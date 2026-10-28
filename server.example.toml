@@ -1,0 +1,9 @@
+# Adres i port UDP, na którym serwer nasłuchuje.
+bind = "0.0.0.0:7700"
+# Katalog na certyfikat serwera (cert.der, key.der).
+data_dir = "/var/lib/komunikator"
+
+# Tymczasowa lista kont (do planu 4). Hash: `komunikator-server hash-password`.
+[[users]]
+name = "ala"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$REPLACE"
