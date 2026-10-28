@@ -274,11 +274,16 @@ name = "client-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "protocol",
  "quinn",
  "rcgen",
  "rustls",
+ "server",
  "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

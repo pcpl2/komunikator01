@@ -18,6 +18,8 @@ pub use conn::TokenBucket;
 
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const BIND_RETRIES: u32 = 30;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct RunningServer {
     endpoint: quinn::Endpoint,
@@ -44,7 +46,7 @@ impl RunningServer {
 
 pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let identity = tls::load_or_create_identity(&config.data_dir)?;
-    let endpoint = quinn::Endpoint::server(quic_config(&identity)?, config.bind)?;
+    let endpoint = bind_endpoint(quic_config(&identity)?, config.bind).await?;
     let shared = Arc::new(conn::Shared {
         room: Mutex::new(room::Room::new()),
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
@@ -57,6 +59,21 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
         }
     });
     Ok(RunningServer { endpoint, fingerprint: identity.fingerprint, accept })
+}
+
+/// Retries briefly while a previous instance's socket is still being released.
+async fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
+    let mut attempts = 0;
+    loop {
+        match quinn::Endpoint::server(config.clone(), addr) {
+            Ok(e) => return Ok(e),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < BIND_RETRIES => {
+                attempts += 1;
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn quic_config(identity: &tls::ServerIdentity) -> anyhow::Result<quinn::ServerConfig> {

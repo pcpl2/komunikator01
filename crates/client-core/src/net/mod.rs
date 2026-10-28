@@ -1,6 +1,7 @@
 //! Connection to the relay server.
 
 pub mod backoff;
+pub mod session;
 pub mod tls;
 
 pub use backoff::Backoff;

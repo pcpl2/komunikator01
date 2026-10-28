@@ -10,6 +10,11 @@ quinn.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+server.workspace = true
+tempfile.workspace = true
