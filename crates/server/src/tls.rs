@@ -26,7 +26,7 @@ pub fn load_or_create_identity(dir: &Path) -> anyhow::Result<ServerIdentity> {
         let generated = rcgen::generate_simple_self_signed(vec![protocol_server_name()])?;
         let cert = generated.cert.der().to_vec();
         let key = generated.signing_key.serialize_der();
-        std::fs::write(&key_path, &key)?;
+        write_secret(&key_path, &key)?;
         std::fs::write(&cert_path, &cert)?;
         (cert, key)
     };
@@ -51,8 +51,18 @@ pub fn load_or_create_reset_key(dir: &Path) -> anyhow::Result<[u8; 32]> {
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
         .map_err(|_| anyhow::anyhow!("system RNG failed"))?;
     std::fs::create_dir_all(dir)?;
-    std::fs::write(&path, key).with_context(|| format!("writing {}", path.display()))?;
+    write_secret(&path, &key).with_context(|| format!("writing {}", path.display()))?;
     Ok(key)
+}
+
+/// Writes a private key readable by the owner only (0600 on Unix).
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(data)
 }
 
 /// SAN embedded in the certificate; clients use it as the TLS server name.
@@ -71,6 +81,19 @@ mod tests {
         let b = load_or_create_identity(dir.path()).unwrap();
         assert_eq!(a.fingerprint, b.fingerprint);
         assert_eq!(a.cert, b.cert);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_identity(dir.path()).unwrap();
+        load_or_create_reset_key(dir.path()).unwrap();
+        for name in ["key.der", "reset.key"] {
+            let mode = std::fs::metadata(dir.path().join(name)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
     }
 
     #[test]

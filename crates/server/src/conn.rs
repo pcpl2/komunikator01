@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::auth::{hash_password, verify_password, LoginLimiter};
+use crate::auth::{verify_password, LoginLimiter};
 use crate::room::Room;
 
 /// Application close code: the account logged in elsewhere.
@@ -46,6 +46,8 @@ pub(crate) struct Shared {
     pub(crate) limiter: Mutex<LoginLimiter>,
     /// Username → Argon2id hash.
     pub(crate) users: HashMap<String, String>,
+    /// Checked for unknown users so timing does not reveal which accounts exist.
+    pub(crate) dummy_hash: String,
     pub(crate) verify_slots: tokio::sync::Semaphore,
     /// Username → client runs that were replaced by a login elsewhere. They may not
     /// come back, or a client that missed its notice would kick out the newer one.
@@ -156,7 +158,7 @@ async fn check_login(
     // Unknown users are checked against a dummy hash so timing does not reveal account names.
     let (hash, known) = match shared.users.get(username) {
         Some(h) => (h.clone(), true),
-        None => (dummy_hash().to_owned(), false),
+        None => (shared.dummy_hash.clone(), false),
     };
     // Each Argon2 check takes ~19 MiB; bound how many run at once.
     let ok = match shared.verify_slots.acquire().await {
@@ -171,11 +173,6 @@ async fn check_login(
     } else {
         Some(RejectReason::BadCredentials)
     }
-}
-
-fn dummy_hash() -> &'static str {
-    static H: OnceLock<String> = OnceLock::new();
-    H.get_or_init(|| hash_password("dummy-password-for-timing"))
 }
 
 /// `None` when this client run was already replaced by a login elsewhere.

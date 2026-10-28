@@ -49,10 +49,13 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let identity = tls::load_or_create_identity(&config.data_dir)?;
     let reset_key = tls::load_or_create_reset_key(&config.data_dir)?;
     let endpoint = bind_endpoint(quic_config(&identity)?, &reset_key, config.bind).await?;
+    let dummy_hash =
+        tokio::task::spawn_blocking(|| auth::hash_password("dummy-password-for-timing")).await?;
     let shared = Arc::new(conn::Shared {
         room: Mutex::new(room::Room::new()),
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
         users: config.users.into_iter().map(|u| (u.name, u.password_hash)).collect(),
+        dummy_hash,
         verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
         retired: Mutex::new(Default::default()),
     });

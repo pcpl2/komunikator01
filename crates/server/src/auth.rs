@@ -40,7 +40,13 @@ impl LoginLimiter {
     }
 
     pub fn record_failure(&mut self, ip: IpAddr, now: Instant) {
-        self.prune(ip, now);
+        // Forget every expired IP, not just this one, so scanners cannot grow the map.
+        // Argon2 bounds attempts to a few dozen per second, so a full pass is cheap.
+        let window = self.window;
+        self.failures.retain(|_, f| {
+            f.retain(|t| now.duration_since(*t) < window);
+            !f.is_empty()
+        });
         self.failures.entry(ip).or_default().push(now);
     }
 
@@ -52,6 +58,11 @@ impl LoginLimiter {
                 self.failures.remove(&ip);
             }
         }
+    }
+
+    /// IPs currently remembered.
+    pub fn tracked_ips(&self) -> usize {
+        self.failures.len()
     }
 
     fn prune(&mut self, ip: IpAddr, now: Instant) {
@@ -94,6 +105,17 @@ mod tests {
         l.record_failure(ip, t0);
         assert!(l.is_blocked(ip, t0 + Duration::from_secs(1)));
         assert!(!l.is_blocked(ip, t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn limiter_forgets_expired_ips() {
+        let mut l = LoginLimiter::new(5, Duration::from_secs(60));
+        let t0 = Instant::now();
+        for i in 0..100u8 {
+            l.record_failure(IpAddr::from([10, 0, 0, i]), t0);
+        }
+        l.record_failure("1.2.3.4".parse().unwrap(), t0 + Duration::from_secs(61));
+        assert_eq!(l.tracked_ips(), 1);
     }
 
     #[test]
