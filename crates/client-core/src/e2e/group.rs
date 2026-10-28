@@ -8,16 +8,21 @@
 //!   (`Peer::min_epoch`, enforced in `open_link`), so it cannot open earlier frames;
 //! - a member's sender keys are accepted only from that member's own channel;
 //! - every join/leave rotates my key; the sealer switches 500 ms later so peers have the new
-//!   key before frames use it.
+//!   key before frames use it;
+//! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and each
+//!   link's chat opener receives exactly the keys its audio opener does, so the rules above
+//!   hold for chat too;
+//! - announces are signed for, and accepted only for, this room.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use protocol::{ClientMsg, MemberId, MemberInfo};
+use protocol::{ClientMsg, MemberId, MemberInfo, RoomId};
 
 use super::announce::{sign_announce, verify_announce, AnnounceError};
 use super::audio::{AudioOpener, AudioSealer, SenderKey};
+use super::chat::{ChatError, ChatOpener, ChatSealer};
 use super::identity::{Identity, IdentityPublic};
 use super::pair::{Inner, PairChannel, PairError};
 use super::trust::{safety_code, KnownDevices, Trust};
@@ -36,8 +41,6 @@ const MAX_DEFER: Duration = Duration::from_secs(1);
 /// Re-announce period: keeps the server's cached announce (replayed to newcomers) far from
 /// `ANNOUNCE_MAX_SKEW_MS`.
 const REANNOUNCE: Duration = Duration::from_secs(30 * 60);
-/// Rooms are not implemented yet; every announce is for room 0.
-const ROOM: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E2eEvent {
@@ -76,6 +79,8 @@ struct Link {
     channel: PairChannel,
     /// Holds only keys received over `channel`.
     opener: AudioOpener,
+    /// Fed exactly the keys `opener` gets.
+    chat: ChatOpener,
     initiator: bool,
     last_hello: Option<Instant>,
     /// Minimum spacing before the next `Hello1`: `HELLO_INTERVAL`, doubled on each re-send
@@ -91,9 +96,12 @@ pub struct E2e {
     trust: Arc<Mutex<KnownDevices>>,
     me: MemberId,
     my_name: String,
+    room: RoomId,
     peers: HashMap<MemberId, Peer>,
     current: SenderKey,
     sealer: AudioSealer,
+    /// Always built from the same key as `sealer`.
+    chat: ChatSealer,
     pending: Option<Pending>,
     /// Latest time seen from the caller, for `trust_changed` (which takes none).
     clock: Instant,
@@ -150,7 +158,7 @@ impl Peer {
 }
 
 impl E2e {
-    /// Joins the room: `members` as listed by the server's `Welcome` (I may be included). The
+    /// Joins `room`: `members` as listed by the server's `Welcome` (I may be included). The
     /// returned `Output` carries my signed announce; my first sender key has epoch `next_epoch`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -158,6 +166,7 @@ impl E2e {
         trust: Arc<Mutex<KnownDevices>>,
         me: MemberId,
         my_name: String,
+        room: RoomId,
         members: &[MemberInfo],
         next_epoch: u16,
         now: Instant,
@@ -173,7 +182,7 @@ impl E2e {
             })
             .collect();
         let out = Output {
-            send: vec![ClientMsg::Announce { blob: sign_announce(&identity, &my_name, ROOM, now_ms) }],
+            send: vec![ClientMsg::Announce { blob: sign_announce(&identity, &my_name, room, now_ms) }],
             ..Output::default()
         };
         let e2e = Self {
@@ -182,8 +191,10 @@ impl E2e {
             trust,
             me,
             my_name,
+            room,
             peers,
             sealer: AudioSealer::new(me, &current),
+            chat: ChatSealer::new(&current),
             current,
             pending: None,
             clock: now,
@@ -201,7 +212,7 @@ impl E2e {
     fn announce_self(&mut self, now: Instant, out: &mut Output) {
         let (base, base_ms) = self.base;
         let now_ms = base_ms.saturating_add(now.saturating_duration_since(base).as_millis() as u64);
-        let blob = sign_announce(&self.identity, &self.my_name, ROOM, now_ms);
+        let blob = sign_announce(&self.identity, &self.my_name, self.room, now_ms);
         out.send.push(ClientMsg::Announce { blob });
         self.last_announce = now;
     }
@@ -276,6 +287,7 @@ impl E2e {
         let mut link = Link {
             channel: PairChannel::new(&self.identity, &their),
             opener: AudioOpener::new(id),
+            chat: ChatOpener::new(),
             initiator: self.my_public.sign < their.sign,
             last_hello: None,
             hello_interval: HELLO_INTERVAL,
@@ -312,7 +324,7 @@ impl E2e {
         self.observe(now);
         let mut out = Output::default();
         let Some(peer) = self.peers.get(&from) else { return out };
-        let verified = verify_announce(blob, &peer.name, ROOM, now_ms).and_then(|a| {
+        let verified = verify_announce(blob, &peer.name, self.room, now_ms).and_then(|a| {
             if a.identity.sign == self.my_public.sign {
                 Err(AnnounceError::OwnIdentity)
             } else {
@@ -366,7 +378,9 @@ impl E2e {
                 if let Some(r) = reply {
                     relay(&mut out, from, r);
                 }
-                link.opener.add_key(SenderKey::from_parts(epoch, key));
+                let key = SenderKey::from_parts(epoch, key);
+                link.chat.add_key(&key);
+                link.opener.add_key(key);
             }
             Ok((reply, None)) => {
                 // A handshake completed (a new session): (re)send my keys over it.
@@ -415,6 +429,7 @@ impl E2e {
             if let Some(p) = self.pending.take() {
                 // Exactly one sealer per key: this key never had one.
                 self.sealer = AudioSealer::new(self.me, &p.key);
+                self.chat = ChatSealer::new(&p.key);
                 self.current = p.key;
             }
         }
@@ -451,6 +466,19 @@ impl E2e {
         }
     }
 
+    /// Seals `text` with the current (switched) key, as a `ClientMsg::Chat` for my room.
+    pub fn seal_chat(&mut self, text: &str) -> Option<ClientMsg> {
+        let blob = self.chat.seal(self.room, self.me, text)?;
+        Some(ClientMsg::Chat { blob })
+    }
+
+    pub fn open_chat(&mut self, from: MemberId, blob: &[u8]) -> Result<String, ChatError> {
+        match self.peers.get_mut(&from).and_then(|p| p.link.as_mut()) {
+            Some(link) => link.chat.open(self.room, from, blob),
+            None => Err(ChatError::NoKey),
+        }
+    }
+
     #[cfg(test)]
     fn current_key(&self) -> &SenderKey {
         &self.current
@@ -469,6 +497,8 @@ mod tests {
     use std::time::Duration;
 
     use protocol::ServerMsg;
+
+    use super::super::audio::TAG_LEN;
 
     const T0_MS: u64 = 1_800_000_000_000;
 
@@ -492,6 +522,7 @@ mod tests {
     /// In-memory server: ordered per-recipient queues, stamps `from`, caches and broadcasts
     /// announces, delivers relays only to `to`.
     struct Net {
+        room: RoomId,
         now: Instant,
         now_ms: u64,
         next_id: MemberId,
@@ -516,6 +547,7 @@ mod tests {
     impl Net {
         fn new() -> Self {
             Net {
+                room: 1,
                 now: Instant::now(),
                 now_ms: T0_MS,
                 next_id: 1,
@@ -562,6 +594,7 @@ mod tests {
                 trust.clone(),
                 id,
                 name.into(),
+                self.room,
                 &members,
                 next_epoch,
                 self.now,
@@ -599,7 +632,17 @@ mod tests {
             let (dir, trust) = store();
             let identity = Arc::new(Identity::generate());
             let (e2e, out) =
-                E2e::new(identity.clone(), trust.clone(), id, old.name.clone(), &members, 0, self.now, self.now_ms);
+                E2e::new(
+                identity.clone(),
+                trust.clone(),
+                id,
+                old.name.clone(),
+                self.room,
+                &members,
+                0,
+                self.now,
+                self.now_ms,
+            );
             let inbox = self
                 .announces
                 .iter()
@@ -964,7 +1007,7 @@ mod tests {
             net.tick(HOUR / 2);
         }
         for (&id, name) in ids.iter().zip(["a", "b"]) {
-            assert!(verify_announce(&net.announces[&id], name, ROOM, net.now_ms).is_ok());
+            assert!(verify_announce(&net.announces[&id], name, net.room, net.now_ms).is_ok());
         }
     }
 
@@ -1180,7 +1223,7 @@ mod tests {
         let _d = dir;
         let now = Instant::now();
         let (mut e, out) =
-            E2e::new(Arc::new(Identity::generate()), trust, 1, "a".into(), &[], u16::MAX, now, T0_MS);
+            E2e::new(Arc::new(Identity::generate()), trust, 1, "a".into(), 1, &[], u16::MAX, now, T0_MS);
         assert!(matches!(out.send[..], [ClientMsg::Announce { .. }]));
         assert_eq!(e.next_epoch(), 0);
         e.member_joined(&MemberInfo { id: 2, name: "b".into(), room: Some(1) }, now);
@@ -1224,5 +1267,117 @@ mod tests {
         net.call(a, |e, now, _| e.member_joined(&MemberInfo { id: a, name: "a".into(), room: Some(1) }, now));
         net.deliver();
         net.tick(1100);
+    }
+
+    fn chat(net: &mut Net, from: MemberId, text: &str) -> Vec<u8> {
+        match net.client(from).e2e.seal_chat(text) {
+            Some(ClientMsg::Chat { blob }) => blob,
+            other => panic!("expected a chat message, got {other:?}"),
+        }
+    }
+
+    fn read(net: &mut Net, who: MemberId, from: MemberId, blob: &[u8]) -> Result<String, ChatError> {
+        net.client(who).e2e.open_chat(from, blob)
+    }
+
+    #[test]
+    fn chat_roundtrip_between_members() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let blob = chat(&mut net, a, "192.168.1.10:27015");
+        assert_eq!(read(&mut net, b, a, &blob).as_deref(), Ok("192.168.1.10:27015"));
+        assert_eq!(read(&mut net, b, b, &blob), Err(ChatError::NoKey), "no link to myself");
+        assert_eq!(read(&mut net, b, 55, &blob), Err(ChatError::NoKey));
+    }
+
+    #[test]
+    fn chat_replay_is_rejected() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let blob = chat(&mut net, a, "gg");
+        assert!(read(&mut net, b, a, &blob).is_ok());
+        assert_eq!(read(&mut net, b, a, &blob), Err(ChatError::Replay));
+    }
+
+    #[test]
+    fn tampered_chat_fails() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let mut blob = chat(&mut net, a, "192.168.1.10:27015");
+        let i = blob.len() - TAG_LEN - 1;
+        blob[i] ^= 1;
+        assert_eq!(read(&mut net, b, a, &blob), Err(ChatError::BadTag));
+    }
+
+    #[test]
+    fn chat_is_bound_to_sender() {
+        let (mut net, ids) = room(&["a", "b", "c"]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let blob = chat(&mut net, a, "hej");
+        assert!(read(&mut net, c, b, &blob).is_err(), "the server cannot re-attribute a message");
+        assert_eq!(read(&mut net, c, a, &blob).as_deref(), Ok("hej"));
+    }
+
+    #[test]
+    fn newcomer_cannot_read_older_chat() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let a = ids[0];
+        let old = chat(&mut net, a, "przed");
+        let c = net.join("c");
+        net.deliver();
+        // Within the switch window a still seals with the pre-join key.
+        let during = chat(&mut net, a, "w trakcie");
+        net.tick(600);
+        for blob in [&old, &during] {
+            assert!(
+                matches!(read(&mut net, c, a, blob), Err(ChatError::UnknownEpoch | ChatError::NoKey)),
+                "newcomer read an older message"
+            );
+        }
+        let after = chat(&mut net, a, "po");
+        assert_eq!(read(&mut net, c, a, &after).as_deref(), Ok("po"));
+    }
+
+    #[test]
+    fn chat_after_rotation_still_opens_previous_epoch() {
+        let (mut net, ids) = room(&["a", "b", "c"]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let old = chat(&mut net, a, "stary");
+        net.leave(c);
+        net.deliver();
+        net.tick(600);
+        let new = chat(&mut net, a, "nowy");
+        assert_ne!(new, old);
+        assert_eq!(read(&mut net, b, a, &new).as_deref(), Ok("nowy"));
+        assert_eq!(read(&mut net, b, a, &old).as_deref(), Ok("stary"));
+        assert!(read(&mut net, c, a, &new).is_err(), "the leaver cannot read new messages");
+    }
+
+    #[test]
+    fn chat_sealer_follows_audio_key() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let a = ids[0];
+        let _c = net.join("c");
+        net.deliver();
+        net.tick(600);
+        let epoch = net.frame(a).epoch;
+        let blob = chat(&mut net, a, "x");
+        assert_eq!(super::super::chat::blob_epoch(&blob), Some(epoch));
+    }
+
+    #[test]
+    fn announce_for_other_room_is_rejected() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let b_identity = net.client(b).identity.clone();
+        let foreign = sign_announce(&b_identity, "b", 2, net.now_ms);
+        net.inject(a, ServerMsg::Announce { from: b, blob: foreign });
+        net.deliver();
+        assert!(net.client(a).events.contains(&E2eEvent::Rejected { id: b, reason: AnnounceError::WrongRoom }));
+        assert!(verify_announce(&net.announces[&a], "a", net.room, net.now_ms).is_ok());
+        assert_eq!(
+            verify_announce(&net.announces[&a], "a", 2, net.now_ms),
+            Err(AnnounceError::WrongRoom)
+        );
     }
 }

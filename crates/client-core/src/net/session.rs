@@ -253,6 +253,8 @@ impl Task {
                     self.params.trust.clone(),
                     you,
                     self.params.username.clone(),
+                    // Outside any room nobody shares keys with me, so the room id is moot.
+                    room.unwrap_or(0),
                     &members,
                     self.next_epoch,
                     Instant::now(),

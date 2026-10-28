@@ -12,6 +12,7 @@ use sha2::Sha256;
 pub const TAG_LEN: usize = 16;
 const OLD_EPOCH_GRACE: Duration = Duration::from_secs(2);
 const AUDIO_INFO: &[u8] = b"komunikator/audio/v1";
+const CHAT_INFO: &[u8] = b"komunikator/chat/v1";
 
 #[derive(Clone)]
 pub struct SenderKey {
@@ -44,6 +45,14 @@ impl SenderKey {
         let mut out = [0u8; 32];
         Hkdf::<Sha256>::new(None, &self.key)
             .expand(AUDIO_INFO, &mut out)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        out
+    }
+
+    pub fn chat_key(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        Hkdf::<Sha256>::new(None, &self.key)
+            .expand(CHAT_INFO, &mut out)
             .expect("32 bytes is a valid HKDF-SHA256 output length");
         out
     }
@@ -382,6 +391,10 @@ mod tests {
     fn audio_key_differs_from_secret() {
         let k = SenderKey::from_parts(1, [9; 32]);
         assert_ne!(&k.audio_key(), k.secret());
+        assert_ne!(&k.chat_key(), k.secret());
+        assert_ne!(k.chat_key(), k.audio_key());
+        assert_eq!(k.chat_key(), SenderKey::from_parts(1, [9; 32]).chat_key());
+        assert_ne!(k.chat_key(), SenderKey::from_parts(1, [8; 32]).chat_key());
         assert_eq!(k.audio_key(), SenderKey::from_parts(1, [9; 32]).audio_key());
         let d = format!("{k:?}");
         assert!(!d.contains("9, 9") && !d.contains("09090909"));

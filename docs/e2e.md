@@ -32,6 +32,21 @@ Gdy ktoś wchodzi do pokoju lub z niego wychodzi, każdy uczestnik tworzy nowy k
 
 Nowa osoba nie usłyszy rozmowy sprzed swojego wejścia, a wychodzący nie usłyszy rozmowy po wyjściu. Zasada dolna (key floor): tożsamość nigdy nie dostaje klucza, którym zaszyfrowano już dźwięk przed otwarciem jej kanału. Jeśli taki klucz byłby jedynym dostępnym, nadawca najpierw robi rotację i wysyła świeży, jeszcze nieużyty.
 
+## Pokój w ogłoszeniu
+
+Ogłoszenie jest podpisane dla konkretnego pokoju (numer pokoju z `Welcome`). Klient przyjmuje tylko ogłoszenia podpisane dla swojego pokoju; ogłoszenie z innego pokoju jest odrzucane („zły pokój”), nawet jeśli serwer twierdzi, że nadawca siedzi obok. Serwer nie przeniesie więc niczyjego urządzenia do innego pokoju bez wiedzy uczestników.
+
+## Czat
+
+Wiadomości czatu są szyfrowane tym samym kluczem nadawcy co dźwięk, ale z osobnym kluczem pochodnym: `HKDF-SHA256(klucz nadawcy, sól pusta, info = "komunikator/chat/v1")`, więc klucz czatu i klucz audio są od siebie niezależne. Wiadomość to postcard struktury `{ epoka u16, licznik u32, szyfrogram }`, szyfrowana ChaCha20-Poly1305:
+
+- nonce 12 bajtów: licznik (u32, little-endian) w pierwszych 4 bajtach, reszta zera; licznik liczy od 0 dla każdego klucza, a po `u32::MAX` nadawca odmawia dalszego szyfrowania tym kluczem;
+- AAD: `"komunikator/chat/v1"` ‖ pokój u32 LE ‖ id nadawcy u16 LE ‖ epoka u16 LE ‖ licznik u32 LE. Serwer nie przeniesie wiadomości do innego pokoju ani nie przypisze jej komuś innemu.
+
+Odbiorca trzyma trzy najnowsze epoki każdego nadawcy (wiadomość wysłana tuż przed rotacją otwiera się po niej), nigdy nie podmienia klucza znanej epoki i w obrębie epoki przyjmuje tylko ściśle rosnące liczniki: strumień sterujący jest uporządkowany, więc powtórka lub stara wiadomość jest odrzucana. Tekst po odszyfrowaniu musi być poprawnym UTF-8 o długości najwyżej 2000 znaków. Serwer nie przechowuje czatu; przekazuje tylko zaszyfrowane bloby.
+
+Nowa osoba nie przeczyta wiadomości sprzed swojego wejścia: czat szyfruje zawsze ten sam klucz, którym w danej chwili szyfrowany jest dźwięk, a klucze dla czatu odbiorca dostaje dokładnie tam, gdzie klucze dźwięku. Zasada dolna (key floor) obejmuje więc i czat: nowa osoba dostaje tylko klucze, którymi nic jeszcze nie zaszyfrowano przed otwarciem jej kanału. Wychodzący z tego samego powodu nie przeczyta wiadomości po rotacji.
+
 ## Zaufanie (TOFU)
 
 Klient zapamiętuje tożsamości w `known_devices.toml` (nazwa, id urządzenia, klucz podpisu, flaga weryfikacji; zapis atomowy przez plik tymczasowy z `fsync`). Stany:
