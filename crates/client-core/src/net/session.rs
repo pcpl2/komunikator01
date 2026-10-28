@@ -70,7 +70,8 @@ pub fn spawn_session(rt: &tokio::runtime::Handle, params: SessionParams) -> Sess
     let (audio_out, out_rx) = mpsc::channel(AUDIO_OUT_CAPACITY);
     let (in_tx, audio_in) = mpsc::channel(AUDIO_IN_CAPACITY);
     let (stop, stop_rx) = watch::channel(false);
-    let task = Task { params, events: events_tx, out_rx, in_tx, stop: stop_rx };
+    let session = random_session_id();
+    let task = Task { params, session, events: events_tx, out_rx, in_tx, stop: stop_rx };
     rt.spawn(task.run());
     SessionHandle { events, audio_out, audio_in, stop }
 }
@@ -84,6 +85,8 @@ enum Outcome {
 
 struct Task {
     params: SessionParams,
+    /// Sent with every Hello of this run; see `ClientMsg::Hello::session`.
+    session: u64,
     events: mpsc::UnboundedSender<SessionEvent>,
     out_rx: mpsc::Receiver<EncodedFrame>,
     in_tx: mpsc::Sender<IncomingFrame>,
@@ -135,6 +138,7 @@ impl Task {
             version: PROTOCOL_VERSION,
             username: self.params.username.clone(),
             password: self.params.password.clone(),
+            session: self.session,
         };
         let login = async {
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
@@ -256,6 +260,14 @@ fn closed_outcome(conn: &Connection) -> Outcome {
         }
         _ => Outcome::Retry,
     }
+}
+
+/// Not a secret: only distinguishes this run's reconnects from other logins.
+fn random_session_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    h.finish()
 }
 
 /// Prefers IPv4 when the name resolves to both families.

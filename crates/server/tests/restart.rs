@@ -55,7 +55,7 @@ async fn killed_server_restart_ends_old_connections_quickly() {
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     let conn = endpoint.connect(addr, client_core::net::SERVER_NAME).unwrap().await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
-    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, username: "ala".into(), password: "x".into() };
+    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, username: "ala".into(), password: "x".into(), session: 1 };
     send.write_all(&encode_frame(&hello)).await.unwrap();
 
     first.kill().unwrap();

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -46,8 +47,14 @@ impl Client {
         Client { conn, send, recv, dec: FrameDecoder::new(), _endpoint: endpoint }
     }
 
+    /// Hello as a fresh client run.
     async fn hello(&mut self, name: &str, pw: &str, version: u16) {
-        let msg = ClientMsg::Hello { version, username: name.into(), password: pw.into() };
+        static NEXT: AtomicU64 = AtomicU64::new(1_000);
+        self.hello_session(name, pw, version, NEXT.fetch_add(1, Ordering::Relaxed)).await;
+    }
+
+    async fn hello_session(&mut self, name: &str, pw: &str, version: u16, session: u64) {
+        let msg = ClientMsg::Hello { version, username: name.into(), password: pw.into(), session };
         self.send.write_all(&encode_frame(&msg)).await.unwrap();
     }
 
@@ -68,8 +75,19 @@ impl Client {
     }
 
     async fn login(srv: &RunningServer, name: &str) -> (Client, MemberId, Vec<MemberInfo>) {
+        Self::login_session(srv, name, None).await
+    }
+
+    async fn login_session(
+        srv: &RunningServer,
+        name: &str,
+        session: Option<u64>,
+    ) -> (Client, MemberId, Vec<MemberInfo>) {
         let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-        c.hello(name, "x", PROTOCOL_VERSION).await;
+        match session {
+            Some(s) => c.hello_session(name, "x", PROTOCOL_VERSION, s).await,
+            None => c.hello(name, "x", PROTOCOL_VERSION).await,
+        }
         match c.next_msg().await {
             Some(ServerMsg::Welcome { you, members }) => (c, you, members),
             other => panic!("expected Welcome, got {other:?}"),
@@ -251,4 +269,28 @@ async fn replaced_session_stops_relaying_at_once() {
     first.send_audio(1, b"stare");
     assert_eq!(ola.recv_audio(Duration::from_millis(300)).await, None);
     assert_eq!(second.recv_audio(Duration::from_millis(100)).await, None);
+}
+
+#[tokio::test]
+async fn replaced_client_cannot_take_the_account_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (_laptop, _, _) = Client::login_session(&srv, "ala", Some(1)).await;
+    let (mut pc, _, _) = Client::login_session(&srv, "ala", Some(2)).await;
+    // The laptop missed its SessionReplaced (network drop) and now reconnects.
+    let mut back = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+    back.hello_session("ala", "x", PROTOCOL_VERSION, 1).await;
+    assert_eq!(back.next_msg().await, Some(ServerMsg::SessionReplaced));
+    assert_eq!(timeout(Duration::from_millis(300), pc.next_msg()).await.ok().flatten(), None);
+    assert!(pc.conn.close_reason().is_none(), "the newer session was kicked");
+}
+
+#[tokio::test]
+async fn reconnecting_client_replaces_its_own_stale_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (_zombie, _, _) = Client::login_session(&srv, "ala", Some(7)).await;
+    let (_again, _, _) = Client::login_session(&srv, "ala", Some(7)).await;
+    let (_third, _, members) = Client::login_session(&srv, "ala", Some(7)).await;
+    assert!(members.is_empty());
 }

@@ -59,7 +59,7 @@ mod tests {
     use crate::ClientMsg;
 
     fn hello() -> ClientMsg {
-        ClientMsg::Hello { version: 1, username: "ala".into(), password: "x".into() }
+        ClientMsg::Hello { version: 1, username: "ala".into(), password: "x".into(), session: 7 }
     }
 
     #[test]

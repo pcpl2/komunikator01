@@ -16,6 +16,9 @@ pub enum ClientMsg {
         version: u16,
         username: String,
         password: String,
+        /// Random per client run, kept across reconnects. Lets the server tell a client
+        /// coming back from a network drop from one that was already replaced elsewhere.
+        session: u64,
     },
 }
 

@@ -1,6 +1,6 @@
 //! One client connection: login on the control stream, then audio relay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -29,12 +29,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const LINGER: Duration = Duration::from_secs(2);
 const AUDIO_RATE_PER_S: u32 = 100;
 const AUDIO_BURST: u32 = 20;
+/// Replaced client runs remembered per account.
+const RETIRED_PER_USER: usize = 8;
 
 /// A room member as seen by other connections.
 #[derive(Clone)]
 pub(crate) struct Peer {
     conn: Connection,
     ctrl: mpsc::UnboundedSender<ServerMsg>,
+    /// The client run this connection belongs to (`ClientMsg::Hello::session`).
+    session: u64,
 }
 
 pub(crate) struct Shared {
@@ -43,6 +47,9 @@ pub(crate) struct Shared {
     /// Username → Argon2id hash.
     pub(crate) users: HashMap<String, String>,
     pub(crate) verify_slots: tokio::sync::Semaphore,
+    /// Username → client runs that were replaced by a login elsewhere. They may not
+    /// come back, or a client that missed its notice would kick out the newer one.
+    pub(crate) retired: Mutex<HashMap<String, VecDeque<u64>>>,
 }
 
 /// Simple token bucket limiting audio datagrams per connection.
@@ -96,7 +103,7 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
         }
         _ => return Ok(()),
     };
-    let ClientMsg::Hello { version, username, password } = hello;
+    let ClientMsg::Hello { version, username, password, session } = hello;
 
     let ip = conn.remote_address().ip();
     if let Some(reason) = check_login(&shared, ip, version, &username, password).await {
@@ -106,7 +113,12 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     }
 
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-    let id = join_room(&shared, &username, Peer { conn: conn.clone(), ctrl: ctrl_tx });
+    let Some(id) = join_room(&shared, &username, Peer { conn: conn.clone(), ctrl: ctrl_tx, session })
+    else {
+        tracing::info!(%ip, user = %username, "replaced client tried to come back");
+        send_and_close(send, &conn, ServerMsg::SessionReplaced, CLOSE_REPLACED).await;
+        return Ok(());
+    };
     tracing::info!(%ip, user = %username, id, "joined");
     let writer = tokio::spawn(write_ctrl(send, ctrl_rx, conn.clone()));
 
@@ -166,12 +178,26 @@ fn dummy_hash() -> &'static str {
     H.get_or_init(|| hash_password("dummy-password-for-timing"))
 }
 
-fn join_room(shared: &Shared, username: &str, peer: Peer) -> MemberId {
+/// `None` when this client run was already replaced by a login elsewhere.
+fn join_room(shared: &Shared, username: &str, peer: Peer) -> Option<MemberId> {
     let welcome_tx = peer.ctrl.clone();
+    let session = peer.session;
     let mut room = shared.room.lock().unwrap();
+    let mut retired = shared.retired.lock().unwrap();
+    if retired.get(username).is_some_and(|r| r.contains(&session)) {
+        return None;
+    }
     let outcome = room.join(username, peer);
     let others = room.peers(outcome.id);
     if let Some((old_id, old)) = &outcome.replaced {
+        // The same run reconnecting over its own stale connection is not a replacement.
+        if old.session != session {
+            let r = retired.entry(username.to_owned()).or_default();
+            if r.len() == RETIRED_PER_USER {
+                r.pop_front();
+            }
+            r.push_back(old.session);
+        }
         let _ = old.ctrl.send(ServerMsg::SessionReplaced);
         for p in &others {
             let _ = p.ctrl.send(ServerMsg::MemberLeft { id: *old_id });
@@ -182,7 +208,7 @@ fn join_room(shared: &Shared, username: &str, peer: Peer) -> MemberId {
         let _ = p.ctrl.send(ServerMsg::MemberJoined(me.clone()));
     }
     let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, members: outcome.members });
-    outcome.id
+    Some(outcome.id)
 }
 
 fn leave_room(shared: &Shared, id: MemberId) {

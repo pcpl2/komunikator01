@@ -54,6 +54,7 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
         users: config.users.into_iter().map(|u| (u.name, u.password_hash)).collect(),
         verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
+        retired: Mutex::new(Default::default()),
     });
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
