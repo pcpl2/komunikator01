@@ -8,6 +8,8 @@ pub mod engine;
 pub mod pipeline;
 pub mod supervisor;
 #[cfg(windows)]
+pub mod ui;
+#[cfg(windows)]
 pub mod wasapi;
 
 use client_core::audio::frame::Pcm;
