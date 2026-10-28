@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 const MAX_PERCENT: u16 = 200;
 const SLOTS: usize = 64;
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 struct Entry {
     percent: Option<u16>,
     #[serde(default)]
@@ -18,7 +18,7 @@ struct Entry {
 }
 
 /// Volumes remembered by username, so they survive reconnects (member ids do not).
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct VolumeBook {
     people: BTreeMap<String, Entry>,
 }
