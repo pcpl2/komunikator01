@@ -152,6 +152,8 @@ impl KnownDevices {
     }
 
     /// Classifies a peer key. Stores first-seen users/devices; never overwrites a changed key.
+    /// An unverified device of a user with several stored devices is `NewDevice` every time,
+    /// not `Known`, so it stays marked until someone verifies it.
     pub fn check(&mut self, user: &str, id: &IdentityPublic) -> Trust {
         if let Some(i) = self.position(user, id) {
             let r = &self.records[i];
@@ -159,6 +161,9 @@ impl KnownDevices {
                 Trust::KeyChanged
             } else if r.verified {
                 Trust::Verified
+            } else if self.records.iter().filter(|o| o.user == user).count() > 1 {
+                // An unverified extra device stays flagged every session until verified.
+                Trust::NewDevice
             } else {
                 Trust::Known
             };
@@ -232,7 +237,29 @@ mod tests {
         let (_d, mut k) = store();
         k.check("ala", &id(1, 1));
         assert_eq!(k.check("ala", &id(2, 2)), Trust::NewDevice);
-        assert_eq!(k.check("ala", &id(2, 2)), Trust::Known);
+    }
+
+    #[test]
+    fn unverified_extra_device_stays_flagged_until_verified() {
+        let (d, mut k) = store();
+        k.check("ala", &id(1, 1));
+        k.verify("ala", &id(1, 1));
+        assert_eq!(k.check("ala", &id(2, 2)), Trust::NewDevice);
+        // Next session (and after a reload) it is still flagged, not plain Known.
+        assert_eq!(k.check("ala", &id(2, 2)), Trust::NewDevice);
+        let mut k2 = KnownDevices::load(&d.path().join("known.toml")).unwrap();
+        assert_eq!(k2.check("ala", &id(2, 2)), Trust::NewDevice);
+        assert_eq!(k2.check("ala", &id(1, 1)), Trust::Verified);
+        k2.verify("ala", &id(2, 2));
+        assert_eq!(k2.check("ala", &id(2, 2)), Trust::Verified);
+    }
+
+    #[test]
+    fn single_unverified_device_is_known() {
+        let (_d, mut k) = store();
+        k.check("ala", &id(1, 1));
+        k.check("ola", &id(2, 2));
+        assert_eq!(k.check("ala", &id(1, 1)), Trust::Known);
     }
 
     #[test]

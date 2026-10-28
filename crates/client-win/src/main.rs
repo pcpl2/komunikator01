@@ -205,13 +205,16 @@ fn print_event(e: &SessionEvent) {
         SessionEvent::E2e(E2eEvent::Member { id, name, trust, code, .. }) => match trust {
             Trust::NewUser => println!("e2e: nowa osoba: {name} (id {id}); kod bezpieczeństwa: {code}"),
             Trust::NewDevice => println!(
-                "e2e: UWAGA: {name} (id {id}) używa nowego urządzenia; kod bezpieczeństwa: {code}"
+                "e2e: UWAGA: {name} (id {id}) używa nowego, niezweryfikowanego urządzenia; \
+                 kod bezpieczeństwa: {code} (po porównaniu: z {id})"
             ),
             Trust::KeyChanged => println!(
                 "e2e: OSTRZEŻENIE: zmieniony klucz u {name} (id {id})! Może to być podszywanie się. \
                  Porównaj kod {code} głosowo; jeśli to na pewno ta osoba: a {id}. Do tego czasu nie dostaje Twojego dźwięku."
             ),
-            Trust::Known => println!("e2e: {name} (id {id}) — znane urządzenie; kod: {code}"),
+            Trust::Known => println!(
+                "e2e: {name} (id {id}) — znany, niezweryfikowany; porównaj kod {code}, potem: z {id}"
+            ),
             Trust::Verified => println!("e2e: {name} (id {id}) — zweryfikowany; kod: {code}"),
         },
         SessionEvent::E2e(E2eEvent::Rejected { id, reason }) => {
@@ -325,9 +328,9 @@ impl Roster {
 fn trust_label(t: Trust) -> &'static str {
     match t {
         Trust::Verified => "zweryfikowany",
-        Trust::Known => "znany",
+        Trust::Known => "znany, niezweryfikowany",
         Trust::NewUser => "nowa osoba",
-        Trust::NewDevice => "NOWE URZĄDZENIE",
+        Trust::NewDevice => "NOWE URZĄDZENIE, niezweryfikowane",
         Trust::KeyChanged => "ZMIENIONY KLUCZ (a <id> po sprawdzeniu)",
     }
 }

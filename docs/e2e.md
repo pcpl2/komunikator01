@@ -34,17 +34,17 @@ Nowa osoba nie usłyszy rozmowy sprzed swojego wejścia, a wychodzący nie usły
 
 ## Zaufanie (TOFU)
 
-Klient zapamiętuje tożsamości w `known_devices.toml` (nazwa, id urządzenia, klucz podpisu, flaga weryfikacji; zapis atomowy). Stany:
+Klient zapamiętuje tożsamości w `known_devices.toml` (nazwa, id urządzenia, klucz podpisu, flaga weryfikacji; zapis atomowy przez plik tymczasowy z `fsync`). Stany:
 
 | Stan | Znaczenie | Dźwięk |
 |---|---|---|
 | nowa osoba | pierwszy kontakt z tą nazwą | tak, z widocznym oznaczeniem |
-| nowe urządzenie | znana nazwa, nowe urządzenie | tak, z widocznym ostrzeżeniem |
-| znany | ten sam klucz co poprzednio | tak |
+| nowe urządzenie | znana nazwa, nowe urządzenie; zostaje w tym stanie przy każdym połączeniu, dopóki nie zweryfikujesz kodu (`z <id>`) | tak, z widocznym ostrzeżeniem |
+| znany, niezweryfikowany | jedyne zapisane urządzenie tej osoby, ten sam klucz co poprzednio, kod niesprawdzony | tak |
 | zweryfikowany | użytkownik potwierdził kod bezpieczeństwa (`z <id>`) | tak |
 | zmieniony klucz | to samo urządzenie, inny klucz podpisu | **nie** (do `a <id>`) |
 
-Kod bezpieczeństwa to cztery grupy po 4 cyfry, wyliczone ze skrótu SHA-256 obu kluczy podpisu (kolejność bez znaczenia, więc obie strony widzą ten sam kod). Porównujecie go głosowo lub innym kanałem. Jeśli nie można zapisać pliku zaufania, klient wypisuje ostrzeżenie, a zmiany obowiązują do zamknięcia programu.
+Kod bezpieczeństwa to cztery grupy po 4 cyfry, wyliczone ze skrótu SHA-256 obu kluczy podpisu (kolejność bez znaczenia, więc obie strony widzą ten sam kod). Porównujecie go głosowo lub innym kanałem. Status „niezweryfikowany” jest zawsze widoczny na liście (`k`) i w komunikatach, dopóki kod nie zostanie potwierdzony. Jeśli pliku zaufania nie da się odczytać (uszkodzony), jest odkładany jako `known_devices.toml.broken`, klient zaczyna od pustej listy i wyraźnie o tym ostrzega: wszyscy znajomi pojawią się jako nowe osoby, a weryfikacje trzeba powtórzyć. Jeśli nie można zapisać pliku zaufania, klient wypisuje ostrzeżenie, a zmiany obowiązują do zamknięcia programu.
 
 ## Co widzi serwer
 
