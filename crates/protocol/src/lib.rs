@@ -1,5 +1,6 @@
 //! Wire format shared by the client and the server.
 
+pub mod audio;
 pub mod control;
 pub mod framing;
 
