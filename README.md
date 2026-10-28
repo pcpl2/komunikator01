@@ -2,7 +2,7 @@
 
 Lekki komunikator głosowy dla małej grupy graczy: natywny klient na Windows (Rust, WASAPI, Opus) i serwer przekazujący dźwięk (QUIC) na Linuksie.
 
-Stan: **plan 4, okno programu (w toku).** Klient ma natywne okno Windows z ikoną w zasobniku: pokoje, czat, wyciszanie skrótami. Okna konfiguracji (pierwsze uruchomienie, ustawienia) są w przygotowaniu; konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
+Stan: **plan 4, okno programu.** Klient ma natywne okno Windows z ikoną w zasobniku: pokoje, czat, wyciszanie skrótami, okna pierwszego uruchomienia, ustawień i kodu bezpieczeństwa. Konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
 
 ## Budowanie
 
@@ -31,13 +31,13 @@ Wymagania: Rust (stable) i CMake (do zbudowania libopus).
 
 ### Okno: `komunikator.exe`
 
-Ustawienia są w `%APPDATA%\komunikator\settings.toml` (adres serwera, odcisk, nazwa użytkownika, hasło chronione DPAPI, skróty, położenie okna, głośności osób). Dopóki nie ma okna pierwszego uruchomienia, program bez konfiguracji pokazuje „Brak konfiguracji” i kończy pracę; do tego czasu używaj `komunikator-cli`.
+Przy pierwszym uruchomieniu program pyta o `Adres serwera` (host:port), `Odcisk certyfikatu` (64 znaki z wydruku serwera), `Nazwę użytkownika` i `Hasło`; `Anuluj` kończy program. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (hasło chronione DPAPI, tylko dla tego konta Windows).
 
-- U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…`, `Ustawienia…`.
-- Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200% i `Wycisz u mnie`.
+- U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…` (po utworzeniu wchodzisz do niego), `Ustawienia…`.
+- Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200%, `Wycisz u mnie` i `Kod bezpieczeństwa…` (osoby z Twojego pokoju: porównajcie kod głosowo i wpisz jego pierwszą grupę, żeby oznaczyć urządzenie jako zweryfikowane albo zaakceptować zmieniony klucz).
 - Po prawej czat pokoju; Enter wysyła. Kliknięcie wiadomości z adresem kopiuje pierwszy adres do schowka, prawy przycisk pozwala wybrać adres.
 - Krzyżyk chowa okno do zasobnika. Ikona w zasobniku: zielona (połączono), czerwona (wyciszony), ciemnoczerwona (wyciszeni wszyscy), szara (rozłączono), pomarańczowa kropka = nowa wiadomość. Lewy klik wycisza mikrofon; prawy: `Pokaż okno`, `Wycisz mikrofon`, `Wycisz wszystkich`, `Wyjdź`.
-- Skróty globalne z `hotkey_mute` / `hotkey_deafen` w ustawieniach (np. `"Ctrl+Shift+M"`); gdy skrót jest zajęty, pasek stanu to mówi.
+- `Ustawienia…`: mikrofon i głośniki, czułość wykrywania mowy (z podglądem poziomu mikrofonu), skróty globalne `Wycisz mikrofon` / `Wycisz wszystkich` (wymagają Ctrl, Alt lub Shift; zajęty skrót okno pokazuje, a drugie `OK` zapisuje go mimo to), dźwięki, `Uruchamiaj z Windows`, `Uruchamiaj jako administrator` (gdy gra działa jako administrator i nie przepuszcza skrótów) oraz `Konto…` — zmiana konta łączy od nowa.
 - Opcje: `--minimized` (start w zasobniku), `--data-dir <katalog>` (zamiast `%APPDATA%\komunikator`), `--smoke` (autotest: okno na sekundę, zapis ustawień, wyjście).
 
 ### Wiersz poleceń: `komunikator-cli.exe`

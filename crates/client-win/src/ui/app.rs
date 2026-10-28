@@ -2,10 +2,11 @@
 //! effects out (session commands, gains, sounds, clipboard, settings file, trust store).
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use client_core::app::{Action, AppState, Effect, View};
+use client_core::audio::activity::Activity;
 use client_core::net::session::{SessionCommand, SessionEvent};
 use client_core::settings::{Settings, SettingsStore};
 use protocol::MemberId;
@@ -15,13 +16,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, PostMessageW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MESSAGEBOX_STYLE,
 };
 
-use super::autostart::{is_elevated, relaunch_as_admin};
-use super::sound::Sounds;
+use super::autostart::{autostart_enabled, is_elevated, relaunch_as_admin, set_autostart};
 use super::clipboard;
+use super::dialogs::{account_dialog, AccountInput, SettingsInput};
+use super::sound::Sounds;
 use super::wide::wide;
 use super::window::{Start, Window, WM_APP_SESSION};
-use crate::dpapi::load_password;
-use crate::startup::{default_data_dir, start_client, Account, Audio, Client};
+use crate::dpapi::{load_password, store_password};
+use crate::startup::{default_data_dir, start_client, Account, Audio, Client, Notice};
 
 pub struct Options {
     /// Start hidden, in the tray.
@@ -40,16 +42,25 @@ pub fn run(opts: Options) -> i32 {
     if settings.run_as_admin && !opts.smoke && !is_elevated() && relaunch_as_admin() {
         return 0;
     }
-    // Until the first-run dialog exists (Task 6).
-    let account = settings.is_configured().then(|| account(&settings)).flatten();
-    let Some(account) = account else {
-        let mut text = format!("Brak konfiguracji.\n\nUzupełnij plik {}.", settings_path.display());
-        if let Some(b) = broken {
-            text.push_str(&format!("\n\nPoprzedni plik był uszkodzony i został odłożony jako {}.", b.display()));
+    let mut settings = settings;
+    if let Some(b) = broken.filter(|_| !opts.smoke) {
+        let text = format!("Plik ustawień był uszkodzony i został odłożony jako {}.", b.display());
+        message_box(None, &text, MB_ICONWARNING);
+    }
+    if account(&settings).is_none() {
+        // The self-test never waits for a person.
+        if opts.smoke {
+            return 1;
         }
-        message_box(None, &text, MB_ICONERROR);
-        return 1;
-    };
+        let Some(a) = account_dialog(None, &account_input(&settings), true) else { return 0 };
+        if let Err(e) = set_account(&mut settings, &a) {
+            message_box(None, &format!("Nie udało się zapisać hasła: {e:#}"), MB_ICONERROR);
+            return 1;
+        }
+        if let Err(e) = store.save(&settings) {
+            message_box(None, &format!("Nie udało się zapisać ustawień: {e}"), MB_ICONWARNING);
+        }
+    }
 
     let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build() {
         Ok(rt) => rt,
@@ -58,37 +69,20 @@ pub fn run(opts: Options) -> i32 {
             return 1;
         }
     };
-    let audio = Audio {
-        capture: settings.capture_device.clone(),
-        render: settings.render_device.clone(),
-        sensitivity: settings.vad_sensitivity,
-    };
-    let (mut client, notices) = match start_client(rt.handle(), &data_dir, account, audio) {
-        Ok(c) => c,
-        Err(e) => {
-            message_box(None, &format!("Nie udało się uruchomić komunikatora: {e:#}"), MB_ICONERROR);
-            return 1;
-        }
-    };
-    let mut session_events = std::mem::replace(&mut client.session.events, tokio::sync::mpsc::unbounded_channel().1);
     let (events_tx, events) = mpsc::channel();
-    let mut app = App {
+    let app = App {
         state: AppState::with_clock(settings, Box::new(local_hm)),
         store,
-        client: Some(client),
+        client: None,
         events,
+        events_tx,
+        generation: 0,
+        rt: rt.handle().clone(),
+        data_dir,
         sounds: Sounds::new(),
         speaking: Vec::new(),
         local_notice: None,
     };
-    let mut warnings = Vec::new();
-    for n in notices {
-        if n.warning {
-            warnings.push(n.text);
-        } else {
-            app.local_notice = Some(n.text);
-        }
-    }
 
     let window = match Window::create(app, Start { minimized: opts.minimized, smoke: opts.smoke }) {
         Ok(w) => w,
@@ -97,17 +91,28 @@ pub fn run(opts: Options) -> i32 {
             return 1;
         }
     };
-    // HWND is not Send; the forwarder only needs its value to post a wake-up.
-    let hwnd_bits = window.hwnd().0 as usize;
-    rt.spawn(async move {
-        while let Some(e) = session_events.recv().await {
-            if events_tx.send(e).is_err() {
-                break;
+    let mut started = Err(String::new());
+    window.with_app(|app| started = app.connect(window.hwnd()));
+    let notices = match started {
+        Ok(n) => n,
+        Err(e) => {
+            window.close();
+            message_box(None, &format!("Nie udało się uruchomić komunikatora: {e}"), MB_ICONERROR);
+            window.destroy();
+            return 1;
+        }
+    };
+    let mut warnings = Vec::new();
+    window.with_app(|app| {
+        for n in notices {
+            if n.warning {
+                warnings.push(n.text);
+            } else {
+                app.local_notice = Some(n.text);
             }
-            let hwnd = HWND(hwnd_bits as *mut _);
-            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SESSION, WPARAM(0), LPARAM(0)) };
         }
     });
+    window.redraw();
     if !opts.smoke {
         for w in warnings {
             message_box(Some(window.hwnd()), &w, MB_ICONWARNING);
@@ -125,12 +130,33 @@ pub fn run(opts: Options) -> i32 {
 }
 
 fn account(s: &Settings) -> Option<Account> {
+    if !s.is_configured() {
+        return None;
+    }
     Some(Account {
         server: s.server.clone(),
         fingerprint: protocol::parse_fingerprint(&s.fingerprint)?,
         username: s.username.clone(),
         password: load_password(s)?,
     })
+}
+
+/// The account form's starting values; the password only if it can still be decrypted.
+pub fn account_input(s: &Settings) -> AccountInput {
+    AccountInput {
+        server: s.server.clone(),
+        fingerprint: s.fingerprint.clone(),
+        username: s.username.clone(),
+        password: load_password(s).unwrap_or_default(),
+    }
+}
+
+fn set_account(s: &mut Settings, a: &AccountInput) -> anyhow::Result<()> {
+    store_password(s, &a.password)?;
+    s.server = a.server.clone();
+    s.fingerprint = a.fingerprint.clone();
+    s.username = a.username.clone();
+    Ok(())
 }
 
 fn local_hm() -> (u8, u8) {
@@ -150,7 +176,13 @@ pub struct App {
     store: SettingsStore,
     /// `None` after shutdown.
     client: Option<Client>,
-    events: mpsc::Receiver<SessionEvent>,
+    /// Session events tagged with the session generation they came from.
+    events: mpsc::Receiver<(u64, SessionEvent)>,
+    events_tx: mpsc::Sender<(u64, SessionEvent)>,
+    /// Bumped on every (re)start, so a replaced session's late events are dropped.
+    generation: u64,
+    rt: tokio::runtime::Handle,
+    data_dir: PathBuf,
     /// Purges playback on drop, so it lives as long as the window.
     sounds: Sounds,
     speaking: Vec<MemberId>,
@@ -183,6 +215,96 @@ impl App {
         self.local_notice.take()
     }
 
+    pub fn activity(&self) -> Option<Arc<Activity>> {
+        self.client.as_ref().map(|c| c.activity.clone())
+    }
+
+    /// Starts (or restarts) the session and audio for the account in the settings, with a
+    /// forwarder that wakes the window for each event.
+    pub fn connect(&mut self, hwnd: HWND) -> Result<Vec<Notice>, String> {
+        if let Some(c) = self.client.take() {
+            c.shutdown();
+        }
+        self.generation += 1;
+        let s = self.state.settings();
+        let account = account(s).ok_or_else(|| "brak konta albo nie da się odczytać zapisanego hasła".to_owned())?;
+        let audio =
+            Audio { capture: s.capture_device.clone(), render: s.render_device.clone(), sensitivity: s.vad_sensitivity };
+        let (mut client, notices) =
+            start_client(&self.rt, &self.data_dir, account, audio).map_err(|e| format!("{e:#}"))?;
+        let mut session_events =
+            std::mem::replace(&mut client.session.events, tokio::sync::mpsc::unbounded_channel().1);
+        let (tx, generation) = (self.events_tx.clone(), self.generation);
+        // HWND is not Send; the forwarder only needs its value to post a wake-up.
+        let hwnd_bits = hwnd.0 as usize;
+        self.rt.spawn(async move {
+            while let Some(e) = session_events.recv().await {
+                if tx.send((generation, e)).is_err() {
+                    break;
+                }
+                let hwnd = HWND(hwnd_bits as *mut _);
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SESSION, WPARAM(0), LPARAM(0)) };
+            }
+        });
+        self.client = Some(client);
+        self.sync_controls();
+        Ok(notices)
+    }
+
+    /// Saves a changed account and reconnects with it; an unchanged one does nothing.
+    pub fn change_account(&mut self, hwnd: HWND, a: AccountInput) {
+        let s = self.state.settings();
+        let same = s.server == a.server
+            && s.fingerprint == a.fingerprint
+            && s.username == a.username
+            && load_password(s).as_deref() == Some(a.password.as_str());
+        if same {
+            return;
+        }
+        if let Err(e) = set_account(self.state.settings_mut(), &a) {
+            self.local_notice = Some(format!("nie udało się zapisać hasła: {e:#}"));
+            return;
+        }
+        self.save_settings();
+        self.state.reset_session();
+        match self.connect(hwnd) {
+            Ok(notices) => {
+                if let Some(n) = notices.into_iter().last() {
+                    self.local_notice = Some(n.text);
+                }
+            }
+            Err(e) => self.local_notice = Some(format!("nie udało się połączyć: {e}")),
+        }
+    }
+
+    /// Applies and saves what the settings dialog returned.
+    pub fn apply_settings(&mut self, new: SettingsInput) {
+        let old = SettingsInput::from_settings(self.state.settings());
+        if let Some(c) = &mut self.client {
+            if new.capture != old.capture || new.render != old.render {
+                c.engine.restart_devices(new.capture.clone(), new.render.clone());
+            }
+            if new.sensitivity != old.sensitivity {
+                c.engine.set_sensitivity(new.sensitivity);
+            }
+        }
+        let mut notices = Vec::new();
+        // Compared with the registry, so an entry removed elsewhere comes back.
+        if new.autostart != autostart_enabled() {
+            if let Err(e) = set_autostart(new.autostart) {
+                notices.push(format!("nie udało się zmienić uruchamiania z Windows: {e}"));
+            }
+        }
+        if new.run_as_admin && !old.run_as_admin && !is_elevated() {
+            notices.push("uprawnienia administratora zadziałają po ponownym uruchomieniu komunikatora".to_owned());
+        }
+        new.apply_to(self.state.settings_mut());
+        self.save_settings();
+        if !notices.is_empty() {
+            self.local_notice = Some(notices.join("; "));
+        }
+    }
+
     pub fn act(&mut self, hwnd: HWND, a: Action) {
         let fx = self.state.on_action(a);
         self.run_effects(hwnd, fx);
@@ -190,7 +312,10 @@ impl App {
 
     /// Applies every session event queued by the forwarder.
     pub fn drain_events(&mut self, hwnd: HWND) {
-        while let Ok(e) = self.events.try_recv() {
+        while let Ok((generation, e)) = self.events.try_recv() {
+            if generation != self.generation {
+                continue;
+            }
             if let (SessionEvent::MemberLeft(id), Some(c)) = (&e, &self.client) {
                 // Frees the slot; the model only sets gains, it never removes them.
                 c.gains.remove(*id);
@@ -269,6 +394,11 @@ impl App {
                 }
             }
         }
+        self.sync_controls();
+    }
+
+    /// Hands the mute state to the audio threads.
+    fn sync_controls(&self) {
         if let Some(c) = &self.client {
             use std::sync::atomic::Ordering::Relaxed;
             c.controls.muted.store(self.state.muted(), Relaxed);

@@ -128,6 +128,8 @@ pub struct AppState {
     speaking: BTreeSet<MemberId>,
     me_speaking: bool,
     window_shown: bool,
+    /// The room I asked to create; I enter it when the server announces it.
+    pending_room: Option<String>,
     view: View,
     version: u64,
     /// The view changed since the last version bump.
@@ -144,6 +146,7 @@ impl AppState {
             speaking: BTreeSet::new(),
             me_speaking: false,
             window_shown: true,
+            pending_room: None,
             view: View {
                 status: Status::Connecting,
                 rooms: Vec::new(),
@@ -175,6 +178,7 @@ impl AppState {
             }
             SessionEvent::Disconnected { retry_in } => {
                 self.lobby = None;
+                self.pending_room = None;
                 self.e2e.clear();
                 self.speaking.clear();
                 let secs = retry_in.as_secs() + u64::from(retry_in.subsec_nanos() > 0);
@@ -198,6 +202,11 @@ impl AppState {
                 self.room_changes(changes, &mut out);
             }
             SessionEvent::RoomCreated(r) => {
+                let mine = self.lobby.as_ref().and_then(|l| l.name_of(l.me())) == Some(r.creator.as_str());
+                if mine && self.pending_room.as_deref() == Some(r.name.as_str()) {
+                    self.pending_room = None;
+                    out.push(Effect::Command(SessionCommand::JoinRoom(r.id)));
+                }
                 if let Some(l) = self.lobby.as_mut() {
                     l.room_created(r);
                 }
@@ -206,7 +215,10 @@ impl AppState {
                 let changes = self.lobby.as_mut().map(|l| l.room_deleted(id)).unwrap_or_default();
                 self.room_changes(changes, &mut out);
             }
-            SessionEvent::RoomError(reason) => self.set_notice(Some(describe_room_error(&reason).to_owned())),
+            SessionEvent::RoomError(reason) => {
+                self.pending_room = None;
+                self.set_notice(Some(describe_room_error(&reason).to_owned()));
+            }
             SessionEvent::Chat(line) => out.extend(self.chat_line(line)),
             SessionEvent::ChatUnreadable { name, .. } => self.system_line(format!(
                 "nie udało się odszyfrować wiadomości od {} (klucze jeszcze się wymieniają)",
@@ -243,7 +255,12 @@ impl AppState {
             }
             Action::JoinRoom(id) => out.push(Effect::Command(SessionCommand::JoinRoom(id))),
             Action::LeaveRoom => out.push(Effect::Command(SessionCommand::LeaveRoom)),
-            Action::CreateRoom(name) => out.push(Effect::Command(SessionCommand::CreateRoom(name))),
+            Action::CreateRoom(name) => {
+                // As the server will name it, so its announcement can be recognised.
+                let name = protocol::normalize_room_name(&name).unwrap_or(name);
+                self.pending_room = Some(name.clone());
+                out.push(Effect::Command(SessionCommand::CreateRoom(name)));
+            }
             Action::DeleteRoom(id) => out.push(Effect::Command(SessionCommand::DeleteRoom(id))),
             Action::SendChat(text) => out.push(Effect::Command(SessionCommand::SendChat(text))),
             Action::SetVolume { name, percent } => {
@@ -281,6 +298,17 @@ impl AppState {
         let before = self.version;
         self.finish();
         self.version != before
+    }
+
+    /// Forgets everything about the current session before another one (a changed account)
+    /// starts; the chat history and mute state stay.
+    pub fn reset_session(&mut self) {
+        self.lobby = None;
+        self.e2e.clear();
+        self.speaking.clear();
+        self.pending_room = None;
+        self.set_status(Status::Connecting);
+        self.finish();
     }
 
     pub fn view(&self) -> &View {
@@ -833,6 +861,44 @@ mod tests {
         assert_eq!(s.view_version(), v);
         s.on_event(chat(2, "ola", "hej", false));
         assert_eq!(s.view_version(), v + 1);
+    }
+
+    #[test]
+    fn created_room_is_joined() {
+        let mut s = online();
+        assert_eq!(
+            s.on_action(Action::CreateRoom("  Nowy ".into())),
+            vec![Effect::Command(SessionCommand::CreateRoom("Nowy".into()))]
+        );
+        // Somebody else's room, even with the same name, is not mine to enter.
+        let other = RoomInfo { id: 12, name: "Nowy".into(), creator: "ola".into() };
+        assert_eq!(s.on_event(SessionEvent::RoomCreated(other)), vec![]);
+        let mine = RoomInfo { id: 13, name: "Nowy".into(), creator: "ja".into() };
+        assert_eq!(
+            s.on_event(SessionEvent::RoomCreated(mine.clone())),
+            vec![Effect::Command(SessionCommand::JoinRoom(13))]
+        );
+        // Only once.
+        let again = RoomInfo { id: 14, ..mine.clone() };
+        assert_eq!(s.on_event(SessionEvent::RoomCreated(again)), vec![]);
+        // A refused name forgets the wish.
+        s.on_action(Action::CreateRoom("Nowy".into()));
+        s.on_event(SessionEvent::RoomError(RoomErrorReason::NameTaken));
+        let later = RoomInfo { id: 15, ..mine };
+        assert_eq!(s.on_event(SessionEvent::RoomCreated(later)), vec![]);
+    }
+
+    #[test]
+    fn reset_session_forgets_the_lobby() {
+        let mut s = online();
+        s.on_event(chat(2, "ola", "hej", false));
+        s.on_action(Action::ToggleMute);
+        s.reset_session();
+        assert_eq!(s.view().status, Status::Connecting);
+        assert!(s.view().rooms.is_empty());
+        assert_eq!(s.view().my_room, None);
+        assert_eq!(s.view().chat.len(), 1);
+        assert!(s.muted());
     }
 
     #[test]

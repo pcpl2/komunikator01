@@ -97,9 +97,7 @@ pub fn create_controls(parent: HWND, instance: HINSTANCE) -> Controls {
         let col = LVCOLUMNW { mask: LVCF_WIDTH, cx: 100, ..Default::default() };
         SendMessageW(c.chat, LVM_INSERTCOLUMNW, Some(WPARAM(0)), Some(LPARAM(&col as *const _ as isize)));
         SendMessageW(c.input, EM_LIMITTEXT, Some(WPARAM(CHAT_LIMIT)), None);
-        // Open in Task 6 (new room and settings dialogs).
-        let _ = EnableWindow(c.new_room, false);
-        let _ = EnableWindow(c.settings, false);
+        // Enabled by the view once I am in a room.
         let _ = EnableWindow(c.leave, false);
     }
     c

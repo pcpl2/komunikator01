@@ -10,7 +10,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use client_core::app::Action;
+use client_core::app::{Action, MemberView};
 use client_core::settings::WindowRect;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -26,11 +26,13 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::app::App;
+use super::app::{account_input, App};
+use super::dialogs::{self, SafetyChoice, SafetyInfo, SettingsEnv, SettingsInput};
 use super::hotkey;
 use super::icons::{make_icon, tray_pixels, TrayState};
 use super::layout::{
-    self, create_controls, initial_rect, ID_CHAT, ID_DEAFEN, ID_LEAVE, ID_MUTE, ID_SEND, ID_TOP, ID_TREE,
+    self, create_controls, initial_rect, ID_CHAT, ID_DEAFEN, ID_LEAVE, ID_MUTE, ID_NEW_ROOM, ID_SEND, ID_SETTINGS,
+    ID_TOP, ID_TREE,
 };
 use super::render::{Controls, Render};
 use super::text::{tray_state, tray_tip, TreeItem, VOLUME_STEPS};
@@ -211,22 +213,14 @@ impl Window {
     /// Registers the hotkeys from the settings again (at start and after a settings change);
     /// failures go to the status bar.
     pub fn apply_hotkeys(&self) {
-        let hwnd = self.hwnd();
         let Ok(inner) = self.inner.try_borrow() else { return };
         let s = inner.app.settings();
-        let keys = [
-            (HOTKEY_MUTE, s.hotkey_mute.clone(), "Wycisz mikrofon"),
-            (HOTKEY_DEAFEN, s.hotkey_deafen.clone(), "Wycisz wszystkich"),
-        ];
+        let keys = [s.hotkey_mute.clone(), s.hotkey_deafen.clone()];
         drop(inner);
+        let results = self.register_hotkeys([keys[0].as_deref(), keys[1].as_deref()]);
         let mut errors = Vec::new();
-        for (id, text, label) in keys {
-            hotkey::unregister(hwnd, id);
-            let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
-            let result = hotkey::parse(&text)
-                .ok_or(hotkey::HotkeyError::Invalid)
-                .and_then(|h| hotkey::register(hwnd, id, &h));
-            if let Err(e) = result {
+        for ((result, text), label) in results.into_iter().zip(&keys).zip(["Wycisz mikrofon", "Wycisz wszystkich"]) {
+            if let (Err(e), Some(text)) = (result, text) {
                 errors.push(format!("{label} ({text}): {}", hotkey::describe(&e)));
             }
         }
@@ -234,6 +228,20 @@ impl Window {
             self.with_app(|app| app.set_local_notice(format!("skrót: {}", errors.join("; "))));
             self.redraw();
         }
+    }
+
+    /// Replaces both registrations with (mute, deafen); an empty one stays unregistered.
+    fn register_hotkeys(&self, keys: [Option<&str>; 2]) -> [Result<(), hotkey::HotkeyError>; 2] {
+        let hwnd = self.hwnd();
+        let ids = [HOTKEY_MUTE, HOTKEY_DEAFEN];
+        for id in ids {
+            hotkey::unregister(hwnd, id);
+        }
+        let register = |id: i32, text: Option<&str>| {
+            let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Ok(()) };
+            hotkey::parse(text).ok_or(hotkey::HotkeyError::Invalid).and_then(|h| hotkey::register(hwnd, id, &h))
+        };
+        [register(ids[0], keys[0]), register(ids[1], keys[1])]
     }
 
     /// First step of exiting: the window and tray icon go away at once and nothing more
@@ -267,7 +275,7 @@ impl Window {
         self.draw(&mut inner);
     }
 
-    fn redraw(&self) {
+    pub fn redraw(&self) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             self.draw(&mut inner);
         }
@@ -398,6 +406,12 @@ impl Window {
             ID_MUTE => self.act(Action::ToggleMute),
             ID_DEAFEN => self.act(Action::ToggleDeafen),
             ID_LEAVE => self.act(Action::LeaveRoom),
+            ID_NEW_ROOM => {
+                if let Some(name) = dialogs::new_room_dialog(self.hwnd()) {
+                    self.act(Action::CreateRoom(name));
+                }
+            }
+            ID_SETTINGS => self.settings_dialog(),
             ID_TOP if u32::from(code) == BN_CLICKED => {
                 let on = unsafe { SendMessageW(c.top, BM_GETCHECK, None, None) }.0 == 1;
                 set_topmost(self.hwnd(), on);
@@ -485,15 +499,72 @@ impl Window {
         let mut items: Vec<_> = VOLUME_STEPS.iter().map(|p| (format!("{p}%"), check(*p == m.percent))).collect();
         items.push((String::new(), MF_SEPARATOR));
         items.push(("Wycisz u mnie".to_owned(), check(m.locally_muted)));
-        // Opens in Task 6 (safety code dialog).
-        items.push(("Kod bezpieczeństwa…".to_owned(), MF_STRING | MF_GRAYED));
-        let mute = VOLUME_STEPS.len() + 1;
+        // Only members of my room whose key has arrived have a code.
+        let has_code = m.code.is_some() && m.trust.is_some();
+        items.push(("Kod bezpieczeństwa…".to_owned(), if has_code { MF_STRING } else { MF_STRING | MF_GRAYED }));
+        let (mute, code) = (VOLUME_STEPS.len() + 1, VOLUME_STEPS.len() + 2);
         match popup(self.hwnd(), &items) {
             Some(i) if i < VOLUME_STEPS.len() => {
                 self.act(Action::SetVolume { name: m.name, percent: VOLUME_STEPS[i] })
             }
             Some(i) if i == mute => self.act(Action::ToggleLocalMute(m.name)),
+            Some(i) if i == code => self.safety_dialog(m),
             _ => {}
+        }
+    }
+
+    fn safety_dialog(&self, m: MemberView) {
+        let (Some(trust), Some(code)) = (m.trust, m.code) else { return };
+        let info = SafetyInfo { name: m.name, trust, code };
+        match dialogs::safety_dialog(self.hwnd(), &info) {
+            Some(SafetyChoice::Verify(group)) => self.act(Action::VerifyMember { id: m.id, group }),
+            Some(SafetyChoice::Accept(group)) => self.act(Action::AcceptMember { id: m.id, group }),
+            None => {}
+        }
+    }
+
+    /// Runs the settings dialog (no state borrowed while it is open) and applies the result.
+    fn settings_dialog(&self) {
+        let hwnd = self.hwnd();
+        let Ok(inner) = self.inner.try_borrow() else { return };
+        let current = SettingsInput::from_settings(inner.app.settings());
+        let activity = inner.app.activity();
+        drop(inner);
+        // WASAPI enumeration initialises COM for its thread; keep that off the UI thread.
+        let (capture_devices, render_devices) = std::thread::scope(|s| {
+            s.spawn(|| (crate::wasapi::list_capture_devices(), crate::wasapi::list_render_devices()))
+                .join()
+                .unwrap_or_default()
+        });
+        let mic_level = || activity.as_ref().map_or(f32::NEG_INFINITY, |a| a.mic_level_dbfs());
+        let try_hotkeys = |mute: Option<&str>, deafen: Option<&str>| {
+            self.register_hotkeys([mute, deafen]).map(|r| r.err().map(|e| hotkey::describe(&e)))
+        };
+        let open_account = |owner: HWND| self.account_dialog(owner);
+        let env = SettingsEnv {
+            capture_devices,
+            render_devices,
+            mic_level: &mic_level,
+            try_hotkeys: &try_hotkeys,
+            open_account: &open_account,
+        };
+        if let Some(new) = dialogs::settings_dialog(hwnd, &current, env) {
+            self.with_app(|app| app.apply_settings(new));
+        }
+        // Back to what the settings say, whether the dialog tried others or not.
+        self.apply_hotkeys();
+        self.redraw();
+    }
+
+    /// The account dialog over `owner`; a changed account restarts the session.
+    fn account_dialog(&self, owner: HWND) {
+        let hwnd = self.hwnd();
+        let Ok(inner) = self.inner.try_borrow() else { return };
+        let initial = account_input(inner.app.settings());
+        drop(inner);
+        if let Some(a) = dialogs::account_dialog(Some(owner), &initial, false) {
+            self.with_app(|app| app.change_account(hwnd, a));
+            self.redraw();
         }
     }
 

@@ -5,6 +5,7 @@
 pub mod app;
 pub mod autostart;
 pub mod clipboard;
+pub mod dialogs;
 pub mod hotkey;
 pub mod icons;
 mod layout;
