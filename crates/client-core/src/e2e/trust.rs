@@ -36,6 +36,7 @@ pub struct KnownDevices {
     path: PathBuf,
     records: Vec<Record>,
     save_failed: Cell<bool>,
+    recovered_from: Option<PathBuf>,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -46,18 +47,59 @@ fn to_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Writes via `<path>.tmp`: create, write, fsync, rename; the temp file is removed on error.
+fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 impl KnownDevices {
-    /// Loads the store. A missing file is an empty store; a malformed one is an error,
-    /// so trust data is never silently discarded.
+    /// Loads the store. A missing file is an empty store. A file that cannot be parsed is
+    /// moved to `<file>.broken` (replacing an older one) and the store starts empty; the
+    /// caller must tell the user (see [`KnownDevices::recovered_from`]). Other read errors
+    /// (e.g. access denied) are returned and the file is left alone.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let mut recovered_from = None;
         let records = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str::<FileFormat>(&text)
-                .map_err(|e| anyhow::anyhow!("malformed trust file {}: {e}", path.display()))?
-                .device,
+            Ok(text) => match toml::from_str::<FileFormat>(&text) {
+                Ok(f) => f.device,
+                Err(e) => {
+                    let mut broken = path.as_os_str().to_owned();
+                    broken.push(".broken");
+                    let broken = PathBuf::from(broken);
+                    tracing::warn!("malformed trust file {}: {e}; moved to {}", path.display(), broken.display());
+                    if broken.exists() {
+                        std::fs::remove_file(&broken)?;
+                    }
+                    std::fs::rename(path, &broken)?;
+                    recovered_from = Some(broken);
+                    Vec::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { path: path.to_path_buf(), records, save_failed: Cell::new(false) })
+        Ok(Self { path: path.to_path_buf(), records, save_failed: Cell::new(false), recovered_from })
+    }
+
+    /// Where an unreadable trust file was moved during [`KnownDevices::load`], if that happened.
+    /// All previously known devices are then forgotten and will show up as new.
+    pub fn recovered_from(&self) -> Option<&Path> {
+        self.recovered_from.as_deref()
     }
 
     fn position(&self, user: &str, id: &IdentityPublic) -> Option<usize> {
@@ -81,12 +123,7 @@ impl KnownDevices {
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        write_atomic(&self.path, text.as_bytes())
     }
 
     fn persist(&self) {
@@ -228,11 +265,33 @@ mod tests {
     }
 
     #[test]
-    fn malformed_file_is_an_error() {
+    fn malformed_file_is_set_aside_and_store_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("known.toml");
         std::fs::write(&p, "this is [not toml").unwrap();
-        assert!(KnownDevices::load(&p).is_err());
+        let mut k = KnownDevices::load(&p).unwrap();
+        let broken = dir.path().join("known.toml.broken");
+        assert_eq!(k.recovered_from(), Some(broken.as_path()));
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "this is [not toml");
+        assert_eq!(k.check("ala", &id(1, 1)), Trust::NewUser);
+        // The new store is written fresh and loads cleanly.
+        let k2 = KnownDevices::load(&p).unwrap();
+        assert_eq!(k2.recovered_from(), None);
+    }
+
+    #[test]
+    fn missing_file_is_empty_without_recovery() {
+        let (_d, k) = store();
+        assert_eq!(k.recovered_from(), None);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file() {
+        let (d, mut k) = store();
+        k.check("ala", &id(1, 1));
+        assert!(!k.save_failed());
+        assert!(d.path().join("known.toml").exists());
+        assert!(!d.path().join("known.toml.tmp").exists());
     }
 
     #[test]

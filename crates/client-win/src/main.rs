@@ -90,7 +90,16 @@ fn main() -> anyhow::Result<()> {
     }
     let identity = Arc::new(identity);
     let trust_path = data_dir.join("known_devices.toml");
-    let trust = Arc::new(Mutex::new(KnownDevices::load(&trust_path)?));
+    let known = KnownDevices::load(&trust_path)?;
+    if let Some(broken) = known.recovered_from() {
+        println!(
+            "UWAGA: nie udało się odczytać listy zaufanych urządzeń (odłożona jako {}).\n\
+             Zaczynamy od pustej listy: wszyscy znajomi pojawią się jako nowe osoby, \
+             a wcześniejsze weryfikacje kodów trzeba powtórzyć.",
+            broken.display()
+        );
+    }
+    let trust = Arc::new(Mutex::new(known));
     let mut session = spawn_session(
         rt.handle(),
         SessionParams { server, fingerprint, username: user, password, identity, trust: trust.clone() },
