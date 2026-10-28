@@ -51,6 +51,13 @@ where
         self.next_attempt = (self.clock)() + RETRY_EVERY;
     }
 
+    /// Drops the stream so the next call reopens it at once on the new default device.
+    fn switch_device(&mut self) {
+        tracing::info!("default audio device changed; reopening");
+        self.stream = None;
+        self.next_attempt = (self.clock)();
+    }
+
     fn idle(&self) {
         if self.idle_wait {
             std::thread::sleep(IDLE_FRAME);
@@ -65,8 +72,14 @@ where
 {
     fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError> {
         if self.ensure_open() {
-            match self.stream.as_mut().expect("open").read_frame(out) {
-                Ok(()) => return Ok(()),
+            let stream = self.stream.as_mut().expect("open");
+            match stream.read_frame(out) {
+                Ok(()) => {
+                    if stream.device_changed() {
+                        self.switch_device();
+                    }
+                    return Ok(());
+                }
                 Err(e) => self.lost(e),
             }
         } else {
@@ -84,8 +97,11 @@ where
 {
     fn write_frame(&mut self, pcm: &Pcm) -> Result<(), AudioError> {
         if self.ensure_open() {
-            if let Err(e) = self.stream.as_mut().expect("open").write_frame(pcm) {
-                self.lost(e);
+            let stream = self.stream.as_mut().expect("open");
+            match stream.write_frame(pcm) {
+                Ok(()) if stream.device_changed() => self.switch_device(),
+                Ok(()) => {}
+                Err(e) => self.lost(e),
             }
         } else {
             self.idle();
@@ -172,6 +188,41 @@ mod tests {
             t.set(t.get() + Duration::from_secs(1));
         }
         assert_eq!(opens.get(), 3);
+        assert_eq!(out[0], 0.5);
+    }
+
+    /// Works, but reports once that the system default device changed.
+    struct Switching {
+        report_change: bool,
+    }
+
+    impl FrameSource for Switching {
+        fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError> {
+            out.fill(0.5);
+            Ok(())
+        }
+
+        fn device_changed(&mut self) -> bool {
+            std::mem::take(&mut self.report_change)
+        }
+    }
+
+    #[test]
+    fn supervisor_follows_default_device_change_immediately() {
+        let opens = Rc::new(Cell::new(0));
+        let o = opens.clone();
+        let (_t, now) = clock();
+        let mut s = Supervised::new(
+            move || {
+                o.set(o.get() + 1);
+                Ok(Switching { report_change: o.get() == 1 })
+            },
+            now,
+        );
+        let mut out = [0f32; FRAME_SAMPLES];
+        s.read_frame(&mut out).unwrap();
+        s.read_frame(&mut out).unwrap();
+        assert_eq!(opens.get(), 2, "reopened on the new default without waiting");
         assert_eq!(out[0], 0.5);
     }
 

@@ -17,9 +17,19 @@ pub enum AudioError {
 /// Blocking source of 20 ms mono frames; paces the capture thread.
 pub trait FrameSource {
     fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError>;
+
+    /// True when the stream should move to a new system default device.
+    fn device_changed(&mut self) -> bool {
+        false
+    }
 }
 
 /// Blocking sink of 20 ms mono frames; paces the render thread.
 pub trait FrameSink {
     fn write_frame(&mut self, pcm: &Pcm) -> Result<(), AudioError>;
+
+    /// True when the stream should move to a new system default device.
+    fn device_changed(&mut self) -> bool {
+        false
+    }
 }

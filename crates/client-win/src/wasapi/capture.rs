@@ -60,6 +60,10 @@ impl WasapiCapture {
 }
 
 impl FrameSource for WasapiCapture {
+    fn device_changed(&mut self) -> bool {
+        self.stream.default_changed()
+    }
+
     fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError> {
         while self.pending_len < FRAME_SAMPLES {
             let woke = unsafe { WaitForSingleObject(self.stream.event, WAIT_MS) };

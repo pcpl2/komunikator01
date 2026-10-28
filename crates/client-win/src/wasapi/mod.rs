@@ -43,6 +43,7 @@ impl From<windows::core::Error> for AudioError {
 struct Stream {
     client: IAudioClient,
     event: HANDLE,
+    tracker: Option<DefaultTracker>,
 }
 
 impl Drop for Stream {
@@ -91,15 +92,62 @@ fn open_stream(flow: EDataFlow, device_id: Option<&str>, buffer_ms: i64) -> Resu
         client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, buffer_ms * 10_000, 0, &format, None)?;
 
         // A communications stream would otherwise make Windows lower the game's volume.
-        match client.cast::<IAudioClientDuckingControl>() {
-            Ok(d) => d.SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)?,
-            Err(e) => tracing::warn!("cannot opt out of ducking: {e}"),
+        // Best effort: failing here must not keep the device from opening.
+        let ducking = client.cast::<IAudioClientDuckingControl>().and_then(|d| {
+            d.SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)
+        });
+        if let Err(e) = ducking {
+            tracing::warn!("cannot opt out of ducking: {e}");
         }
 
+        let tracker = match device_id {
+            Some(_) => None,
+            None => Some(DefaultTracker { enumerator, flow, id: device_id_of(&device)?, frames: 0 }),
+        };
         let event = CreateEventW(None, false, false, None)?;
-        let stream = Stream { client, event };
+        let stream = Stream { client, event, tracker };
         stream.client.SetEventHandle(stream.event)?;
         Ok(stream)
+    }
+}
+
+/// Notices when Windows switches the default communications device (e.g. a headset is
+/// plugged in), so a stream opened on "the default" can follow it.
+struct DefaultTracker {
+    enumerator: IMMDeviceEnumerator,
+    flow: EDataFlow,
+    id: String,
+    frames: u32,
+}
+
+/// Check about once a second (50 frames of 20 ms).
+const DEFAULT_CHECK_FRAMES: u32 = 50;
+
+impl DefaultTracker {
+    fn changed(&mut self) -> bool {
+        self.frames += 1;
+        if self.frames < DEFAULT_CHECK_FRAMES {
+            return false;
+        }
+        self.frames = 0;
+        let current = unsafe { self.enumerator.GetDefaultAudioEndpoint(self.flow, eCommunications) }
+            .and_then(|d| device_id_of(&d));
+        matches!(current, Ok(id) if id != self.id)
+    }
+}
+
+impl Stream {
+    fn default_changed(&mut self) -> bool {
+        self.tracker.as_mut().is_some_and(DefaultTracker::changed)
+    }
+}
+
+fn device_id_of(device: &IMMDevice) -> windows::core::Result<String> {
+    unsafe {
+        let raw = device.GetId()?;
+        let id = raw.to_string();
+        CoTaskMemFree(Some(raw.0 as _));
+        id.map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))
     }
 }
 

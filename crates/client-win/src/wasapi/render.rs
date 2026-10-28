@@ -31,6 +31,10 @@ impl WasapiRender {
 }
 
 impl FrameSink for WasapiRender {
+    fn device_changed(&mut self) -> bool {
+        self.stream.default_changed()
+    }
+
     fn write_frame(&mut self, pcm: &Pcm) -> Result<(), AudioError> {
         let n = FRAME_SAMPLES as u32;
         unsafe {
