@@ -44,12 +44,11 @@ struct Cli {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    use client_core::audio::codec::Encoder;
-    use client_core::audio::vad::Vad;
+    use client_core::audio::activity::Activity;
     use client_win::identity_store::IdentityStatus;
-    use client_win::pipeline::{capture_loop, render_loop, Controls};
-    use client_win::supervisor::Supervised;
-    use client_win::wasapi::{self, enter_pro_audio, WasapiCapture, WasapiRender};
+    use client_win::engine::AudioEngine;
+    use client_win::pipeline::Controls;
+    use client_win::wasapi;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -115,29 +114,17 @@ fn main() -> anyhow::Result<()> {
     let audio_out = session.audio_out.clone();
 
     let controls = Arc::new(Controls::default());
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let capture = {
-        let (controls, stop, device) = (controls.clone(), stop.clone(), cli.capture_device);
-        std::thread::Builder::new().name("capture".into()).spawn(move || {
-            let _mmcss = enter_pro_audio();
-            let src = Supervised::new(move || WasapiCapture::open(device.as_deref()), std::time::Instant::now);
-            match Encoder::new() {
-                Ok(enc) => capture_loop(src, Vad::new(0.5), enc, audio_out, controls, stop),
-                Err(e) => eprintln!("opus: {e}"),
-            }
-        })?
-    };
     let gains = Arc::new(GainTable::new());
-    let render = {
-        let (controls, stop, device) = (controls.clone(), stop.clone(), cli.render_device);
-        let gains = gains.clone();
-        std::thread::Builder::new().name("render".into()).spawn(move || {
-            let _mmcss = enter_pro_audio();
-            let sink = Supervised::new(move || WasapiRender::open(device.as_deref()), std::time::Instant::now);
-            render_loop(sink, audio_in, controls, gains, stop);
-        })?
-    };
+    let engine = AudioEngine::start(
+        cli.capture_device,
+        cli.render_device,
+        0.5,
+        audio_out,
+        audio_in,
+        controls.clone(),
+        gains.clone(),
+        Arc::new(Activity::new()),
+    );
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
@@ -257,10 +244,8 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    stop.store(true, Ordering::Relaxed);
     session.shutdown();
-    let _ = capture.join();
-    let _ = render.join();
+    engine.stop();
     std::process::exit(exit_code);
 }
 

@@ -4,6 +4,7 @@
 pub mod dpapi;
 #[cfg(windows)]
 pub mod identity_store;
+pub mod engine;
 pub mod pipeline;
 pub mod supervisor;
 #[cfg(windows)]
@@ -35,5 +36,25 @@ pub trait FrameSink {
     /// True when the stream should move to a new system default device.
     fn device_changed(&mut self) -> bool {
         false
+    }
+}
+
+impl FrameSource for Box<dyn FrameSource> {
+    fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError> {
+        (**self).read_frame(out)
+    }
+
+    fn device_changed(&mut self) -> bool {
+        (**self).device_changed()
+    }
+}
+
+impl FrameSink for Box<dyn FrameSink> {
+    fn write_frame(&mut self, pcm: &Pcm) -> Result<(), AudioError> {
+        (**self).write_frame(pcm)
+    }
+
+    fn device_changed(&mut self) -> bool {
+        (**self).device_changed()
     }
 }

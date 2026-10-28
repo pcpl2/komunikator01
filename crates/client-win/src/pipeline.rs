@@ -1,8 +1,9 @@
 //! Capture and render loops connecting audio devices to the network session.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use client_core::audio::activity::Activity;
 use client_core::audio::codec::{Decoder, Encoder};
 use client_core::audio::frame::{EncodedFrame, IncomingFrame, Pcm, FRAME_SAMPLES, MAX_PACKET};
 use client_core::audio::jitter::{JitterBuffer, Pop};
@@ -25,15 +26,21 @@ pub struct Controls {
 
 /// Reads the microphone until `stop` or a source error. Sequence numbers advance every
 /// 20 ms whether or not a frame is sent, so receivers can tell pauses from loss.
+/// `sensitivity` (f32 bits) is read every frame so the UI can retune the VAD live.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_loop(
     mut src: impl FrameSource,
     mut vad: Vad,
     mut enc: Encoder,
     out: mpsc::Sender<EncodedFrame>,
     controls: Arc<Controls>,
+    activity: Arc<Activity>,
+    sensitivity: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
 ) {
     let mut pcm = [0f32; FRAME_SAMPLES];
+    let mut applied = sensitivity.load(Ordering::Relaxed);
+    vad.set_sensitivity(f32::from_bits(applied));
     let mut packet = [0u8; MAX_PACKET];
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -43,13 +50,19 @@ pub fn capture_loop(
         }
         let this_seq = seq;
         seq = seq.wrapping_add(1);
+        let wanted = sensitivity.load(Ordering::Relaxed);
+        if wanted != applied {
+            applied = wanted;
+            vad.set_sensitivity(f32::from_bits(wanted));
+        }
         let speaking = vad.process(&pcm);
         // Deafen silences the mic too; the flags stay separate so undeafening restores
         // whatever mute state the user had.
-        if !speaking
-            || controls.muted.load(Ordering::Relaxed)
-            || controls.deafened.load(Ordering::Relaxed)
-        {
+        let sending = speaking
+            && !controls.muted.load(Ordering::Relaxed)
+            && !controls.deafened.load(Ordering::Relaxed);
+        activity.set_me(sending, vad.level_dbfs());
+        if !sending {
             continue;
         }
         match enc.encode(&pcm, &mut packet) {
@@ -74,13 +87,15 @@ struct Voice {
 }
 
 /// Plays everyone else until `stop` or a sink error; the sink's blocking write paces the loop.
+/// Returns the input channel so a restarted loop can keep receiving on the same session.
 pub fn render_loop(
     mut sink: impl FrameSink,
     mut inp: mpsc::Receiver<IncomingFrame>,
     controls: Arc<Controls>,
     gains: Arc<GainTable>,
+    activity: Arc<Activity>,
     stop: Arc<AtomicBool>,
-) {
+) -> mpsc::Receiver<IncomingFrame> {
     // Every slot and decoder is made up front so the real-time loop never allocates.
     let voices: Result<Vec<Box<Voice>>, _> = (0..MAX_VOICES)
         .map(|_| {
@@ -99,7 +114,7 @@ pub fn render_loop(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("render not started: {e}");
-            return;
+            return inp;
         }
     };
     let mut out = [0f32; FRAME_SAMPLES];
@@ -116,18 +131,21 @@ pub fn render_loop(
             if v.jitter.pop(&mut v.decoder, &mut v.pcm) == Pop::Audio {
                 if let Some(id) = v.id {
                     accumulate(&mut out, &v.pcm, gains.get(id));
+                    activity.heard(id);
                 }
             }
         }
+        activity.tick();
         clip(&mut out);
         if controls.deafened.load(Ordering::Relaxed) {
             out.fill(0.0);
         }
         if let Err(e) = sink.write_frame(&out) {
             tracing::warn!("render stopped: {e:?}");
-            return;
+            return inp;
         }
     }
+    inp
 }
 
 /// The voice slot for `id`. A new sender takes an unused slot, or else the one
@@ -155,6 +173,7 @@ mod tests {
     use super::*;
     use crate::AudioError;
     use client_core::audio::frame::{IncomingFrame, FRAME_SAMPLES, SAMPLE_RATE};
+    use client_core::audio::activity::Activity;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -180,16 +199,29 @@ mod tests {
     }
 
     fn run_capture_with(frames: Vec<Pcm>, muted: bool, deafened: bool) -> Vec<u32> {
+        run_capture_full(frames, muted, deafened, 0.5, 0.5, Arc::new(Activity::new()))
+    }
+
+    fn run_capture_full(
+        frames: Vec<Pcm>,
+        muted: bool,
+        deafened: bool,
+        vad_sensitivity: f32,
+        shared_sensitivity: f32,
+        activity: Arc<Activity>,
+    ) -> Vec<u32> {
         let (tx, mut rx) = mpsc::channel(1024);
         let controls = Arc::new(Controls::default());
         controls.muted.store(muted, Ordering::Relaxed);
         controls.deafened.store(deafened, Ordering::Relaxed);
         capture_loop(
             Script(frames.into_iter()),
-            Vad::new(0.5),
+            Vad::new(vad_sensitivity),
             Encoder::new().unwrap(),
             tx,
             controls,
+            activity,
+            Arc::new(AtomicU32::new(shared_sensitivity.to_bits())),
             Arc::new(AtomicBool::new(false)),
         );
         std::iter::from_fn(|| rx.try_recv().ok()).map(|f| f.seq).collect()
@@ -244,6 +276,10 @@ mod tests {
     }
 
     fn run_render_with(deafened: bool, gains: GainTable) -> Vec<Pcm> {
+        run_render_full(deafened, gains, Arc::new(Activity::new()))
+    }
+
+    fn run_render_full(deafened: bool, gains: GainTable, activity: Arc<Activity>) -> Vec<Pcm> {
         let (tx, rx) = mpsc::channel(256);
         for sender in [1, 2] {
             let mut enc = Encoder::new().unwrap();
@@ -261,6 +297,7 @@ mod tests {
             rx,
             controls,
             Arc::new(gains),
+            activity,
             Arc::new(AtomicBool::new(false)),
         );
         frames.take()
@@ -312,9 +349,51 @@ mod tests {
             rx,
             Arc::new(Controls::default()),
             Arc::new(GainTable::new()),
+            Arc::new(Activity::new()),
             Arc::new(AtomicBool::new(false)),
         );
         assert!(peak(&frames.take()[5..]) > 0.1, "sender 17 plays");
+    }
+
+    #[test]
+    fn render_marks_speakers() {
+        let activity = Arc::new(Activity::new());
+        run_render_full(false, GainTable::new(), activity.clone());
+        let mut heard = Vec::new();
+        activity.speaking(&mut heard);
+        heard.sort();
+        assert_eq!(heard, [1, 2]);
+    }
+
+    #[test]
+    fn capture_publishes_me_speaking_and_level() {
+        let activity = Arc::new(Activity::new());
+        run_capture_full((0..5).map(sine).collect(), false, false, 0.5, 0.5, activity.clone());
+        assert!(activity.me_speaking());
+        let level = activity.mic_level_dbfs();
+        assert!((-30.0..-20.0).contains(&level), "0.141 amplitude sine is about -23 dBFS: {level}");
+
+        // Muted: the mic level still moves, but nobody hears the speaker.
+        let activity = Arc::new(Activity::new());
+        run_capture_full((0..5).map(sine).collect(), true, false, 0.5, 0.5, activity.clone());
+        assert!(!activity.me_speaking());
+        assert!(activity.mic_level_dbfs() > -30.0);
+    }
+
+    /// Noise at -40 dBFS sets the floor; speech at -28 dBFS opens the gate only when
+    /// the sensitivity is high.
+    fn speech_over_noise_sends(shared_sensitivity: f32) -> bool {
+        let mut frames = vec![[0.01; FRAME_SAMPLES]; 100];
+        frames.extend(vec![[0.04; FRAME_SAMPLES]; 5]);
+        let activity = Arc::new(Activity::new());
+        run_capture_full(frames, false, false, 0.0, shared_sensitivity, activity.clone());
+        activity.me_speaking()
+    }
+
+    #[test]
+    fn capture_applies_new_sensitivity() {
+        assert!(!speech_over_noise_sends(0.0), "low sensitivity stays closed");
+        assert!(speech_over_noise_sends(1.0), "the shared value overrides the Vad's own");
     }
 
     #[test]
