@@ -27,9 +27,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opus = "0.4"
 tempfile = "3"
+bytes = "1"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Argon2, Opus and QUIC are very slow unoptimized; our own crates stay debuggable.
+[profile.dev.package."*"]
+opt-level = 3

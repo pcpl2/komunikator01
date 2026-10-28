@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 protocol.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 argon2.workspace = true
 password-hash = { version = "0.5", features = ["getrandom"] }
@@ -18,7 +19,13 @@ anyhow.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 sha2.workspace = true
+quinn.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+client-core.workspace = true

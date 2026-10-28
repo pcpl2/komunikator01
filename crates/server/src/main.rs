@@ -23,10 +23,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
-        Cmd::Run { config } => {
-            let _config = server::ServerConfig::load(&config)?;
-            Ok(())
-        }
+        Cmd::Run { config } => run(server::ServerConfig::load(&config)?),
         Cmd::HashPassword => {
             let mut pw = String::new();
             std::io::stdin().read_to_string(&mut pw)?;
@@ -34,4 +31,21 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn run(config: server::ServerConfig) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let srv = server::start(config).await?;
+        println!("listening: {}", srv.local_addr());
+        println!("fingerprint: {}", protocol::fingerprint_hex(&srv.fingerprint()));
+        tokio::signal::ctrl_c().await?;
+        srv.shutdown().await;
+        Ok(())
+    })
 }
