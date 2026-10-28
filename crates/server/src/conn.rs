@@ -9,7 +9,7 @@ use bytes::Bytes;
 use protocol::audio::{upstream_to_downstream, MAX_DATAGRAM};
 use protocol::{
     encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, ServerMsg,
-    PROTOCOL_VERSION,
+    MAX_BLOB, PROTOCOL_VERSION,
 };
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use serde::de::DeserializeOwned;
@@ -30,6 +30,9 @@ const LINGER: Duration = Duration::from_secs(2);
 const AUDIO_RATE_PER_S: u32 = 100;
 const AUDIO_BURST: u32 = 20;
 /// Replaced client runs remembered per account.
+/// Control messages (Announce/Relay) per second and burst, per connection.
+const CTRL_RATE_PER_S: u32 = 50;
+const CTRL_BURST: u32 = 100;
 const RETIRED_PER_USER: usize = 8;
 
 /// A room member as seen by other connections.
@@ -39,6 +42,8 @@ pub(crate) struct Peer {
     ctrl: mpsc::UnboundedSender<ServerMsg>,
     /// The client run this connection belongs to (`ClientMsg::Hello::session`).
     session: u64,
+    /// Last key-exchange blob this member announced (opaque; never logged).
+    announce: Option<Arc<[u8]>>,
 }
 
 pub(crate) struct Shared {
@@ -118,7 +123,7 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     }
 
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-    let Some(id) = join_room(&shared, &username, Peer { conn: conn.clone(), ctrl: ctrl_tx, session })
+    let Some(id) = join_room(&shared, &username, Peer { conn: conn.clone(), ctrl: ctrl_tx, session, announce: None })
     else {
         tracing::info!(%ip, user = %username, "replaced client tried to come back");
         send_and_close(send, &conn, ServerMsg::SessionReplaced, CLOSE_REPLACED).await;
@@ -128,7 +133,7 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     let writer = tokio::spawn(write_ctrl(send, ctrl_rx, conn.clone()));
 
     let end = tokio::select! {
-        e = control_loop(&mut recv, &mut dec) => e,
+        e = control_loop(&mut recv, &mut dec, id, &shared) => e,
         e = datagram_loop(&conn, id, &shared) => e,
     };
     if let End::Violation = end {
@@ -208,6 +213,12 @@ fn join_room(shared: &Shared, username: &str, peer: Peer) -> Option<MemberId> {
         let _ = p.ctrl.send(ServerMsg::MemberJoined(me.clone()));
     }
     let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, members: outcome.members });
+    // Same room lock as Welcome, so these always follow it and precede any later Announce.
+    for (from, p) in room.peers_with_ids(outcome.id) {
+        if let Some(blob) = &p.announce {
+            let _ = welcome_tx.send(ServerMsg::Announce { from, blob: blob.to_vec() });
+        }
+    }
     Some(outcome.id)
 }
 
@@ -241,11 +252,44 @@ async fn send_and_close(mut send: SendStream, conn: &Connection, msg: ServerMsg,
     conn.close(VarInt::from_u32(code), b"");
 }
 
-async fn control_loop(recv: &mut RecvStream, dec: &mut FrameDecoder) -> End {
-    // Announce/Relay are forwarded in a later change; until then any message after Hello is a violation.
-    match read_msg::<ClientMsg>(recv, dec).await {
-        Ok(Some(_)) | Err(End::Violation) => End::Violation,
-        Ok(None) | Err(End::Closed) => End::Closed,
+async fn control_loop(
+    recv: &mut RecvStream,
+    dec: &mut FrameDecoder,
+    id: MemberId,
+    shared: &Shared,
+) -> End {
+    let mut bucket = TokenBucket::new(CTRL_RATE_PER_S, CTRL_BURST);
+    loop {
+        let msg = match read_msg::<ClientMsg>(recv, dec).await {
+            Ok(Some(m)) => m,
+            Err(End::Violation) => return End::Violation,
+            Ok(None) | Err(End::Closed) => return End::Closed,
+        };
+        match msg {
+            ClientMsg::Announce { blob } | ClientMsg::Relay { blob, .. } if blob.len() > MAX_BLOB => {
+                return End::Violation;
+            }
+            ClientMsg::Hello { .. } => return End::Violation,
+            _ if !bucket.try_take(Instant::now()) => {}
+            ClientMsg::Announce { blob } => {
+                let mut room = shared.room.lock().unwrap();
+                // A replaced session lingers to read its notice but must not be heard.
+                let Some(me) = room.get_mut(id) else { continue };
+                me.announce = Some(Arc::from(blob.as_slice()));
+                for p in room.peers(id) {
+                    let _ = p.ctrl.send(ServerMsg::Announce { from: id, blob: blob.clone() });
+                }
+            }
+            ClientMsg::Relay { to, blob } => {
+                let room = shared.room.lock().unwrap();
+                if to == id || !room.contains(id) {
+                    continue;
+                }
+                if let Some(p) = room.get(to) {
+                    let _ = p.ctrl.send(ServerMsg::Relay { from: id, blob });
+                }
+            }
+        }
     }
 }
 
