@@ -3,3 +3,4 @@
 pub mod codec;
 pub mod frame;
 pub mod mixer;
+pub mod vad;
