@@ -2,3 +2,4 @@
 
 pub mod net;
 pub mod audio;
+pub mod e2e;
