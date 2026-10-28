@@ -63,6 +63,11 @@ impl Lobby {
         self.members.values().filter(|m| m.room == room).collect()
     }
 
+    /// Everyone online, me included, in ascending id order.
+    pub fn members(&self) -> impl Iterator<Item = &MemberInfo> {
+        self.members.values()
+    }
+
     pub fn name_of(&self, id: MemberId) -> Option<&str> {
         self.members.get(&id).map(|m| m.name.as_str())
     }

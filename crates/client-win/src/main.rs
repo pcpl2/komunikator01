@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::collections::BTreeMap;
 
 use clap::Parser;
+use client_core::app::{describe_chat_not_sent, describe_fatal, describe_room_error, trust_label};
 use client_core::audio::volume::{GainTable, VolumeBook};
 use client_core::chat::{find_links, sanitize_name};
 use client_core::e2e::{AnnounceError, E2eEvent, IdentityPublic, KnownDevices, Trust};
 use client_core::lobby::Lobby;
 use client_core::net::session::{
-    spawn_session, ChatLine, ChatSendError, FatalReason, SessionCommand, SessionEvent, SessionParams,
+    spawn_session, ChatLine, ChatSendError, SessionCommand, SessionEvent, SessionParams,
 };
-use protocol::{MemberId, RoomErrorReason, RoomId, PROTOCOL_VERSION};
+use protocol::{MemberId, RoomId};
 
 #[derive(Parser)]
 #[command(name = "komunikator", version, about = "Lekki komunikator głosowy")]
@@ -308,7 +309,7 @@ fn print_event(e: &SessionEvent, now: (u16, u16)) {
             "nie udało się odszyfrować wiadomości od {} (klucze jeszcze się wymieniają)",
             sanitize_name(name)
         ),
-        SessionEvent::ChatNotSent(reason) => println!("nie wysłano wiadomości: {}", describe_chat_error(*reason)),
+        SessionEvent::ChatNotSent(reason) => println!("nie wysłano wiadomości: {}", cli_chat_not_sent(*reason)),
         SessionEvent::Disconnected { retry_in } => {
             println!("rozłączono, ponowna próba za {:.1} s", retry_in.as_secs_f32())
         }
@@ -334,37 +335,6 @@ fn print_event(e: &SessionEvent, now: (u16, u16)) {
         SessionEvent::E2e(E2eEvent::Rejected { id, reason }) => {
             println!("e2e: odrzucono ogłoszenie klucza od uczestnika {id}: {}", describe_reject(reason))
         }
-    }
-}
-
-fn describe_room_error(r: &RoomErrorReason) -> &'static str {
-    match r {
-        RoomErrorReason::InvalidName => "niepoprawna nazwa (1–32 znaki)",
-        RoomErrorReason::NameTaken => "nazwa zajęta",
-        RoomErrorReason::TooManyRooms => "za dużo pokoi",
-        RoomErrorReason::NotFound => "pokój nie istnieje",
-        RoomErrorReason::NotAllowed => "nie możesz usunąć cudzego pokoju",
-        RoomErrorReason::NotEmpty => "w pokoju ktoś jest",
-        RoomErrorReason::Full => "pokój pełny",
-    }
-}
-
-fn describe_chat_error(r: ChatSendError) -> &'static str {
-    match r {
-        ChatSendError::Empty => "pusta wiadomość",
-        ChatSendError::TooLong => "za długa (limit 2000 znaków)",
-        ChatSendError::NotInRoom => "nie jesteś w żadnym pokoju (wejdź do pokoju: w <nr>)",
-        ChatSendError::NotConnected => "brak połączenia z serwerem",
-    }
-}
-
-fn describe_fatal(r: FatalReason) -> String {
-    match r {
-        FatalReason::BadCredentials => "zły login lub hasło".into(),
-        FatalReason::VersionMismatch { server } => format!(
-            "niezgodna wersja programu (serwer: {server}, Twoja: {PROTOCOL_VERSION}) — zaktualizuj komunikator"
-        ),
-        FatalReason::SessionReplaced => "zalogowano się na to konto w innym miejscu".into(),
     }
 }
 
@@ -489,6 +459,22 @@ fn local_hm() -> (u16, u16) {
     (t.wHour, t.wMinute)
 }
 
+/// The shared text, plus the CLI command that helps.
+fn cli_chat_not_sent(r: ChatSendError) -> String {
+    match r {
+        ChatSendError::NotInRoom => format!("{} (wejdź do pokoju: w <nr>)", describe_chat_not_sent(r)),
+        _ => describe_chat_not_sent(r).to_owned(),
+    }
+}
+
+/// The shared label, plus the CLI command for a changed key.
+fn cli_trust_label(t: Trust) -> String {
+    match t {
+        Trust::KeyChanged => format!("{} (a <id> <grupa> po sprawdzeniu)", trust_label(t)),
+        _ => trust_label(t).to_owned(),
+    }
+}
+
 fn describe_reject(r: &AnnounceError) -> &'static str {
     match r {
         AnnounceError::Malformed => "uszkodzone",
@@ -572,7 +558,7 @@ impl Roster {
             let name = sanitize_name(name);
             match self.e2e.get(id) {
                 Some((_, _, trust, code)) => {
-                    println!("{id:>4}  {name}  {}  kod: {code}", trust_label(*trust))
+                    println!("{id:>4}  {name}  {}  kod: {code}", cli_trust_label(*trust))
                 }
                 None => println!("{id:>4}  {name}  {NO_KEY}"),
             }
@@ -623,16 +609,6 @@ impl Roster {
         }
         warn_if_unsaved(trust);
         let _ = commands.send(SessionCommand::TrustChanged(id));
-    }
-}
-
-fn trust_label(t: Trust) -> &'static str {
-    match t {
-        Trust::Verified => "zweryfikowany",
-        Trust::Known => "znany, niezweryfikowany",
-        Trust::NewUser => "nowa osoba",
-        Trust::NewDevice => "NOWE URZĄDZENIE, niezweryfikowane",
-        Trust::KeyChanged => "ZMIENIONY KLUCZ (a <id> <grupa> po sprawdzeniu)",
     }
 }
 

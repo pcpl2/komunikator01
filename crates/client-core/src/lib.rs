@@ -6,3 +6,4 @@ pub mod e2e;
 pub mod chat;
 pub mod lobby;
 pub mod settings;
+pub mod app;
