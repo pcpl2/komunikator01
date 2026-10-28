@@ -6,10 +6,19 @@ use super::frame::Pcm;
 pub fn mix(sources: &[(&Pcm, f32)], out: &mut Pcm) {
     out.fill(0.0);
     for (pcm, gain) in sources {
-        for (o, s) in out.iter_mut().zip(pcm.iter()) {
-            *o += s * gain;
-        }
+        accumulate(out, pcm, *gain);
     }
+    clip(out);
+}
+
+/// Adds `pcm * gain` to `out`; call `clip` once all sources are in.
+pub fn accumulate(out: &mut Pcm, pcm: &Pcm, gain: f32) {
+    for (o, s) in out.iter_mut().zip(pcm.iter()) {
+        *o += s * gain;
+    }
+}
+
+pub fn clip(out: &mut Pcm) {
     for o in out.iter_mut() {
         *o = o.clamp(-1.0, 1.0);
     }

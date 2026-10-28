@@ -1,5 +1,6 @@
 //! Windows client: WASAPI audio and the capture/render pipeline.
 
+pub mod pipeline;
 pub mod supervisor;
 #[cfg(windows)]
 pub mod wasapi;
