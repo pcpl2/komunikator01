@@ -43,8 +43,11 @@ pub struct PairChannel {
     local_secret: [u8; 32],
     peer_dh: [u8; 32],
     prologue: Vec<u8>,
-    /// Initiator only: handshake in flight after `start()`.
+    /// Initiator only: handshake in flight after the latest `start()`.
     pending: Option<snow::HandshakeState>,
+    /// Initiator only: the handshake of the `start()` before that. Over a slow relay the
+    /// answer to an earlier `Hello1` can arrive after a re-send; it still completes.
+    previous: Option<snow::HandshakeState>,
     session: Option<Session>,
 }
 
@@ -69,6 +72,7 @@ impl PairChannel {
             peer_dh: peer.dh,
             prologue,
             pending: None,
+            previous: None,
             session: None,
         }
     }
@@ -95,7 +99,7 @@ impl PairChannel {
         let mut out = vec![0u8; MAX_BLOB];
         let n = hs.write_message(&[], &mut out).ok()?;
         out.truncate(n);
-        self.pending = Some(hs);
+        self.previous = self.pending.replace(hs);
         encode(&PairMsg::Hello1(out))
     }
 
@@ -135,13 +139,28 @@ impl PairChannel {
         Ok(reply)
     }
 
+    /// Completes against the latest `Hello1`, else the one before it. A failed read leaves a
+    /// handshake state as it was (snow restores it), so junk discards neither pending state.
+    /// Answering the latest clears both; answering the previous keeps the latest, since the
+    /// responder may still adopt it, and its answer then replaces the session.
     fn on_hello2(&mut self, h: &[u8]) -> Result<(), PairError> {
-        // A failed attempt resets to the initial state; `start()` can be called again.
-        let mut hs = self.pending.take().ok_or(PairError::Unexpected)?;
         let mut scratch = vec![0u8; MAX_BLOB];
-        hs.read_message(h, &mut scratch).map_err(|_| PairError::Handshake)?;
-        self.session = Some(Session::from_handshake(hs)?);
-        Ok(())
+        if let Some(hs) = self.pending.as_mut() {
+            if hs.read_message(h, &mut scratch).is_ok() {
+                let hs = self.pending.take().ok_or(PairError::Unexpected)?;
+                self.previous = None;
+                self.session = Some(Session::from_handshake(hs)?);
+                return Ok(());
+            }
+        }
+        if let Some(hs) = self.previous.as_mut() {
+            if hs.read_message(h, &mut scratch).is_ok() {
+                let hs = self.previous.take().ok_or(PairError::Unexpected)?;
+                self.session = Some(Session::from_handshake(hs)?);
+                return Ok(());
+            }
+        }
+        Err(PairError::Handshake)
     }
 
     fn on_data(&mut self, d: &[u8]) -> Result<Inner, PairError> {
@@ -352,6 +371,34 @@ mod tests {
         assert!(init.is_ready() && resp.is_ready());
         let blob = init.send(&key_msg(3)).unwrap();
         assert_eq!(resp.receive(&blob).unwrap().1, Some(key_msg(3)));
+    }
+
+    #[test]
+    fn hello2_for_previous_hello1_completes_after_restart() {
+        let ((_, mut init), (_, mut resp)) = roles();
+        let h1a = init.start().unwrap();
+        let h1b = init.start().unwrap(); // restarted before the answer came back
+        let (h2a, _) = resp.receive(&h1a).unwrap();
+        init.receive(&h2a.unwrap()).expect("answer to the previous Hello1 completes");
+        assert!(init.is_ready());
+        // The responder then adopts the newer Hello1; its answer still completes too.
+        let (h2b, _) = resp.receive(&h1b).unwrap();
+        init.receive(&h2b.unwrap()).expect("answer to the newer Hello1 completes");
+        let blob = init.send(&key_msg(4)).unwrap();
+        assert_eq!(resp.receive(&blob).unwrap().1, Some(key_msg(4)));
+        let blob = resp.send(&key_msg(5)).unwrap();
+        assert_eq!(init.receive(&blob).unwrap().1, Some(key_msg(5)));
+    }
+
+    #[test]
+    fn failed_hello2_keeps_both_pending_handshakes() {
+        let ((_, mut init), (_, mut resp)) = roles();
+        let h1a = init.start().unwrap();
+        init.start().unwrap();
+        assert!(init.receive(&enc(PairMsg::Hello2(vec![7; 48]))).is_err());
+        let (h2a, _) = resp.receive(&h1a).unwrap();
+        init.receive(&h2a.unwrap()).expect("junk Hello2 did not discard the previous state");
+        assert!(init.is_ready());
     }
 
     #[test]

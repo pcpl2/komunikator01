@@ -27,6 +27,9 @@ const SWITCH_DELAY: Duration = Duration::from_millis(500);
 /// Minimum spacing of `Hello1`s to one member (restarts and retries), so a hostile server
 /// cannot make us loop at full speed.
 const HELLO_INTERVAL: Duration = Duration::from_secs(1);
+/// Cap of the exponential backoff (1, 2, 4, 8 s) between `Hello1` re-sends while a link is
+/// not ready, so a relay round trip above `HELLO_INTERVAL` still lets an answer land.
+const MAX_HELLO_INTERVAL: Duration = Duration::from_secs(8);
 /// A coalesced rotation may postpone the switch at most this long past its first deadline, so
 /// continuous churn cannot keep the sealer on a key that departed members hold.
 const MAX_DEFER: Duration = Duration::from_secs(1);
@@ -75,6 +78,9 @@ struct Link {
     opener: AudioOpener,
     initiator: bool,
     last_hello: Option<Instant>,
+    /// Minimum spacing before the next `Hello1`: `HELLO_INTERVAL`, doubled on each re-send
+    /// while not ready (up to `MAX_HELLO_INTERVAL`), reset when the handshake completes.
+    hello_interval: Duration,
     /// Initiator only: a `Hello1` is owed but was rate-limited.
     restart_due: bool,
 }
@@ -116,15 +122,19 @@ fn send_key(out: &mut Output, to: MemberId, link: &mut Link, min_epoch: u16, key
     }
 }
 
-/// Initiator: sends a fresh `Hello1` unless one went out less than `HELLO_INTERVAL` ago, in
-/// which case it is remembered and sent from `tick`.
+/// Initiator: sends a fresh `Hello1` unless one went out less than `hello_interval` ago, in
+/// which case it is remembered and sent from `tick`. A re-send on a link that is still not
+/// ready doubles the interval (backoff), so slow relays are not flooded with restarts.
 fn hello(out: &mut Output, to: MemberId, link: &mut Link, now: Instant) {
     if !link.initiator {
         return;
     }
-    if link.last_hello.is_some_and(|t| now.saturating_duration_since(t) < HELLO_INTERVAL) {
+    if link.last_hello.is_some_and(|t| now.saturating_duration_since(t) < link.hello_interval) {
         link.restart_due = true;
         return;
+    }
+    if link.last_hello.is_some() && !link.channel.is_ready() {
+        link.hello_interval = (link.hello_interval * 2).min(MAX_HELLO_INTERVAL);
     }
     link.last_hello = Some(now);
     link.restart_due = false;
@@ -268,6 +278,7 @@ impl E2e {
             opener: AudioOpener::new(id),
             initiator: self.my_public.sign < their.sign,
             last_hello: None,
+            hello_interval: HELLO_INTERVAL,
             restart_due: false,
         };
         hello(out, id, &mut link, now);
@@ -363,6 +374,7 @@ impl E2e {
                     relay(&mut out, from, r);
                 }
                 link.restart_due = false;
+                link.hello_interval = HELLO_INTERVAL;
                 send_key(&mut out, from, link, min_epoch, &self.current);
                 if let Some(p) = &self.pending {
                     send_key(&mut out, from, link, min_epoch, &p.key);
@@ -489,6 +501,10 @@ mod tests {
         relays: Vec<(MemberId, MemberId, Vec<u8>)>,
         /// (from, to, epoch) of every sender key sent.
         keys: Vec<(MemberId, MemberId, u16)>,
+        /// One-way delay of relayed blobs (zero: delivered at once).
+        relay_delay: Duration,
+        /// Relays held back by `relay_delay`: (due, to, message), in send order.
+        in_flight: Vec<(Instant, MemberId, ServerMsg)>,
     }
 
     fn store() -> (Arc<tempfile::TempDir>, Arc<Mutex<KnownDevices>>) {
@@ -508,6 +524,8 @@ mod tests {
                 announces: BTreeMap::new(),
                 relays: Vec::new(),
                 keys: Vec::new(),
+                relay_delay: Duration::ZERO,
+                in_flight: Vec::new(),
             }
         }
 
@@ -615,7 +633,9 @@ mod tests {
                     }
                     ClientMsg::Relay { to, blob } => {
                         self.relays.push((from, to, blob.clone()));
-                        if let Some(c) = self.clients.get_mut(&to).filter(|_| to != from) {
+                        if !self.relay_delay.is_zero() {
+                            self.in_flight.push((self.now + self.relay_delay, to, ServerMsg::Relay { from, blob }));
+                        } else if let Some(c) = self.clients.get_mut(&to).filter(|_| to != from) {
                             c.inbox.push_back(ServerMsg::Relay { from, blob });
                         }
                     }
@@ -663,6 +683,16 @@ mod tests {
         fn tick(&mut self, ms: u64) {
             self.now += Duration::from_millis(ms);
             self.now_ms += ms;
+            let now = self.now;
+            let (due, later): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.in_flight).into_iter().partition(|(t, _, _)| *t <= now);
+            self.in_flight = later;
+            for (_, to, msg) in due {
+                if let Some(c) = self.clients.get_mut(&to) {
+                    c.inbox.push_back(msg);
+                }
+            }
+            self.deliver();
             let ids: Vec<_> = self.clients.keys().copied().collect();
             for id in ids {
                 let out = self.clients.get_mut(&id).unwrap().e2e.tick(self.now);
@@ -719,6 +749,26 @@ mod tests {
             .collect();
         net.tick(600);
         (net, ids)
+    }
+
+    #[test]
+    fn slow_relay_still_pairs_without_hello_storm() {
+        let mut net = Net::new();
+        net.relay_delay = Duration::from_millis(1500); // round trip 3 s, above HELLO_INTERVAL
+        let a = net.join("a");
+        net.deliver();
+        let b = net.join("b");
+        net.deliver();
+        for _ in 0..300 {
+            net.tick(100);
+        }
+        assert!(net.all_hear(), "a pair with a 1.5 s relay delay becomes ready");
+        let settled = net.relays.len();
+        for _ in 0..300 {
+            net.tick(100);
+        }
+        assert_eq!(net.relays.len(), settled, "no Hello1 retries once ready");
+        let _ = (a, b);
     }
 
     #[test]
