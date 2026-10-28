@@ -12,7 +12,7 @@ pub struct Announce {
     pub timestamp_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceError {
     Malformed,
     BadSignature,

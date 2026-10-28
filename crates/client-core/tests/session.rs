@@ -1,71 +1,10 @@
-use std::sync::OnceLock;
+mod common;
+
 use std::time::Duration;
 
 use client_core::audio::frame::EncodedFrame;
-use client_core::net::session::{
-    spawn_session, FatalReason, SessionEvent, SessionHandle, SessionParams,
-};
-use protocol::MemberId;
-use server::{RunningServer, ServerConfig, UserEntry};
-use tokio::time::{timeout, Instant};
-
-fn hash_x() -> String {
-    static H: OnceLock<String> = OnceLock::new();
-    H.get_or_init(|| server::auth::hash_password("x")).clone()
-}
-
-fn config(dir: &tempfile::TempDir, port: u16) -> ServerConfig {
-    ServerConfig {
-        bind: format!("127.0.0.1:{port}").parse().unwrap(),
-        data_dir: dir.path().to_owned(),
-        users: ["ala", "ola"]
-            .iter()
-            .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x() })
-            .collect(),
-    }
-}
-
-fn session(srv: &RunningServer, user: &str, pw: &str, fingerprint: [u8; 32]) -> SessionHandle {
-    spawn_session(
-        &tokio::runtime::Handle::current(),
-        SessionParams {
-            server: srv.local_addr().to_string(),
-            fingerprint,
-            username: user.into(),
-            password: pw.into(),
-        },
-    )
-}
-
-/// Waits for the first event matching `pred`, failing after `wait`.
-async fn wait_for(
-    h: &mut SessionHandle,
-    wait: Duration,
-    pred: impl Fn(&SessionEvent) -> bool,
-) -> Option<SessionEvent> {
-    let deadline = Instant::now() + wait;
-    loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        match timeout(left, h.events.recv()).await {
-            Ok(Some(e)) if pred(&e) => return Some(e),
-            Ok(Some(_)) => continue,
-            _ => return None,
-        }
-    }
-}
-
-async fn connected(h: &mut SessionHandle) -> MemberId {
-    match wait_for(h, Duration::from_secs(5), |e| matches!(e, SessionEvent::Connected { .. })).await {
-        Some(SessionEvent::Connected { you, .. }) => you,
-        other => panic!("expected Connected, got {other:?}"),
-    }
-}
-
-async fn exchange(from: &SessionHandle, to: &mut SessionHandle, seq: u32) -> Option<(MemberId, u32, Vec<u8>)> {
-    from.audio_out.try_send(EncodedFrame::new(seq, b"hej").unwrap()).unwrap();
-    let f = timeout(Duration::from_secs(2), to.audio_in.recv()).await.ok()??;
-    Some((f.sender, f.seq, f.payload().to_vec()))
-}
+use client_core::net::session::{spawn_session, FatalReason, SessionEvent, SessionParams};
+use common::*;
 
 #[tokio::test]
 async fn two_clients_exchange_audio() {
@@ -75,7 +14,7 @@ async fn two_clients_exchange_audio() {
     let a_id = connected(&mut a).await;
     let mut b = session(&srv, "ola", "x", srv.fingerprint());
     connected(&mut b).await;
-    assert_eq!(exchange(&a, &mut b, 1).await, Some((a_id, 1, b"hej".to_vec())));
+    assert_eq!(exchange(&a, &mut b, 1).await.map(|f| (f.0, f.2)), Some((a_id, b"hej".to_vec())));
 }
 
 #[tokio::test]
@@ -163,12 +102,7 @@ async fn stuck_server_login_times_out_and_retries() {
     });
     let mut a = spawn_session(
         &tokio::runtime::Handle::current(),
-        SessionParams {
-            server: addr.to_string(),
-            fingerprint: identity.fingerprint,
-            username: "ala".into(),
-            password: "x".into(),
-        },
+        params(addr.to_string(), identity.fingerprint, "ala", "x", &Device::new()),
     );
     let e = wait_for(&mut a, Duration::from_secs(15), |e| matches!(e, SessionEvent::Disconnected { .. })).await;
     assert!(e.is_some(), "session hung in login");
@@ -176,13 +110,11 @@ async fn stuck_server_login_times_out_and_retries() {
 
 #[test]
 fn debug_output_hides_password() {
-    let p = SessionParams {
-        server: "a:1".into(),
-        fingerprint: [0; 32],
-        username: "ala".into(),
-        password: "tajne-haslo".into(),
-    };
-    assert!(!format!("{p:?}").contains("tajne-haslo"));
+    let dev = Device::new();
+    let p: SessionParams = params("a:1".into(), [0; 32], "ala", "tajne-haslo", &dev);
+    let s = format!("{p:?}");
+    assert!(!s.contains("tajne-haslo"));
+    assert!(!s.contains("Identity") && !s.contains("KnownDevices"), "{s}");
 }
 
 #[tokio::test]
@@ -197,5 +129,6 @@ async fn audio_queued_before_login_is_not_sent() {
         a.audio_out.try_send(EncodedFrame::new(seq, b"stare").unwrap()).unwrap();
     }
     connected(&mut a).await;
-    assert_eq!(exchange(&a, &mut b, 1).await.map(|f| f.1), Some(1));
+    // Stale frames carried seq 100..110; only ours (from 1 up) may arrive.
+    assert!(exchange(&a, &mut b, 1).await.is_some_and(|f| f.1 < 100));
 }

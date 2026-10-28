@@ -64,9 +64,18 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(1)
         .enable_all()
         .build()?;
+    // Placeholder until Task 9 (DPAPI identity store, trust CLI): a fresh in-memory identity
+    // per run and a trust store under %APPDATA%\komunikator.
+    let trust_path = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("komunikator")
+        .join("known_devices.toml");
+    let identity = Arc::new(client_core::e2e::Identity::generate());
+    let trust = Arc::new(std::sync::Mutex::new(client_core::e2e::KnownDevices::load(&trust_path)?));
     let mut session = spawn_session(
         rt.handle(),
-        SessionParams { server, fingerprint, username: user, password },
+        SessionParams { server, fingerprint, username: user, password, identity, trust },
     );
     // The session stops when the handle's stop sender drops, so only the channels move out.
     let audio_in = std::mem::replace(&mut session.audio_in, tokio::sync::mpsc::channel(1).1);
@@ -151,6 +160,7 @@ fn print_event(e: &SessionEvent) {
             println!("rozłączono, ponowna próba za {:.1} s", retry_in.as_secs_f32())
         }
         SessionEvent::Fatal(r) => println!("błąd: {r:?}"),
+        SessionEvent::E2e(e) => println!("e2e: {e:?}"),
     }
 }
 

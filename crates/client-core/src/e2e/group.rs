@@ -36,7 +36,7 @@ const REANNOUNCE: Duration = Duration::from_secs(30 * 60);
 /// Rooms are not implemented yet; every announce is for room 0.
 const ROOM: u32 = 0;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E2eEvent {
     Member { id: MemberId, name: String, trust: Trust, code: String },
     Rejected { id: MemberId, reason: AnnounceError },
