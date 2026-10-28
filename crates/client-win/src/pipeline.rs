@@ -8,6 +8,7 @@ use client_core::audio::frame::{EncodedFrame, IncomingFrame, Pcm, FRAME_SAMPLES,
 use client_core::audio::jitter::{JitterBuffer, Pop};
 use client_core::audio::mixer::{accumulate, clip};
 use client_core::audio::vad::Vad;
+use client_core::audio::volume::GainTable;
 use protocol::MemberId;
 use tokio::sync::mpsc;
 
@@ -43,7 +44,12 @@ pub fn capture_loop(
         let this_seq = seq;
         seq = seq.wrapping_add(1);
         let speaking = vad.process(&pcm);
-        if !speaking || controls.muted.load(Ordering::Relaxed) {
+        // Deafen silences the mic too; the flags stay separate so undeafening restores
+        // whatever mute state the user had.
+        if !speaking
+            || controls.muted.load(Ordering::Relaxed)
+            || controls.deafened.load(Ordering::Relaxed)
+        {
             continue;
         }
         match enc.encode(&pcm, &mut packet) {
@@ -72,6 +78,7 @@ pub fn render_loop(
     mut sink: impl FrameSink,
     mut inp: mpsc::Receiver<IncomingFrame>,
     controls: Arc<Controls>,
+    gains: Arc<GainTable>,
     stop: Arc<AtomicBool>,
 ) {
     // Every slot and decoder is made up front so the real-time loop never allocates.
@@ -107,7 +114,9 @@ pub fn render_loop(
         for v in voices.iter_mut().filter(|v| v.id.is_some()) {
             v.idle_frames = v.idle_frames.saturating_add(1);
             if v.jitter.pop(&mut v.decoder, &mut v.pcm) == Pop::Audio {
-                accumulate(&mut out, &v.pcm, 1.0);
+                if let Some(id) = v.id {
+                    accumulate(&mut out, &v.pcm, gains.get(id));
+                }
             }
         }
         clip(&mut out);
@@ -167,9 +176,14 @@ mod tests {
     }
 
     fn run_capture(frames: Vec<Pcm>, muted: bool) -> Vec<u32> {
+        run_capture_with(frames, muted, false)
+    }
+
+    fn run_capture_with(frames: Vec<Pcm>, muted: bool, deafened: bool) -> Vec<u32> {
         let (tx, mut rx) = mpsc::channel(1024);
         let controls = Arc::new(Controls::default());
         controls.muted.store(muted, Ordering::Relaxed);
+        controls.deafened.store(deafened, Ordering::Relaxed);
         capture_loop(
             Script(frames.into_iter()),
             Vad::new(0.5),
@@ -184,6 +198,11 @@ mod tests {
     #[test]
     fn muted_sends_nothing() {
         assert!(run_capture((0..20).map(sine).collect(), true).is_empty());
+    }
+
+    #[test]
+    fn deafened_sends_nothing() {
+        assert!(run_capture_with((0..20).map(sine).collect(), false, true).is_empty());
     }
 
     #[test]
@@ -221,6 +240,10 @@ mod tests {
     }
 
     fn run_render(deafened: bool) -> Vec<Pcm> {
+        run_render_with(deafened, GainTable::new())
+    }
+
+    fn run_render_with(deafened: bool, gains: GainTable) -> Vec<Pcm> {
         let (tx, rx) = mpsc::channel(256);
         for sender in [1, 2] {
             let mut enc = Encoder::new().unwrap();
@@ -237,6 +260,7 @@ mod tests {
             Recorder { frames: frames.clone(), limit: 12 },
             rx,
             controls,
+            Arc::new(gains),
             Arc::new(AtomicBool::new(false)),
         );
         frames.take()
@@ -252,6 +276,20 @@ mod tests {
         assert_eq!(frames.len(), 12);
         assert!(peak(&frames[5..]) > 0.1, "audio plays");
         assert!(peak(&frames[5..]) > 0.16, "two senders are summed");
+    }
+
+    #[test]
+    fn render_applies_per_sender_gain() {
+        // Both senders play the same sine, so one sender at gain g sums to (1 + g) times it.
+        let one = peak(&run_render_with(false, GainTable::new())[5..]) / 2.0;
+        let halved = GainTable::new();
+        halved.set(1, 0.5);
+        let p = peak(&run_render_with(false, halved)[5..]);
+        assert!((p - one * 1.5).abs() < one * 0.1, "halved sender: {p} vs {}", one * 1.5);
+        let silenced = GainTable::new();
+        silenced.set(1, 0.0);
+        let p = peak(&run_render_with(false, silenced)[5..]);
+        assert!((p - one).abs() < one * 0.1, "only the other sender remains: {p} vs {one}");
     }
 
     #[test]
@@ -273,6 +311,7 @@ mod tests {
             Recorder { frames: frames.clone(), limit: 12 },
             rx,
             Arc::new(Controls::default()),
+            Arc::new(GainTable::new()),
             Arc::new(AtomicBool::new(false)),
         );
         assert!(peak(&frames.take()[5..]) > 0.1, "sender 17 plays");

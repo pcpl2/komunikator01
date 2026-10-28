@@ -124,10 +124,12 @@ fn main() -> anyhow::Result<()> {
     };
     let render = {
         let (controls, stop, device) = (controls.clone(), stop.clone(), cli.render_device);
+        // Names are mapped to ids and the table filled once the UI exists (task 8).
+        let gains = std::sync::Arc::new(client_core::audio::volume::GainTable::new());
         std::thread::Builder::new().name("render".into()).spawn(move || {
             let _mmcss = enter_pro_audio();
             let sink = Supervised::new(move || WasapiRender::open(device.as_deref()), std::time::Instant::now);
-            render_loop(sink, audio_in, controls, stop);
+            render_loop(sink, audio_in, controls, gains, stop);
         })?
     };
 

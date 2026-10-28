@@ -5,3 +5,4 @@ pub mod frame;
 pub mod jitter;
 pub mod mixer;
 pub mod vad;
+pub mod volume;
