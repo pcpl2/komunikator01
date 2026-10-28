@@ -72,6 +72,8 @@ pub struct AudioSealer {
 }
 
 impl AudioSealer {
+    /// Invariant: exactly one sealer per `SenderKey` for its lifetime; a second one restarts
+    /// `seq` and would reuse nonces.
     pub fn new(me: MemberId, key: &SenderKey) -> Self {
         Self { me, epoch: key.epoch, cipher: key.cipher(), last_seq: None }
     }
@@ -198,7 +200,9 @@ impl AudioOpener {
                 s.expires.get_or_insert(now + OLD_EPOCH_GRACE);
             }
         }
-        self.last_used = Some(epoch);
+        if self.last_used.is_none_or(|l| newer(epoch, l)) {
+            self.last_used = Some(epoch);
+        }
         true
     }
 }
@@ -321,6 +325,19 @@ mod tests {
     }
 
     #[test]
+    fn late_old_frame_does_not_drop_current_key() {
+        let (k1, k2, k3) = (SenderKey::generate(1), SenderKey::generate(2), SenderKey::generate(3));
+        let mut o = AudioOpener::new(S);
+        let (t0, mut pt) = (Instant::now(), Vec::new());
+        o.add_key(k1.clone());
+        o.add_key(k2.clone());
+        assert!(o.open(2, 1, &frame(&k2, 1), t0, &mut pt));
+        assert!(o.open(1, 1, &frame(&k1, 1), t0, &mut pt));
+        o.add_key(k3);
+        assert!(o.open(2, 2, &frame(&k2, 2), t0, &mut pt));
+    }
+
+    #[test]
     fn unknown_epoch_fails() {
         let (mut s, mut o, _) = pair(1);
         let (mut ct, mut pt) = (Vec::new(), Vec::new());
@@ -333,6 +350,8 @@ mod tests {
         let k = SenderKey::from_parts(1, [9; 32]);
         assert_ne!(&k.audio_key(), k.secret());
         assert_eq!(k.audio_key(), SenderKey::from_parts(1, [9; 32]).audio_key());
-        assert!(!format!("{k:?}").contains("09"));
+        let d = format!("{k:?}");
+        assert!(!d.contains("9, 9") && !d.contains("09090909"));
+        assert_eq!(d, "SenderKey { epoch: 1, .. }");
     }
 }
