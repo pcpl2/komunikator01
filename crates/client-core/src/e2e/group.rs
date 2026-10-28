@@ -4,8 +4,8 @@
 //! The server is treated as hostile. Invariants:
 //! - my sender key leaves only over a ready pairwise channel, to a current member whose latest
 //!   announce verified and whose trust is not `KeyChanged`;
-//! - a member never receives a key of mine older than the rotation triggered by its arrival
-//!   (`Peer::min_epoch`), so it cannot open frames from before it joined;
+//! - an identity never receives a key of mine that sealed audio before its link opened
+//!   (`Peer::min_epoch`, enforced in `open_link`), so it cannot open earlier frames;
 //! - a member's sender keys are accepted only from that member's own channel;
 //! - every join/leave rotates my key; the sealer switches 500 ms later so peers have the new
 //!   key before frames use it.
@@ -65,9 +65,6 @@ struct Peer {
     min_epoch: u16,
     /// Identity from the member's latest announce, if it verified.
     identity: Option<IdentityPublic>,
-    /// Identity that last had a link (and so may hold my keys); a link for any other identity
-    /// first raises `min_epoch` past every key that one could have received.
-    keyed: Option<IdentityPublic>,
     /// Present only while the member is eligible (verified, not `KeyChanged`).
     link: Option<Link>,
 }
@@ -138,7 +135,7 @@ fn hello(out: &mut Output, to: MemberId, link: &mut Link, now: Instant) {
 
 impl Peer {
     fn new(name: String, min_epoch: u16) -> Self {
-        Self { name, min_epoch, identity: None, keyed: None, link: None }
+        Self { name, min_epoch, identity: None, link: None }
     }
 }
 
@@ -230,7 +227,6 @@ impl E2e {
     fn reset_floor(&mut self, id: MemberId, now: Instant, out: &mut Output) {
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.link = None;
-            peer.keyed = None;
         }
         self.rotate(now, out);
         let newest = self.newest_epoch();
@@ -251,14 +247,21 @@ impl E2e {
     }
 
     /// Creates the pairwise channel to an eligible member; the initiator sends `Hello1`.
+    ///
+    /// Invariant: an identity never receives a key that sealed audio before its link opened.
+    /// If the member's floor is a key I already seal with (or an older one), rotate first and
+    /// raise the floor to the fresh, still unused key. A floor on the unused pending key (the
+    /// usual join, then announce within 500 ms) needs nothing.
     fn open_link(&mut self, id: MemberId, now: Instant, out: &mut Output) {
         let Some(peer) = self.peers.get(&id) else { return };
-        let Some(their) = peer.identity else { return };
-        if peer.keyed.is_some_and(|k| k != their) {
+        if peer.identity.is_none() {
+            return;
+        }
+        if at_least(self.current.epoch, peer.min_epoch) {
             self.reset_floor(id, now, out);
         }
         let Some(peer) = self.peers.get_mut(&id) else { return };
-        peer.keyed = Some(their);
+        let Some(their) = peer.identity else { return };
         let mut link = Link {
             channel: PairChannel::new(&self.identity, &their),
             opener: AudioOpener::new(id),
@@ -620,6 +623,16 @@ mod tests {
             }
         }
 
+        /// Takes every queued announce from `from` out of `to`'s inbox (the server holds them back).
+        fn withhold(&mut self, to: MemberId, from: MemberId) -> Vec<ServerMsg> {
+            let inbox = &mut self.clients.get_mut(&to).unwrap().inbox;
+            let (held, kept): (Vec<_>, Vec<_>) = inbox
+                .drain(..)
+                .partition(|m| matches!(m, ServerMsg::Announce { from: f, .. } if *f == from));
+            inbox.extend(kept);
+            held
+        }
+
         fn inject(&mut self, to: MemberId, msg: ServerMsg) {
             self.clients.get_mut(&to).unwrap().inbox.push_back(msg);
         }
@@ -825,6 +838,53 @@ mod tests {
         assert!(!to_b2.is_empty(), "the new device is paired");
         assert!(to_b2.iter().all(|&e| at_least(e, old.epoch.wrapping_add(1))), "{to_b2:?} vs {}", old.epoch);
         assert!(!net.opens(b, a, &old));
+    }
+
+    #[test]
+    fn junk_then_delayed_new_identity_gets_no_used_key() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert!(net.all_hear());
+        net.inject(a, ServerMsg::Announce { from: b, blob: vec![1, 2, 3] });
+        net.deliver();
+        net.tick(600);
+        let f = net.frame(a);
+        let start = net.keys.len();
+        net.hijack(b);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        let to_b2: Vec<u16> =
+            net.keys[start..].iter().filter(|k| k.0 == a && k.1 == b).map(|k| k.2).collect();
+        assert!(!to_b2.is_empty(), "the new device is paired");
+        assert!(to_b2.iter().all(|&e| at_least(e, f.epoch.wrapping_add(1))), "{to_b2:?} vs {}", f.epoch);
+        assert!(!net.opens(b, a, &f));
+    }
+
+    #[test]
+    fn delayed_announce_gets_no_used_key() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let a = ids[0];
+        let c = net.join("c");
+        let held = net.withhold(a, c);
+        assert!(!held.is_empty());
+        net.deliver();
+        net.tick(600);
+        let f = net.frame(a);
+        let start = net.keys.len();
+        for m in held {
+            net.inject(a, m);
+        }
+        net.deliver();
+        net.tick(1100);
+        assert!(!net.opens(c, a, &f));
+        let to_c: Vec<u16> =
+            net.keys[start..].iter().filter(|k| k.0 == a && k.1 == c).map(|k| k.2).collect();
+        assert!(!to_c.is_empty());
+        assert!(to_c.iter().all(|&e| at_least(e, f.epoch.wrapping_add(1))), "{to_c:?} vs {}", f.epoch);
+        net.tick(600);
+        assert!(!net.opens(c, a, &f));
+        assert!(net.all_hear());
     }
 
     #[test]
