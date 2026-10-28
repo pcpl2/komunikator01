@@ -2,10 +2,14 @@
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use std::collections::BTreeMap;
 
 use clap::Parser;
-use client_core::net::session::{spawn_session, SessionEvent, SessionParams};
+use client_core::e2e::{AnnounceError, E2eEvent, IdentityPublic, KnownDevices, Trust};
+use protocol::MemberId;
+use client_core::net::session::{spawn_session, SessionCommand, SessionEvent, SessionParams};
 
 #[derive(Parser)]
 #[command(name = "komunikator", version, about = "Lekki komunikator głosowy")]
@@ -24,6 +28,9 @@ struct Cli {
     /// Render device id (see --list-devices); default communications output otherwise
     #[arg(long)]
     render_device: Option<String>,
+    /// Directory for identity.bin and known_devices.toml (default: %APPDATA%\komunikator)
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
     /// Print audio devices and exit
     #[arg(long)]
     list_devices: bool,
@@ -33,6 +40,7 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     use client_core::audio::codec::Encoder;
     use client_core::audio::vad::Vad;
+    use client_win::identity_store::IdentityStatus;
     use client_win::pipeline::{capture_loop, render_loop, Controls};
     use client_win::supervisor::Supervised;
     use client_win::wasapi::{self, enter_pro_audio, WasapiCapture, WasapiRender};
@@ -64,18 +72,28 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(1)
         .enable_all()
         .build()?;
-    // Placeholder until Task 9 (DPAPI identity store, trust CLI): a fresh in-memory identity
-    // per run and a trust store under %APPDATA%\komunikator.
-    let trust_path = std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("komunikator")
-        .join("known_devices.toml");
-    let identity = Arc::new(client_core::e2e::Identity::generate());
-    let trust = Arc::new(std::sync::Mutex::new(client_core::e2e::KnownDevices::load(&trust_path)?));
+    let data_dir = cli.data_dir.unwrap_or_else(|| {
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("komunikator")
+    });
+    let (identity, status) = client_win::identity_store::load_or_create_identity(&data_dir)?;
+    match status {
+        IdentityStatus::Loaded => {}
+        IdentityStatus::Created => println!("utworzono nową tożsamość urządzenia (klucz szyfrowania)"),
+        IdentityStatus::Replaced { broken } => println!(
+            "UWAGA: nie udało się odczytać poprzedniej tożsamości urządzenia (zachowana jako {}).\n\
+             Utworzono nową. Znajomi zobaczą ostrzeżenie o zmianie klucza i muszą je zaakceptować.",
+            broken.display()
+        ),
+    }
+    let identity = Arc::new(identity);
+    let trust_path = data_dir.join("known_devices.toml");
+    let trust = Arc::new(Mutex::new(KnownDevices::load(&trust_path)?));
     let mut session = spawn_session(
         rt.handle(),
-        SessionParams { server, fingerprint, username: user, password, identity, trust },
+        SessionParams { server, fingerprint, username: user, password, identity, trust: trust.clone() },
     );
     // The session stops when the handle's stop sender drops, so only the channels move out.
     let audio_in = std::mem::replace(&mut session.audio_in, tokio::sync::mpsc::channel(1).1);
@@ -113,7 +131,8 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    println!("komendy: m = mikrofon wł./wył., d = wycisz wszystkich, q = wyjście");
+    println!("komendy: m = mikrofon wł./wył., d = wycisz wszystkich, k = lista osób i kody, z <id> = zweryfikowany, a <id> = akceptuj zmieniony klucz, q = wyjście");
+    let mut roster = Roster::default();
     let exit_code = rt.block_on(async {
         loop {
             tokio::select! {
@@ -122,14 +141,27 @@ fn main() -> anyhow::Result<()> {
                         println!("błąd: {reason:?}");
                         return 1;
                     }
-                    Some(e) => print_event(&e),
+                    Some(e) => {
+                        roster.observe(&e);
+                        print_event(&e);
+                        if matches!(e, SessionEvent::E2e(_)) {
+                            warn_if_unsaved(&trust);
+                        }
+                    }
                     None => return 1,
                 },
                 c = cmd_rx.recv() => match c.as_deref() {
                     Some("m") => toggle("mikrofon wyciszony", &controls.muted),
                     Some("d") => toggle("dźwięk wyciszony", &controls.deafened),
+                    Some("k") => roster.print(),
                     Some("q") | None => return 0,
-                    _ => {}
+                    Some(line) => {
+                        if let Some((verb, arg)) = line.split_once(' ') {
+                            if matches!(verb, "z" | "a") {
+                                roster.trust_command(verb == "z", arg.trim(), &trust, &session.commands);
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -160,7 +192,129 @@ fn print_event(e: &SessionEvent) {
             println!("rozłączono, ponowna próba za {:.1} s", retry_in.as_secs_f32())
         }
         SessionEvent::Fatal(r) => println!("błąd: {r:?}"),
-        SessionEvent::E2e(e) => println!("e2e: {e:?}"),
+        SessionEvent::E2e(E2eEvent::Member { id, name, trust, code, .. }) => match trust {
+            Trust::NewUser => println!("e2e: nowa osoba: {name} (id {id}); kod bezpieczeństwa: {code}"),
+            Trust::NewDevice => println!(
+                "e2e: UWAGA: {name} (id {id}) używa nowego urządzenia; kod bezpieczeństwa: {code}"
+            ),
+            Trust::KeyChanged => println!(
+                "e2e: OSTRZEŻENIE: zmieniony klucz u {name} (id {id})! Może to być podszywanie się. \
+                 Porównaj kod {code} głosowo; jeśli to na pewno ta osoba: a {id}. Do tego czasu nie dostaje Twojego dźwięku."
+            ),
+            Trust::Known => println!("e2e: {name} (id {id}) — znane urządzenie; kod: {code}"),
+            Trust::Verified => println!("e2e: {name} (id {id}) — zweryfikowany; kod: {code}"),
+        },
+        SessionEvent::E2e(E2eEvent::Rejected { id, reason }) => {
+            println!("e2e: odrzucono ogłoszenie klucza od uczestnika {id}: {}", describe_reject(reason))
+        }
+    }
+}
+
+fn describe_reject(r: &AnnounceError) -> &'static str {
+    match r {
+        AnnounceError::Malformed => "uszkodzone",
+        AnnounceError::BadSignature => "zły podpis",
+        AnnounceError::NameMismatch => "nazwa nie zgadza się z serwerem",
+        AnnounceError::WrongRoom => "inny pokój",
+        AnnounceError::Stale => "nieaktualne (sprawdź zegar komputera)",
+        AnnounceError::OwnIdentity => "ta sama tożsamość co Twoja",
+    }
+}
+
+fn warn_if_unsaved(trust: &Mutex<KnownDevices>) {
+    if trust.lock().map(|t| t.save_failed()).unwrap_or(false) {
+        println!(
+            "UWAGA: nie udało się zapisać listy zaufanych urządzeń (known_devices.toml). \
+             Zmiany obowiązują do zamknięcia programu, potem znajomi znów wyglądają jak nowi."
+        );
+    }
+}
+
+#[derive(Default)]
+struct Roster {
+    names: BTreeMap<MemberId, String>,
+    e2e: BTreeMap<MemberId, (String, IdentityPublic, Trust, String)>,
+}
+
+impl Roster {
+    fn observe(&mut self, e: &SessionEvent) {
+        match e {
+            SessionEvent::Connected { members, .. } => {
+                self.names = members.iter().map(|m| (m.id, m.name.clone())).collect();
+                self.e2e.clear();
+            }
+            SessionEvent::MemberJoined(m) => {
+                self.names.insert(m.id, m.name.clone());
+            }
+            SessionEvent::MemberLeft(id) => {
+                self.names.remove(id);
+                self.e2e.remove(id);
+            }
+            SessionEvent::E2e(E2eEvent::Member { id, name, identity, trust, code }) => {
+                self.e2e.insert(*id, (name.clone(), *identity, *trust, code.clone()));
+            }
+            SessionEvent::E2e(E2eEvent::Rejected { id, .. }) => {
+                self.e2e.remove(id);
+            }
+            _ => {}
+        }
+    }
+
+    fn print(&self) {
+        if self.names.is_empty() {
+            println!("w pokoju nikogo nie ma");
+        }
+        for (id, name) in &self.names {
+            match self.e2e.get(id) {
+                Some((_, _, trust, code)) => {
+                    println!("{id:>4}  {name}  {}  kod: {code}", trust_label(*trust))
+                }
+                None => println!("{id:>4}  {name}  brak ważnego klucza (bez szyfrowania do czasu ogłoszenia)"),
+            }
+        }
+    }
+
+    fn trust_command(
+        &self,
+        verify: bool,
+        arg: &str,
+        trust: &Mutex<KnownDevices>,
+        commands: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    ) {
+        let Ok(id) = arg.parse::<MemberId>() else {
+            println!("podaj numer uczestnika z listy (k), np. {} 3", if verify { "z" } else { "a" });
+            return;
+        };
+        let Some((name, identity, trust_state, _)) = self.e2e.get(&id) else {
+            println!("uczestnik {id} nie ma jeszcze klucza; zobacz listę: k");
+            return;
+        };
+        {
+            let Ok(mut store) = trust.lock() else { return };
+            if verify {
+                if *trust_state == Trust::KeyChanged {
+                    println!("klucz {name} się zmienił; najpierw porównaj kod i zaakceptuj: a {id}");
+                    return;
+                }
+                store.verify(name, identity);
+                println!("{name} oznaczony jako zweryfikowany");
+            } else {
+                store.accept(name, identity);
+                println!("zaakceptowano klucz {name}; to urządzenie jest znane, ale niezweryfikowane");
+            }
+        }
+        warn_if_unsaved(trust);
+        let _ = commands.send(SessionCommand::TrustChanged(id));
+    }
+}
+
+fn trust_label(t: Trust) -> &'static str {
+    match t {
+        Trust::Verified => "zweryfikowany",
+        Trust::Known => "znany",
+        Trust::NewUser => "nowa osoba",
+        Trust::NewDevice => "NOWE URZĄDZENIE",
+        Trust::KeyChanged => "ZMIENIONY KLUCZ (a <id> po sprawdzeniu)",
     }
 }
 

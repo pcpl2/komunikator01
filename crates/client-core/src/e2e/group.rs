@@ -38,7 +38,7 @@ const ROOM: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E2eEvent {
-    Member { id: MemberId, name: String, trust: Trust, code: String },
+    Member { id: MemberId, name: String, identity: IdentityPublic, trust: Trust, code: String },
     Rejected { id: MemberId, reason: AnnounceError },
 }
 
@@ -241,6 +241,7 @@ impl E2e {
         Some(E2eEvent::Member {
             id,
             name: peer.name.clone(),
+            identity: *identity,
             trust,
             code: safety_code(&self.my_public, identity),
         })
@@ -747,6 +748,7 @@ mod tests {
         assert!(net.client(a).events.contains(&E2eEvent::Member {
             id: b,
             name: "b".into(),
+            identity: pb,
             trust: Trust::NewUser,
             code: code.clone(),
         }));
