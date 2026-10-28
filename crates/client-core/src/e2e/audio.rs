@@ -132,19 +132,31 @@ struct Slot {
     expires: Option<Instant>,
 }
 
-/// Decrypts frames of one sender. Keeps at most two keys: the newest added one and the one of
-/// the epoch that most recently opened a valid frame.
+/// Decrypts frames of one sender. Keeps at most three keys: the newest added one, the one of
+/// the newest epoch that opened a valid frame (in use), and the previous newest until the
+/// newest opens a frame. The last covers a sender that switched to a key while silent (VAD)
+/// when the next rotation arrives: it may keep sealing with that key for a while. Keys older
+/// than an epoch that opened a frame expire after `OLD_EPOCH_GRACE`.
 pub struct AudioOpener {
     sender: MemberId,
     slots: Vec<Slot>,
     newest: Option<u16>,
+    /// The newest before `newest`, kept while `newest` has not opened a frame yet.
+    prev_newest: Option<u16>,
     last_used: Option<u16>,
     highest_opened: Option<u16>,
 }
 
 impl AudioOpener {
     pub fn new(sender: MemberId) -> Self {
-        Self { sender, slots: Vec::new(), newest: None, last_used: None, highest_opened: None }
+        Self {
+            sender,
+            slots: Vec::new(),
+            newest: None,
+            prev_newest: None,
+            last_used: None,
+            highest_opened: None,
+        }
     }
 
     pub fn add_key(&mut self, key: SenderKey) {
@@ -162,12 +174,12 @@ impl AudioOpener {
             replay: Replay::default(),
             expires: None,
         });
-        self.newest = Some(key.epoch);
+        self.prev_newest = self.newest.replace(key.epoch);
         // The first key counts as in use until a frame says otherwise, so a key that has not
         // yet seen traffic survives the next rotation.
         self.last_used.get_or_insert(key.epoch);
-        let (newest, last_used) = (self.newest, self.last_used);
-        self.slots.retain(|s| Some(s.epoch) == newest || Some(s.epoch) == last_used);
+        let keep = [self.newest, self.last_used, self.prev_newest];
+        self.slots.retain(|s| keep.contains(&Some(s.epoch)));
     }
 
     pub fn open(
@@ -335,6 +347,27 @@ mod tests {
         assert!(o.open(1, 1, &frame(&k1, 1), t0, &mut pt));
         o.add_key(k3);
         assert!(o.open(2, 2, &frame(&k2, 2), t0, &mut pt));
+    }
+
+    #[test]
+    fn silent_sender_keeps_switched_key() {
+        let (k1, k2, k3, k4) =
+            (SenderKey::generate(1), SenderKey::generate(2), SenderKey::generate(3), SenderKey::generate(4));
+        let mut o = AudioOpener::new(S);
+        let (t0, mut pt) = (Instant::now(), Vec::new());
+        o.add_key(k1.clone());
+        assert!(o.open(1, 1, &frame(&k1, 1), t0, &mut pt)); // e1 in use
+        o.add_key(k2.clone()); // the sender switches to e2 but stays silent (VAD)
+        o.add_key(k3.clone()); // the next rotation arrives before the sender switched again
+        assert!(o.open(2, 1, &frame(&k2, 1), t0, &mut pt), "e2 still opens");
+        // At most three keys: a fourth rotation drops the oldest that is neither newest,
+        // in use, nor the previous newest.
+        o.add_key(k4);
+        assert!(!o.open(1, 2, &frame(&k1, 2), t0, &mut pt));
+        assert!(o.open(3, 1, &frame(&k3, 1), t0, &mut pt), "previous newest kept");
+        // e3 (the previous newest) opened: the 2 s grace now applies to older keys.
+        assert!(o.open(2, 2, &frame(&k2, 2), t0 + Duration::from_secs(1), &mut pt));
+        assert!(!o.open(2, 3, &frame(&k2, 3), t0 + Duration::from_secs(3), &mut pt));
     }
 
     #[test]
