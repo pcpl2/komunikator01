@@ -1,6 +1,5 @@
 //! A server session that reconnects on its own until told to stop or a fatal error.
 
-use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,7 +8,7 @@ use bytes::Bytes;
 use protocol::audio::{encode_upstream, parse_downstream, MAX_AUDIO_PAYLOAD, MAX_DATAGRAM};
 use protocol::{
     encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
-    RoomId, ServerMsg, PROTOCOL_VERSION,
+    RoomErrorReason, RoomId, RoomInfo, ServerMsg, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use tokio::sync::{mpsc, watch};
@@ -17,7 +16,9 @@ use tokio::time::timeout;
 
 use super::{client_config, Backoff, SERVER_NAME};
 use crate::audio::frame::{EncodedFrame, IncomingFrame, MAX_PACKET};
+use crate::chat::{self, ChatTextError};
 use crate::e2e::{E2e, E2eEvent, Identity, KnownDevices, Output, TAG_LEN};
+use crate::lobby::{Lobby, RoomChange};
 
 /// Close code the server uses when this account logged in elsewhere.
 const CLOSE_REPLACED: u32 = 1;
@@ -60,19 +61,51 @@ impl std::fmt::Debug for SessionParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Connecting,
-    Connected { you: MemberId, members: Vec<MemberInfo> },
+    /// `members` are everyone online (me included), whatever their room.
+    Connected { you: MemberId, room: Option<RoomId>, rooms: Vec<RoomInfo>, members: Vec<MemberInfo> },
     MemberJoined(MemberInfo),
     MemberLeft(MemberId),
+    MemberMoved { id: MemberId, room: Option<RoomId> },
+    RoomCreated(RoomInfo),
+    RoomDeleted(RoomId),
+    RoomError(RoomErrorReason),
+    Chat(ChatLine),
+    /// A chat message from `from` that could not be decrypted; its content is unknown.
+    ChatUnreadable { from: MemberId, name: String },
+    ChatNotSent(ChatSendError),
     Disconnected { retry_in: Duration },
     Fatal(FatalReason),
     E2e(E2eEvent),
 }
 
-/// Requests to the running session.
+/// A chat message of my room, decrypted and sanitized (or my own, as sent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLine {
+    pub from: MemberId,
+    pub name: String,
+    pub text: String,
+    pub own: bool,
+    pub at: SystemTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSendError {
+    Empty,
+    TooLong,
+    NotInRoom,
+    NotConnected,
+}
+
+/// Requests to the running session.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     /// The trust store entry for this member's device was changed (accepted or verified).
     TrustChanged(MemberId),
+    JoinRoom(RoomId),
+    LeaveRoom,
+    CreateRoom(String),
+    DeleteRoom(RoomId),
+    SendChat(String),
 }
 
 /// Errors after which the session stops for good instead of reconnecting.
@@ -116,6 +149,7 @@ pub fn spawn_session(rt: &tokio::runtime::Handle, params: SessionParams) -> Sess
         stop: stop_rx,
         next_epoch: 0,
         seq: WireSeq::default(),
+        room_choice: RoomChoice::Default,
     };
     rt.spawn(task.run());
     SessionHandle { events, audio_out, audio_in, commands, stop }
@@ -137,9 +171,12 @@ struct Task {
     in_tx: mpsc::Sender<IncomingFrame>,
     cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
     stop: watch::Receiver<bool>,
-    /// First sender-key epoch for the next connection; carried across reconnects.
+    /// First sender-key epoch for the next room key set; carried across rooms and reconnects
+    /// so no epoch repeats within a run.
     next_epoch: u16,
     seq: WireSeq,
+    /// Sent in every `Hello`, so a reconnect returns to the last room the server confirmed.
+    room_choice: RoomChoice,
 }
 
 /// Maps capture sequence numbers to the ones sent (and used as AEAD nonces): strictly
@@ -196,7 +233,8 @@ impl Task {
         let _ = self.events.send(e);
     }
 
-    /// Sleeps while discarding stale outgoing audio; true when asked to stop.
+    /// Sleeps while discarding stale outgoing audio and answering commands the way an
+    /// offline session can; true when asked to stop.
     async fn wait(&mut self, delay: Duration) -> bool {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -205,6 +243,16 @@ impl Task {
                 _ = &mut sleep => return false,
                 _ = self.stop.changed() => return true,
                 f = self.out_rx.recv() => if f.is_none() { return true },
+                Some(c) = self.cmd_rx.recv() => match c {
+                    SessionCommand::JoinRoom(r) => self.room_choice = RoomChoice::Room(r),
+                    SessionCommand::LeaveRoom => self.room_choice = RoomChoice::Nowhere,
+                    SessionCommand::SendChat(_) => {
+                        self.emit(SessionEvent::ChatNotSent(ChatSendError::NotConnected))
+                    }
+                    SessionCommand::TrustChanged(_)
+                    | SessionCommand::CreateRoom(_)
+                    | SessionCommand::DeleteRoom(_) => {}
+                },
             }
         }
     }
@@ -216,7 +264,7 @@ impl Task {
             username: self.params.username.clone(),
             password: self.params.password.clone(),
             session: self.session,
-            room: RoomChoice::Default,
+            room: self.room_choice,
         };
         let login = async {
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
@@ -235,34 +283,22 @@ impl Task {
             conn.close(VarInt::from_u32(0), b"");
             return Outcome::Retry;
         };
-        let (e2e, first, room, reported) = match reply {
-            Some(ServerMsg::Welcome { you, room, members, .. }) => {
-                // Only the others in my room share keys with me; in no room, nobody does.
-                let members: Vec<MemberInfo> = members
-                    .into_iter()
-                    .filter(|m| m.id != you && room.is_some() && m.room == room)
-                    .collect();
+        let (lobby, entered, queued) = match reply {
+            Some(ServerMsg::Welcome { you, room, rooms, members }) => {
                 backoff.reset();
                 // Audio captured while connecting is stale; sending it would play as a burst.
                 while self.out_rx.try_recv().is_ok() {}
-                // Member ids from an old connection mean nothing now, and the new E2e reads
-                // the trust store fresh anyway.
-                while self.cmd_rx.try_recv().is_ok() {}
-                let (e2e, first) = E2e::new(
-                    self.params.identity.clone(),
-                    self.params.trust.clone(),
-                    you,
-                    self.params.username.clone(),
-                    // Outside any room nobody shares keys with me, so the room id is moot.
-                    room.unwrap_or(0),
-                    &members,
-                    self.next_epoch,
-                    Instant::now(),
-                    now_ms(),
-                );
-                let reported = members.iter().map(|m| m.id).collect();
-                self.emit(SessionEvent::Connected { you, members });
-                (e2e, first, room, reported)
+                // Member ids from an old connection mean nothing now, and a new E2e reads the
+                // trust store fresh anyway; other commands issued while connecting still apply.
+                let mut queued = Vec::new();
+                while let Ok(c) = self.cmd_rx.try_recv() {
+                    if !matches!(c, SessionCommand::TrustChanged(_)) {
+                        queued.push(c);
+                    }
+                }
+                let (lobby, entered) = Lobby::new(you, room, rooms.clone(), members.clone());
+                self.emit(SessionEvent::Connected { you, room, rooms, members });
+                (lobby, entered, queued)
             }
             Some(ServerMsg::Rejected { reason }) => {
                 return match reason {
@@ -276,13 +312,19 @@ impl Task {
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),
             _ => return closed_outcome(&conn),
         };
-        let mut link = Link::new(&conn, &mut send, e2e, room, reported);
-        let outcome = match link.output(first, &self.events) {
+        let mut link = Link::new(&conn, &mut send, lobby);
+        let mut started = self.room_changes(&mut link, entered.into_iter().collect());
+        for c in queued {
+            started = started.and_then(|()| self.command(&mut link, c));
+        }
+        let outcome = match started {
             Ok(()) => self.connected_loop(&mut link, &mut recv, &mut dec).await,
             Err(o) => o,
         };
         // Keys of the next connection must not reuse an epoch of this one.
-        self.next_epoch = link.e2e.next_epoch();
+        if let Some(e2e) = &link.e2e {
+            self.next_epoch = e2e.next_epoch();
+        }
         conn.close(VarInt::from_u32(0), b"");
         outcome
     }
@@ -321,33 +363,11 @@ impl Task {
         let (mut unsealed, mut unopened) = (0u64, 0u64);
         loop {
             // `read_msg` is cancel-safe: partial input stays in `dec`, and quinn reads are.
-            let out = tokio::select! {
-                m = read_msg(recv, dec) => {
-                    let now = Instant::now();
-                    match m {
-                        Some(ServerMsg::MemberJoined(m))
-                            if link.room.is_some() && m.room == link.room =>
-                        {
-                            let out = link.e2e.member_joined(&m, now);
-                            link.reported.insert(m.id);
-                            self.emit(SessionEvent::MemberJoined(m));
-                            out
-                        }
-                        Some(ServerMsg::MemberLeft { id }) if link.reported.remove(&id) => {
-                            self.emit(SessionEvent::MemberLeft(id));
-                            link.e2e.member_left(id, now)
-                        }
-                        Some(ServerMsg::Announce { from, blob }) => {
-                            link.e2e.announce(from, &blob, now, now_ms())
-                        }
-                        Some(ServerMsg::Relay { from, blob }) => link.e2e.relay(from, &blob, now),
-                        Some(ServerMsg::SessionReplaced) => {
-                            return Outcome::Fatal(FatalReason::SessionReplaced)
-                        }
-                        Some(_) => continue,
-                        None => return closed_outcome(link.conn),
-                    }
-                }
+            let handled = tokio::select! {
+                m = read_msg(recv, dec) => match m {
+                    Some(m) => self.server_msg(link, m),
+                    None => return closed_outcome(link.conn),
+                },
                 // `write` is cancel-safe: if another branch wins, nothing was written.
                 w = link.send.write(&link.ctrl_out[link.ctrl_sent..]), if link.ctrl_pending() => match w {
                     Ok(n) => {
@@ -361,17 +381,21 @@ impl Task {
                     tracing::debug!("control stream stalled; reconnecting");
                     return Outcome::Retry;
                 }
-                _ = tick.tick() => link.e2e.tick(Instant::now()),
-                Some(c) = self.cmd_rx.recv() => match c {
-                    SessionCommand::TrustChanged(id) => link.e2e.trust_changed(id),
+                _ = tick.tick() => match link.e2e.as_mut() {
+                    Some(e2e) => {
+                        let out = e2e.tick(Instant::now());
+                        link.output(out, &self.events)
+                    }
+                    None => continue,
                 },
+                Some(c) = self.cmd_rx.recv() => self.command(link, c),
                 _ = self.stop.changed() => return Outcome::Stop,
                 d = link.conn.read_datagram() => match d {
                     Ok(d) => {
-                        if let Ok(p) = parse_downstream(&d) {
+                        // Outside any room nobody may send to me; such frames are dropped.
+                        if let (Ok(p), Some(e2e)) = (parse_downstream(&d), link.e2e.as_mut()) {
                             let now = Instant::now();
-                            let frame = link
-                                .e2e
+                            let frame = e2e
                                 .open(p.sender, p.epoch, p.seq, p.payload, now, &mut plain)
                                 .then(|| IncomingFrame::new(p.sender, p.seq, &plain))
                                 .flatten();
@@ -392,14 +416,17 @@ impl Task {
                 f = self.out_rx.recv() => match f {
                     Some(f) => {
                         let seq = self.seq.map(f.seq);
-                        match link.e2e.seal(seq, f.payload(), &mut sealed) {
-                            Some(epoch) => {
-                                encode_upstream(epoch, seq, &sealed, &mut up);
-                                let _ = link.conn.send_datagram(Bytes::copy_from_slice(&up));
-                            }
-                            None => {
-                                unsealed += 1;
-                                tracing::debug!(unsealed, "dropped audio frame that could not be sealed");
+                        // In no room there is nobody to talk to.
+                        if let Some(e2e) = link.e2e.as_mut() {
+                            match e2e.seal(seq, f.payload(), &mut sealed) {
+                                Some(epoch) => {
+                                    encode_upstream(epoch, seq, &sealed, &mut up);
+                                    let _ = link.conn.send_datagram(Bytes::copy_from_slice(&up));
+                                }
+                                None => {
+                                    unsealed += 1;
+                                    tracing::debug!(unsealed, "dropped audio frame that could not be sealed");
+                                }
                             }
                         }
                         continue;
@@ -407,23 +434,205 @@ impl Task {
                     None => return Outcome::Stop,
                 },
             };
-            if let Err(o) = link.output(out, &self.events) {
+            if let Err(o) = handled {
                 return o;
+            }
+        }
+    }
+
+    /// Mirrors lobby changes to the caller for everyone online; E2E only follows my room.
+    fn server_msg(&mut self, link: &mut Link<'_>, m: ServerMsg) -> Result<(), Outcome> {
+        let now = Instant::now();
+        let changes = match m {
+            ServerMsg::MemberJoined(m) => {
+                self.emit(SessionEvent::MemberJoined(m.clone()));
+                link.lobby.member_joined(m)
+            }
+            ServerMsg::MemberLeft { id } => {
+                self.emit(SessionEvent::MemberLeft(id));
+                link.lobby.member_left(id)
+            }
+            ServerMsg::MemberMoved { id, room } => {
+                if id == link.lobby.me() {
+                    self.room_choice = room.map_or(RoomChoice::Nowhere, RoomChoice::Room);
+                }
+                self.emit(SessionEvent::MemberMoved { id, room });
+                link.lobby.member_moved(id, room)
+            }
+            ServerMsg::RoomCreated(r) => {
+                self.emit(SessionEvent::RoomCreated(r.clone()));
+                link.lobby.room_created(r)
+            }
+            ServerMsg::RoomDeleted { room } => {
+                if self.room_choice == RoomChoice::Room(room) {
+                    self.room_choice = RoomChoice::Default;
+                }
+                self.emit(SessionEvent::RoomDeleted(room));
+                link.lobby.room_deleted(room)
+            }
+            ServerMsg::RoomError { reason } => {
+                self.emit(SessionEvent::RoomError(reason));
+                return Ok(());
+            }
+            ServerMsg::Chat { from, blob } => {
+                self.incoming_chat(link, from, &blob);
+                return Ok(());
+            }
+            ServerMsg::Announce { from, blob } => {
+                return match link.e2e.as_mut() {
+                    Some(e2e) => {
+                        let out = e2e.announce(from, &blob, now, now_ms());
+                        link.output(out, &self.events)
+                    }
+                    None => Ok(()),
+                };
+            }
+            ServerMsg::Relay { from, blob } => {
+                return match link.e2e.as_mut() {
+                    Some(e2e) => {
+                        let out = e2e.relay(from, &blob, now);
+                        link.output(out, &self.events)
+                    }
+                    None => Ok(()),
+                };
+            }
+            ServerMsg::SessionReplaced => return Err(Outcome::Fatal(FatalReason::SessionReplaced)),
+            ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } => return Ok(()),
+        };
+        self.room_changes(link, changes)
+    }
+
+    /// Keeps E2E in step with my room: entering one starts a fresh key set for it, leaving
+    /// drops it, and arrivals and departures there are passed on.
+    fn room_changes(&mut self, link: &mut Link<'_>, changes: Vec<RoomChange>) -> Result<(), Outcome> {
+        let now = Instant::now();
+        for change in changes {
+            let out = match change {
+                RoomChange::Entered { room, members } => {
+                    if let Some(old) = link.e2e.take() {
+                        self.next_epoch = old.next_epoch();
+                    }
+                    let (e2e, out) = E2e::new(
+                        self.params.identity.clone(),
+                        self.params.trust.clone(),
+                        link.lobby.me(),
+                        self.params.username.clone(),
+                        room,
+                        &members,
+                        self.next_epoch,
+                        now,
+                        now_ms(),
+                    );
+                    link.e2e = Some(e2e);
+                    out
+                }
+                RoomChange::Exited => {
+                    if let Some(old) = link.e2e.take() {
+                        self.next_epoch = old.next_epoch();
+                    }
+                    continue;
+                }
+                RoomChange::Joined(m) => match link.e2e.as_mut() {
+                    Some(e2e) => e2e.member_joined(&m, now),
+                    None => continue,
+                },
+                RoomChange::Left(id) => match link.e2e.as_mut() {
+                    Some(e2e) => e2e.member_left(id, now),
+                    None => continue,
+                },
+            };
+            link.output(out, &self.events)?;
+        }
+        Ok(())
+    }
+
+    fn command(&mut self, link: &mut Link<'_>, c: SessionCommand) -> Result<(), Outcome> {
+        let msg = match c {
+            SessionCommand::TrustChanged(id) => {
+                return match link.e2e.as_mut() {
+                    Some(e2e) => {
+                        let out = e2e.trust_changed(id);
+                        link.output(out, &self.events)
+                    }
+                    None => Ok(()),
+                };
+            }
+            SessionCommand::JoinRoom(room) => ClientMsg::JoinRoom { room },
+            SessionCommand::LeaveRoom => ClientMsg::LeaveRoom,
+            SessionCommand::CreateRoom(name) => ClientMsg::CreateRoom { name },
+            SessionCommand::DeleteRoom(room) => ClientMsg::DeleteRoom { room },
+            SessionCommand::SendChat(text) => match self.outgoing_chat(link, &text) {
+                Some(msg) => msg,
+                None => return Ok(()),
+            },
+        };
+        link.queue(&[msg])
+    }
+
+    /// Seals `text` for my room and reports it as sent; `None` (with the reason reported)
+    /// when it cannot be sent.
+    fn outgoing_chat(&mut self, link: &mut Link<'_>, text: &str) -> Option<ClientMsg> {
+        let text = match chat::prepare_outgoing(text) {
+            Ok(t) => t,
+            Err(e) => {
+                let reason = match e {
+                    ChatTextError::Empty => ChatSendError::Empty,
+                    ChatTextError::TooLong => ChatSendError::TooLong,
+                };
+                self.emit(SessionEvent::ChatNotSent(reason));
+                return None;
+            }
+        };
+        let Some(e2e) = link.e2e.as_mut() else {
+            self.emit(SessionEvent::ChatNotSent(ChatSendError::NotInRoom));
+            return None;
+        };
+        // Length was checked above, so only a spent key (2^32 messages) gets here.
+        let Some(msg) = e2e.seal_chat(&text) else {
+            tracing::warn!("chat key spent; message not sent");
+            return None;
+        };
+        self.emit(SessionEvent::Chat(ChatLine {
+            from: link.lobby.me(),
+            name: self.params.username.clone(),
+            text,
+            own: true,
+            at: SystemTime::now(),
+        }));
+        Some(msg)
+    }
+
+    fn incoming_chat(&mut self, link: &mut Link<'_>, from: MemberId, blob: &[u8]) {
+        let name = link.lobby.name_of(from).unwrap_or("?").to_owned();
+        let opened = match link.e2e.as_mut() {
+            Some(e2e) => e2e.open_chat(from, blob).map_err(|e| format!("{e:?}")),
+            None => Err("not in a room".to_owned()),
+        };
+        match opened {
+            Ok(text) => self.emit(SessionEvent::Chat(ChatLine {
+                from,
+                name,
+                text: chat::sanitize(&text),
+                own: false,
+                at: SystemTime::now(),
+            })),
+            Err(kind) => {
+                // The kind only; never the content.
+                tracing::debug!(from, error = %kind, "chat message did not open");
+                self.emit(SessionEvent::ChatUnreadable { from, name });
             }
         }
     }
 }
 
-/// One live connection with its E2E state.
+/// One live connection with its lobby view and, while I am in a room, its E2E state.
 struct Link<'a> {
     conn: &'a Connection,
     /// Control stream to the server.
     send: &'a mut SendStream,
-    e2e: E2e,
-    /// My room as of the `Welcome`; only its members take part in E2E.
-    room: Option<RoomId>,
-    /// Members reported in `Connected`/`MemberJoined`; only their departures are reported.
-    reported: HashSet<MemberId>,
+    lobby: Lobby,
+    /// Keys for my current room; `None` while in no room.
+    e2e: Option<E2e>,
     /// Encoded control messages not yet written; `ctrl_out[ctrl_sent..]` is pending. Written
     /// from the main loop so a server that stops reading cannot block audio or shutdown.
     ctrl_out: Vec<u8>,
@@ -433,19 +642,12 @@ struct Link<'a> {
 }
 
 impl<'a> Link<'a> {
-    fn new(
-        conn: &'a Connection,
-        send: &'a mut SendStream,
-        e2e: E2e,
-        room: Option<RoomId>,
-        reported: HashSet<MemberId>,
-    ) -> Self {
+    fn new(conn: &'a Connection, send: &'a mut SendStream, lobby: Lobby) -> Self {
         Self {
             conn,
             send,
-            e2e,
-            room,
-            reported,
+            lobby,
+            e2e: None,
             ctrl_out: Vec::new(),
             ctrl_sent: 0,
             ctrl_deadline: Instant::now(),
@@ -457,12 +659,17 @@ impl<'a> Link<'a> {
     }
 
     /// Reports the state machine's events and queues its messages for the control stream.
-    /// Fails when the queue grows past `CTRL_QUEUE_MAX` (the server is not reading).
     fn output(&mut self, out: Output, events: &mpsc::UnboundedSender<SessionEvent>) -> Result<(), Outcome> {
         for e in out.events {
             let _ = events.send(SessionEvent::E2e(e));
         }
-        if out.send.is_empty() {
+        self.queue(&out.send)
+    }
+
+    /// Queues messages for the control stream. Fails when the queue grows past
+    /// `CTRL_QUEUE_MAX` (the server is not reading).
+    fn queue(&mut self, msgs: &[ClientMsg]) -> Result<(), Outcome> {
+        if msgs.is_empty() {
             return Ok(());
         }
         if !self.ctrl_pending() {
@@ -473,7 +680,7 @@ impl<'a> Link<'a> {
             self.ctrl_out.drain(..self.ctrl_sent);
             self.ctrl_sent = 0;
         }
-        for m in &out.send {
+        for m in msgs {
             self.ctrl_out.extend_from_slice(&encode_frame(m));
         }
         if self.ctrl_out.len() - self.ctrl_sent > CTRL_QUEUE_MAX {

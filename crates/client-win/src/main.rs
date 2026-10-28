@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use clap::Parser;
 use client_core::e2e::{AnnounceError, E2eEvent, IdentityPublic, KnownDevices, Trust};
-use protocol::MemberId;
+use protocol::{MemberId, RoomId};
 use client_core::net::session::{spawn_session, SessionCommand, SessionEvent, SessionParams};
 
 #[derive(Parser)]
@@ -195,12 +195,24 @@ fn toggle(label: &str, flag: &AtomicBool) {
 fn print_event(e: &SessionEvent) {
     match e {
         SessionEvent::Connecting => println!("łączenie…"),
-        SessionEvent::Connected { you, members } => {
-            let names: Vec<_> = members.iter().map(|m| m.name.as_str()).collect();
+        SessionEvent::Connected { you, room, members, .. } => {
+            let names: Vec<_> = members
+                .iter()
+                .filter(|m| m.id != *you && room.is_some() && m.room == *room)
+                .map(|m| m.name.as_str())
+                .collect();
             println!("połączono (id {you}); w pokoju: {}", if names.is_empty() { "nikt".into() } else { names.join(", ") });
         }
         SessionEvent::MemberJoined(m) => println!("+ {} dołącza", m.name),
         SessionEvent::MemberLeft(id) => println!("- uczestnik {id} wychodzi"),
+        SessionEvent::MemberMoved { id, room: Some(r) } => println!("uczestnik {id} przechodzi do pokoju {r}"),
+        SessionEvent::MemberMoved { id, room: None } => println!("uczestnik {id} wychodzi z pokoju"),
+        SessionEvent::RoomCreated(r) => println!("nowy pokój: {} (id {})", r.name, r.id),
+        SessionEvent::RoomDeleted(id) => println!("usunięto pokój {id}"),
+        SessionEvent::RoomError(reason) => println!("błąd pokoju: {reason:?}"),
+        SessionEvent::Chat(line) => println!("[{}] {}", line.name, line.text),
+        SessionEvent::ChatUnreadable { name, .. } => println!("nie udało się odczytać wiadomości od {name}"),
+        SessionEvent::ChatNotSent(reason) => println!("nie wysłano wiadomości: {reason:?}"),
         SessionEvent::Disconnected { retry_in } => {
             println!("rozłączono, ponowna próba za {:.1} s", retry_in.as_secs_f32())
         }
@@ -248,23 +260,42 @@ fn warn_if_unsaved(trust: &Mutex<KnownDevices>) {
 
 #[derive(Default)]
 struct Roster {
-    names: BTreeMap<MemberId, String>,
+    you: MemberId,
+    room: Option<RoomId>,
+    /// Everyone online except me, with their room.
+    members: BTreeMap<MemberId, (String, Option<RoomId>)>,
     e2e: BTreeMap<MemberId, (String, IdentityPublic, Trust, String)>,
 }
 
 impl Roster {
     fn observe(&mut self, e: &SessionEvent) {
         match e {
-            SessionEvent::Connected { members, .. } => {
-                self.names = members.iter().map(|m| (m.id, m.name.clone())).collect();
+            SessionEvent::Connected { you, room, members, .. } => {
+                self.you = *you;
+                self.room = *room;
+                self.members =
+                    members.iter().filter(|m| m.id != *you).map(|m| (m.id, (m.name.clone(), m.room))).collect();
                 self.e2e.clear();
             }
-            SessionEvent::MemberJoined(m) => {
-                self.names.insert(m.id, m.name.clone());
+            SessionEvent::MemberJoined(m) if m.id != self.you => {
+                self.members.insert(m.id, (m.name.clone(), m.room));
             }
             SessionEvent::MemberLeft(id) => {
-                self.names.remove(id);
+                self.members.remove(id);
                 self.e2e.remove(id);
+            }
+            // A new room means new keys for everyone.
+            SessionEvent::MemberMoved { id, room } if *id == self.you => {
+                self.room = *room;
+                self.e2e.clear();
+            }
+            SessionEvent::MemberMoved { id, room } => {
+                if let Some(m) = self.members.get_mut(id) {
+                    m.1 = *room;
+                }
+                if room.is_none() || *room != self.room {
+                    self.e2e.remove(id);
+                }
             }
             SessionEvent::E2e(E2eEvent::Member { id, name, identity, trust, code }) => {
                 self.e2e.insert(*id, (name.clone(), *identity, *trust, code.clone()));
@@ -277,10 +308,15 @@ impl Roster {
     }
 
     fn print(&self) {
-        if self.names.is_empty() {
+        if self.room.is_none() {
+            println!("nie jesteś w żadnym pokoju");
+            return;
+        }
+        let here: Vec<_> = self.members.iter().filter(|(_, (_, room))| *room == self.room).collect();
+        if here.is_empty() {
             println!("w pokoju nikogo nie ma");
         }
-        for (id, name) in &self.names {
+        for (id, (name, _)) in here {
             match self.e2e.get(id) {
                 Some((_, _, trust, code)) => {
                     println!("{id:>4}  {name}  {}  kod: {code}", trust_label(*trust))

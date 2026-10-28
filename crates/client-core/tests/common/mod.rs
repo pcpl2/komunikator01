@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use client_core::audio::frame::EncodedFrame;
 use client_core::e2e::{E2eEvent, Identity, KnownDevices, Trust};
-use client_core::net::session::{spawn_session, SessionEvent, SessionHandle, SessionParams};
-use protocol::MemberId;
+use client_core::net::session::{spawn_session, SessionCommand, SessionEvent, SessionHandle, SessionParams};
+use protocol::{MemberId, RoomId};
 use server::{RunningServer, ServerConfig, UserEntry};
 use tokio::time::{timeout, Instant};
 
@@ -90,10 +90,34 @@ pub async fn wait_for(
 }
 
 pub async fn connected(h: &mut SessionHandle) -> MemberId {
+    connected_in(h).await.0
+}
+
+/// Waits for `Connected`; returns my id and the room the server put me in.
+pub async fn connected_in(h: &mut SessionHandle) -> (MemberId, Option<RoomId>) {
     match wait_for(h, Duration::from_secs(5), |e| matches!(e, SessionEvent::Connected { .. })).await {
-        Some(SessionEvent::Connected { you, .. }) => you,
+        Some(SessionEvent::Connected { you, room, .. }) => (you, room),
         other => panic!("expected Connected, got {other:?}"),
     }
+}
+
+/// Creates a room named `name` and waits for the server to confirm it.
+pub async fn create_room(h: &mut SessionHandle, name: &str) -> RoomId {
+    h.commands.send(SessionCommand::CreateRoom(name.into())).unwrap();
+    let e = wait_for(h, Duration::from_secs(5), |e| matches!(e, SessionEvent::RoomCreated(r) if r.name == name)).await;
+    match e {
+        Some(SessionEvent::RoomCreated(r)) => r.id,
+        other => panic!("expected RoomCreated, got {other:?}"),
+    }
+}
+
+/// Waits until `h` sees member `id` move to `room`.
+pub async fn moved(h: &mut SessionHandle, id: MemberId, room: Option<RoomId>) {
+    let e = wait_for(h, Duration::from_secs(5), |e| {
+        matches!(e, SessionEvent::MemberMoved { id: m, room: r } if *m == id && *r == room)
+    })
+    .await;
+    assert!(e.is_some(), "member {id} never seen moving to {room:?}");
 }
 
 /// Waits for an E2E `Member` event about `id` (any member when `None`) with trust `trust`
@@ -115,10 +139,21 @@ pub async fn e2e_member(h: &mut SessionHandle, id: Option<MemberId>, trust: Opti
 pub async fn exchange_payload(
     from: &SessionHandle,
     to: &mut SessionHandle,
-    mut seq: u32,
+    seq: u32,
     payload: &[u8],
 ) -> Option<(MemberId, u32, Vec<u8>)> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    exchange_within(from, to, seq, payload, Duration::from_secs(5)).await
+}
+
+/// `exchange_payload`, giving up after `wait`.
+pub async fn exchange_within(
+    from: &SessionHandle,
+    to: &mut SessionHandle,
+    mut seq: u32,
+    payload: &[u8],
+    wait: Duration,
+) -> Option<(MemberId, u32, Vec<u8>)> {
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         let _ = from.audio_out.try_send(EncodedFrame::new(seq, payload).unwrap());
         seq += 1;
