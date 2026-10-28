@@ -84,6 +84,13 @@ impl GainTable {
         }
     }
 
+    /// Frees every slot; for a new connection, where all member ids changed.
+    pub fn clear(&self) {
+        for id in &self.ids {
+            id.store(0, Ordering::Release);
+        }
+    }
+
     /// 1.0 for ids without an entry.
     pub fn get(&self, id: MemberId) -> f32 {
         match self.find(id) {
@@ -116,6 +123,19 @@ mod tests {
         assert_eq!(b.percent("ala"), 200);
         b.set_percent("ala", 50);
         assert_eq!(b.gain("ala"), 0.5);
+    }
+
+    #[test]
+    fn clear_frees_every_slot() {
+        let t = GainTable::new();
+        for id in 1..=SLOTS as MemberId {
+            assert!(t.set(id, 0.5));
+        }
+        assert!(!t.set(1000, 0.5), "table full");
+        t.clear();
+        assert_eq!(t.get(1), 1.0);
+        assert!(t.set(1000, 0.5));
+        assert_eq!(t.get(1000), 0.5);
     }
 
     #[test]
