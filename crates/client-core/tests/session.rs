@@ -144,3 +144,32 @@ async fn wrong_fingerprint_never_connects() {
     let e = wait_for(&mut a, Duration::from_secs(2), |e| matches!(e, SessionEvent::Connected { .. })).await;
     assert!(e.is_none());
 }
+
+#[tokio::test]
+async fn stuck_server_login_times_out_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = server::tls::load_or_create_identity(dir.path()).unwrap();
+    let endpoint =
+        quinn::Endpoint::server(server::quic_config(&identity).unwrap(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    // Accepts connections and streams but never answers the Hello.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = endpoint.accept().await {
+            if let Ok(conn) = incoming.await {
+                held.push(conn);
+            }
+        }
+    });
+    let mut a = spawn_session(
+        &tokio::runtime::Handle::current(),
+        SessionParams {
+            server: addr.to_string(),
+            fingerprint: identity.fingerprint,
+            username: "ala".into(),
+            password: "x".into(),
+        },
+    );
+    let e = wait_for(&mut a, Duration::from_secs(15), |e| matches!(e, SessionEvent::Disconnected { .. })).await;
+    assert!(e.is_some(), "session hung in login");
+}

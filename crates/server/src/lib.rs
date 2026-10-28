@@ -100,7 +100,8 @@ async fn bind_endpoint(
     }
 }
 
-fn quic_config(identity: &tls::ServerIdentity) -> anyhow::Result<quinn::ServerConfig> {
+/// TLS 1.3 + ALPN + transport limits for the relay endpoint.
+pub fn quic_config(identity: &tls::ServerIdentity) -> anyhow::Result<quinn::ServerConfig> {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()

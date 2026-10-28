@@ -19,6 +19,7 @@ use crate::audio::frame::{EncodedFrame, IncomingFrame};
 /// Close code the server uses when this account logged in elsewhere.
 const CLOSE_REPLACED: u32 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIO_OUT_CAPACITY: usize = 64;
 const AUDIO_IN_CAPACITY: usize = 256;
 
@@ -130,17 +131,29 @@ impl Task {
 
     async fn connect_once(&mut self, backoff: &mut Backoff) -> Outcome {
         let Some(conn) = self.connect().await else { return Outcome::Retry };
-        let Ok((mut send, mut recv)) = conn.open_bi().await else { return Outcome::Retry };
         let hello = ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             username: self.params.username.clone(),
             password: self.params.password.clone(),
         };
-        if send.write_all(&encode_frame(&hello)).await.is_err() {
+        let login = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            send.write_all(&encode_frame(&hello)).await.ok()?;
+            let mut dec = FrameDecoder::new();
+            let reply = read_msg(&mut recv, &mut dec).await;
+            Some((send, recv, dec, reply))
+        };
+        // A wedged server can keep the connection alive with keep-alives yet never answer.
+        let result = tokio::select! {
+            r = timeout(LOGIN_TIMEOUT, login) => r,
+            _ = self.stop.changed() => return Outcome::Stop,
+        };
+        // The send half must stay open: dropping it would finish the stream and log us out.
+        let Ok(Some((_send, mut recv, mut dec, reply))) = result else {
+            conn.close(VarInt::from_u32(0), b"");
             return Outcome::Retry;
-        }
-        let mut dec = FrameDecoder::new();
-        match read_msg(&mut recv, &mut dec).await {
+        };
+        match reply {
             Some(ServerMsg::Welcome { you, members }) => {
                 backoff.reset();
                 self.emit(SessionEvent::Connected { you, members });
