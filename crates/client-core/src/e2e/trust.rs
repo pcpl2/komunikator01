@@ -1,5 +1,6 @@
 //! Trust-on-first-use store of peer device keys, and safety codes for out-of-band comparison.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ struct FileFormat {
 pub struct KnownDevices {
     path: PathBuf,
     records: Vec<Record>,
+    save_failed: Cell<bool>,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -55,7 +57,7 @@ impl KnownDevices {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { path: path.to_path_buf(), records })
+        Ok(Self { path: path.to_path_buf(), records, save_failed: Cell::new(false) })
     }
 
     fn position(&self, user: &str, id: &IdentityPublic) -> Option<usize> {
@@ -76,6 +78,9 @@ impl KnownDevices {
                 })
                 .collect(),
         })?;
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -85,9 +90,18 @@ impl KnownDevices {
     }
 
     fn persist(&self) {
-        if let Err(e) = self.save() {
-            tracing::warn!("could not save trust store {}: {e}", self.path.display());
+        match self.save() {
+            Ok(()) => self.save_failed.set(false),
+            Err(e) => {
+                self.save_failed.set(true);
+                tracing::warn!("could not save trust store {}: {e}", self.path.display());
+            }
         }
+    }
+
+    /// True if the most recent attempt to persist the store failed (reset by the next success).
+    pub fn save_failed(&self) -> bool {
+        self.save_failed.get()
     }
 
     fn insert(&mut self, user: &str, id: &IdentityPublic) {
@@ -219,6 +233,32 @@ mod tests {
         let p = dir.path().join("known.toml");
         std::fs::write(&p, "this is [not toml").unwrap();
         assert!(KnownDevices::load(&p).is_err());
+    }
+
+    #[test]
+    fn persists_into_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sub").join("deeper").join("known.toml");
+        let mut k = KnownDevices::load(&p).unwrap();
+        assert_eq!(k.check("ala", &id(1, 1)), Trust::NewUser);
+        assert!(!k.save_failed());
+        let mut k2 = KnownDevices::load(&p).unwrap();
+        assert_eq!(k2.check("ala", &id(1, 1)), Trust::Known);
+    }
+
+    #[test]
+    fn save_failed_flag_tracks_persist_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut k = KnownDevices::load(&blocker.join("known.toml")).unwrap();
+        assert!(!k.save_failed());
+        k.check("ala", &id(1, 1));
+        assert!(k.save_failed());
+        // Point at a writable location: next successful save clears the flag.
+        k.path = dir.path().join("ok.toml");
+        k.verify("ala", &id(1, 1));
+        assert!(!k.save_failed());
     }
 
     #[test]
