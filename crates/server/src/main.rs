@@ -44,8 +44,22 @@ fn run(config: server::ServerConfig) -> anyhow::Result<()> {
         let srv = server::start(config).await?;
         println!("listening: {}", srv.local_addr());
         println!("fingerprint: {}", protocol::fingerprint_hex(&srv.fingerprint()));
-        tokio::signal::ctrl_c().await?;
+        wait_for_stop_signal().await?;
         srv.shutdown().await;
         Ok(())
     })
+}
+
+/// Ctrl+C everywhere; on Unix also SIGTERM (systemd stop) so clients get a clean close.
+async fn wait_for_stop_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }

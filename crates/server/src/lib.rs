@@ -47,7 +47,8 @@ impl RunningServer {
 
 pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let identity = tls::load_or_create_identity(&config.data_dir)?;
-    let endpoint = bind_endpoint(quic_config(&identity)?, config.bind).await?;
+    let reset_key = tls::load_or_create_reset_key(&config.data_dir)?;
+    let endpoint = bind_endpoint(quic_config(&identity)?, &reset_key, config.bind).await?;
     let shared = Arc::new(conn::Shared {
         room: Mutex::new(room::Room::new()),
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
@@ -64,11 +65,32 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
 }
 
 /// Retries briefly while a previous instance's socket is still being released.
-async fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
+async fn bind_endpoint(
+    config: quinn::ServerConfig,
+    reset_key: &[u8; 32],
+    addr: SocketAddr,
+) -> anyhow::Result<quinn::Endpoint> {
+    let mut endpoint_config = quinn::EndpointConfig::new(Arc::new(::ring::hmac::Key::new(
+        ::ring::hmac::HMAC_SHA256,
+        reset_key,
+    )));
+    // Connection IDs carry a keyed hash; with a random key a restarted server would drop
+    // old clients' packets as invalid instead of answering them with a stateless reset.
+    let cid_key = u64::from_le_bytes(reset_key[..8].try_into().expect("8 bytes"));
+    endpoint_config.cid_generator(move || {
+        Box::new(quinn_proto::HashedConnectionIdGenerator::from_key(cid_key))
+    });
     let mut attempts = 0;
     loop {
-        match quinn::Endpoint::server(config.clone(), addr) {
-            Ok(e) => return Ok(e),
+        match std::net::UdpSocket::bind(addr) {
+            Ok(socket) => {
+                return Ok(quinn::Endpoint::new(
+                    endpoint_config,
+                    Some(config),
+                    socket,
+                    Arc::new(quinn::TokioRuntime),
+                )?)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < BIND_RETRIES => {
                 attempts += 1;
                 tokio::time::sleep(BIND_RETRY_DELAY).await;
