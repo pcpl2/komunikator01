@@ -57,6 +57,7 @@ struct Session {
 impl PairChannel {
     pub fn new(me: &Identity, peer: &IdentityPublic) -> Self {
         let mine = me.public();
+        debug_assert_ne!(mine.sign, peer.sign, "a device must not pair with itself");
         let initiator = mine.sign < peer.sign;
         let (first, second) = if initiator { (mine.sign, peer.sign) } else { (peer.sign, mine.sign) };
         let mut prologue = PROLOGUE_TAG.to_vec();
@@ -255,19 +256,38 @@ mod tests {
         assert_eq!(ca.receive(&blob).unwrap(), (None, Some(key_msg(2))));
     }
 
+    /// An identity whose `sign` sorts below `r`'s, so a responder `r` still treats it as initiator.
+    fn identity_below(r: &Identity) -> Identity {
+        loop {
+            let o = Identity::generate();
+            if o.public().sign < r.public().sign {
+                return o;
+            }
+        }
+    }
+
     #[test]
     fn wrong_peer_key_fails() {
-        let (a, b) = pair();
-        let other = Identity::generate();
-        // a is the initiator in this test iff its sign key is smaller; pick roles accordingly.
-        let (i, r) = if a.public().sign < b.public().sign { (&a, &b) } else { (&b, &a) };
-        let mut ci = PairChannel::new(i, &r.public());
-        // The responder expects `other` instead of the real initiator.
-        let mut cr = PairChannel::new(r, &other.public());
+        let ((i, mut ci), (r, _)) = roles();
+        let _ = i;
+        // The responder expects a different initiator (still sorting as initiator).
+        let other = identity_below(&r);
+        let mut cr = PairChannel::new(&r, &other.public());
         let h1 = ci.start().unwrap();
-        // `other` may sort either side of r; only the initiator role matters for the hello.
-        let res = cr.receive(&h1);
-        assert!(res.is_err());
+        assert_eq!(cr.receive(&h1).unwrap_err(), PairError::Handshake);
+        assert!(!cr.is_ready());
+    }
+
+    #[test]
+    fn prologue_binds_sign_keys() {
+        let ((i, mut ci), (r, _)) = roles();
+        // Correct dh key, but a different sign key for the expected initiator.
+        let other = identity_below(&r);
+        let mut wrong = i.public();
+        wrong.sign = other.public().sign;
+        let mut cr = PairChannel::new(&r, &wrong);
+        let h1 = ci.start().unwrap();
+        assert_eq!(cr.receive(&h1).unwrap_err(), PairError::Handshake);
         assert!(!cr.is_ready());
     }
 
