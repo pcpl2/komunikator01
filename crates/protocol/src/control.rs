@@ -20,6 +20,10 @@ pub enum ClientMsg {
         /// coming back from a network drop from one that was already replaced elsewhere.
         session: u64,
     },
+    /// Opaque key-exchange blob (e.g. a public key) for every other member.
+    Announce { blob: Vec<u8> },
+    /// Opaque blob for one member.
+    Relay { to: MemberId, blob: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -36,6 +40,8 @@ pub enum ServerMsg {
         reason: RejectReason,
     },
     SessionReplaced,
+    Announce { from: MemberId, blob: Vec<u8> },
+    Relay { from: MemberId, blob: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

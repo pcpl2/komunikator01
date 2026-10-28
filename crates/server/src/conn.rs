@@ -105,7 +105,10 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
         }
         _ => return Ok(()),
     };
-    let ClientMsg::Hello { version, username, password, session } = hello;
+    let ClientMsg::Hello { version, username, password, session } = hello else {
+        conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
+        return Ok(());
+    };
 
     let ip = conn.remote_address().ip();
     if let Some(reason) = check_login(&shared, ip, version, &username, password).await {
@@ -239,7 +242,7 @@ async fn send_and_close(mut send: SendStream, conn: &Connection, msg: ServerMsg,
 }
 
 async fn control_loop(recv: &mut RecvStream, dec: &mut FrameDecoder) -> End {
-    // Protocol v1 has no client messages after Hello; anything else is a violation.
+    // Announce/Relay are forwarded in a later change; until then any message after Hello is a violation.
     match read_msg::<ClientMsg>(recv, dec).await {
         Ok(Some(_)) | Err(End::Violation) => End::Violation,
         Ok(None) | Err(End::Closed) => End::Closed,

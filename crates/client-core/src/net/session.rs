@@ -252,7 +252,7 @@ impl Task {
                 },
                 f = self.out_rx.recv() => match f {
                     Some(f) => {
-                        encode_upstream(f.seq, f.payload(), &mut up);
+                        encode_upstream(0, f.seq, f.payload(), &mut up);
                         let _ = conn.send_datagram(Bytes::copy_from_slice(&up));
                     }
                     None => return Outcome::Stop,

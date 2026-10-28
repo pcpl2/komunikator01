@@ -8,7 +8,9 @@ pub use control::{ClientMsg, MemberId, MemberInfo, RejectReason, ServerMsg};
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+/// Largest key-exchange blob accepted in Announce/Relay.
+pub const MAX_BLOB: usize = 1024;
 pub const ALPN: &[u8] = b"komunikator/1";
 pub const KEEP_ALIVE_MS: u64 = 5_000;
 pub const IDLE_TIMEOUT_MS: u64 = 15_000;

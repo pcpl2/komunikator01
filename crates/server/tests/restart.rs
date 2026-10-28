@@ -64,7 +64,7 @@ async fn killed_server_restart_ends_old_connections_quickly() {
     assert_eq!(fp, fp2);
 
     let mut d = Vec::new();
-    encode_upstream(1, b"x", &mut d);
+    encode_upstream(0, 1, b"x", &mut d);
     let _ = conn.send_datagram(d.into());
     let closed = timeout(Duration::from_secs(3), conn.closed()).await;
     second.kill().unwrap();

@@ -96,7 +96,7 @@ impl Client {
 
     fn send_audio(&self, seq: u32, payload: &[u8]) {
         let mut d = Vec::new();
-        encode_upstream(seq, payload, &mut d);
+        encode_upstream(0, seq, payload, &mut d);
         self.conn.send_datagram(d.into()).unwrap();
     }
 
@@ -167,7 +167,7 @@ async fn version_mismatch_rejected() {
     c.hello("ala", "x", 99).await;
     assert_eq!(
         c.next_msg().await,
-        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: 1 } })
+        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: PROTOCOL_VERSION } })
     );
 }
 
