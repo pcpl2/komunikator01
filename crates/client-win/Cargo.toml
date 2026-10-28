@@ -6,6 +6,10 @@ license.workspace = true
 
 [[bin]]
 name = "komunikator"
+path = "src/gui_main.rs"
+
+[[bin]]
+name = "komunikator-cli"
 path = "src/main.rs"
 
 [dependencies]

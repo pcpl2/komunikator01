@@ -2,12 +2,12 @@
 
 Lekki komunikator głosowy dla małej grupy graczy: natywny klient na Windows (Rust, WASAPI, Opus) i serwer przekazujący dźwięk (QUIC) na Linuksie.
 
-Stan: **plan 3, pokoje i czat.** Klient działa w wierszu poleceń: wiele pokoi, czat tekstowy i głośność każdej osoby. Interfejs graficzny i konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
+Stan: **plan 4, okno programu (w toku).** Klient ma natywne okno Windows z ikoną w zasobniku: pokoje, czat, wyciszanie skrótami. Okna konfiguracji (pierwsze uruchomienie, ustawienia) są w przygotowaniu; konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
 
 ## Budowanie
 
 ```
-cargo build --release --workspace          # Windows: komunikator.exe + komunikator-server.exe
+cargo build --release --workspace          # Windows: komunikator.exe (okno), komunikator-cli.exe, komunikator-server.exe
 cargo build --release -p server            # Debian: tylko serwer
 ```
 
@@ -29,9 +29,22 @@ Wymagania: Rust (stable) i CMake (do zbudowania libopus).
 
 ## Klient (Windows)
 
+### Okno: `komunikator.exe`
+
+Ustawienia są w `%APPDATA%\komunikator\settings.toml` (adres serwera, odcisk, nazwa użytkownika, hasło chronione DPAPI, skróty, położenie okna, głośności osób). Dopóki nie ma okna pierwszego uruchomienia, program bez konfiguracji pokazuje „Brak konfiguracji” i kończy pracę; do tego czasu używaj `komunikator-cli`.
+
+- U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…`, `Ustawienia…`.
+- Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200% i `Wycisz u mnie`.
+- Po prawej czat pokoju; Enter wysyła. Kliknięcie wiadomości z adresem kopiuje pierwszy adres do schowka, prawy przycisk pozwala wybrać adres.
+- Krzyżyk chowa okno do zasobnika. Ikona w zasobniku: zielona (połączono), czerwona (wyciszony), ciemnoczerwona (wyciszeni wszyscy), szara (rozłączono), pomarańczowa kropka = nowa wiadomość. Lewy klik wycisza mikrofon; prawy: `Pokaż okno`, `Wycisz mikrofon`, `Wycisz wszystkich`, `Wyjdź`.
+- Skróty globalne z `hotkey_mute` / `hotkey_deafen` w ustawieniach (np. `"Ctrl+Shift+M"`); gdy skrót jest zajęty, pasek stanu to mówi.
+- Opcje: `--minimized` (start w zasobniku), `--data-dir <katalog>` (zamiast `%APPDATA%\komunikator`), `--smoke` (autotest: okno na sekundę, zapis ustawień, wyjście).
+
+### Wiersz poleceń: `komunikator-cli.exe`
+
 ```
 set KOMUNIKATOR_PASSWORD=haslo
-komunikator --server adres.serwera:7700 --fingerprint <odcisk> --user ala
+komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala
 ```
 
 Polecenia (wpisz i naciśnij Enter):

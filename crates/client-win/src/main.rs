@@ -2,7 +2,7 @@
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use std::collections::BTreeMap;
 
@@ -13,12 +13,12 @@ use client_core::chat::{find_links, sanitize_name};
 use client_core::e2e::{AnnounceError, E2eEvent, IdentityPublic, KnownDevices, Trust};
 use client_core::lobby::Lobby;
 use client_core::net::session::{
-    spawn_session, ChatLine, ChatSendError, SessionCommand, SessionEvent, SessionParams,
+    ChatLine, ChatSendError, SessionCommand, SessionEvent,
 };
 use protocol::{MemberId, RoomId};
 
 #[derive(Parser)]
-#[command(name = "komunikator", version, about = "Lekki komunikator głosowy")]
+#[command(name = "komunikator-cli", version, about = "Lekki komunikator głosowy")]
 struct Cli {
     /// Server address, host:port
     #[arg(long)]
@@ -44,11 +44,7 @@ struct Cli {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    use client_core::audio::activity::Activity;
-    use client_win::identity_store::IdentityStatus;
-    use client_win::engine::AudioEngine;
-    use client_win::pipeline::Controls;
-    use client_win::wasapi;
+    use client_win::{startup, wasapi};
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -77,54 +73,17 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(1)
         .enable_all()
         .build()?;
-    let data_dir = cli.data_dir.unwrap_or_else(|| {
-        std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("komunikator")
-    });
-    let (identity, status) = client_win::identity_store::load_or_create_identity(&data_dir)?;
-    match status {
-        IdentityStatus::Loaded => {}
-        IdentityStatus::Created => println!("utworzono nową tożsamość urządzenia (klucz szyfrowania)"),
-        IdentityStatus::Replaced { broken } => println!(
-            "UWAGA: nie udało się odczytać poprzedniej tożsamości urządzenia (zachowana jako {}).\n\
-             Utworzono nową. Znajomi zobaczą Cię jako „nowe urządzenie” i powinni porównać z Tobą kod bezpieczeństwa.",
-            broken.display()
-        ),
-    }
-    let identity = Arc::new(identity);
-    let trust_path = data_dir.join("known_devices.toml");
-    let known = KnownDevices::load(&trust_path)?;
-    if let Some(broken) = known.recovered_from() {
-        println!(
-            "UWAGA: nie udało się odczytać listy zaufanych urządzeń (odłożona jako {}).\n\
-             Zaczynamy od pustej listy: wszyscy znajomi pojawią się jako nowe osoby, \
-             a wcześniejsze weryfikacje kodów trzeba powtórzyć.",
-            broken.display()
-        );
-    }
-    let trust = Arc::new(Mutex::new(known));
-    let mut session = spawn_session(
+    let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);
+    let (client, notices) = startup::start_client(
         rt.handle(),
-        SessionParams { server, fingerprint, username: user, password, identity, trust: trust.clone() },
-    );
-    // The session stops when the handle's stop sender drops, so only the channels move out.
-    let audio_in = std::mem::replace(&mut session.audio_in, tokio::sync::mpsc::channel(1).1);
-    let audio_out = session.audio_out.clone();
-
-    let controls = Arc::new(Controls::default());
-    let gains = Arc::new(GainTable::new());
-    let engine = AudioEngine::start(
-        cli.capture_device,
-        cli.render_device,
-        0.5,
-        audio_out,
-        audio_in,
-        controls.clone(),
-        gains.clone(),
-        Arc::new(Activity::new()),
-    );
+        &data_dir,
+        startup::Account { server, fingerprint, username: user, password },
+        startup::Audio { capture: cli.capture_device, render: cli.render_device, sensitivity: 0.5 },
+    )?;
+    for n in notices {
+        println!("{}", n.text);
+    }
+    let startup::Client { mut session, engine, trust, controls, gains, .. } = client;
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {

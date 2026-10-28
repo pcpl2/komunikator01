@@ -148,9 +148,11 @@ impl AudioEngine {
                 let src = open(capture.as_deref());
                 let vad = Vad::new(f32::from_bits(sensitivity.load(Ordering::Relaxed)));
                 match Encoder::new() {
-                    Ok(enc) => capture_loop(src, vad, enc, out, controls, activity, sensitivity, stop),
+                    Ok(enc) => capture_loop(src, vad, enc, out, controls, activity.clone(), sensitivity, stop),
                     Err(e) => tracing::warn!("capture not started: {e}"),
                 }
+                // Otherwise the UI shows the last frame's state ("speaking") forever.
+                activity.set_me(false, -100.0);
             }
         });
         match spawned {
@@ -277,5 +279,28 @@ mod tests {
         let opened = opened.lock().unwrap();
         assert!(opened.contains(&("capture", Some("mic2".into()))));
         assert!(opened.contains(&("render", Some("spk2".into()))));
+    }
+
+    #[test]
+    fn stopped_capture_is_not_speaking() {
+        let (out_tx, _out_rx) = mpsc::channel(4096);
+        let (_in_tx, in_rx) = mpsc::channel(16);
+        let activity = Arc::new(Activity::new());
+        let engine = AudioEngine::with_openers(
+            Arc::new(|_| Box::new(Mic(0))),
+            Arc::new(|_| Box::new(Speaker)),
+            None,
+            None,
+            0.5,
+            out_tx,
+            in_rx,
+            Arc::new(Controls::default()),
+            Arc::new(GainTable::new()),
+            activity.clone(),
+        );
+        wait_for("me speaking", || activity.me_speaking());
+        engine.stop();
+        assert!(!activity.me_speaking());
+        assert_eq!(activity.mic_level_dbfs(), -100.0);
     }
 }

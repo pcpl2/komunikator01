@@ -1,4 +1,4 @@
-//! The client binary must carry the application manifest (common controls v6, per-monitor DPI).
+//! Both client binaries must carry the application manifest (common controls v6, per-monitor DPI).
 #![cfg(windows)]
 
 use windows::core::PCWSTR;
@@ -11,7 +11,11 @@ const RT_MANIFEST: usize = 24;
 
 #[test]
 fn exe_has_manifest() {
-    let exe = env!("CARGO_BIN_EXE_komunikator");
+    assert_manifest(env!("CARGO_BIN_EXE_komunikator"));
+    assert_manifest(env!("CARGO_BIN_EXE_komunikator-cli"));
+}
+
+fn assert_manifest(exe: &str) {
     let wide: Vec<u16> = exe.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let module = LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_AS_DATAFILE).unwrap();

@@ -6,6 +6,8 @@ pub mod dpapi;
 pub mod identity_store;
 pub mod engine;
 pub mod pipeline;
+#[cfg(windows)]
+pub mod startup;
 pub mod supervisor;
 #[cfg(windows)]
 pub mod ui;

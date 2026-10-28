@@ -1,9 +1,16 @@
-//! Win32 building blocks for the native window: hotkeys, sounds, tray icons, clipboard,
-//! autostart. Pure helpers (parsing, tone synthesis, pixels) are unit-testable.
+//! The native window: main window, tray, and their Win32 building blocks (hotkeys, sounds,
+//! tray icons, clipboard, autostart). Pure helpers (parsing, tone synthesis, pixels, view
+//! texts) are unit-testable.
 
+pub mod app;
 pub mod autostart;
 pub mod clipboard;
 pub mod hotkey;
 pub mod icons;
+mod layout;
+mod render;
 pub mod sound;
+pub mod text;
+pub mod tray;
 pub mod wide;
+pub mod window;
