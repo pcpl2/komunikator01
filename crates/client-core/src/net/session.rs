@@ -23,13 +23,22 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIO_OUT_CAPACITY: usize = 64;
 const AUDIO_IN_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionParams {
     /// "host:port"
     pub server: String,
     pub fingerprint: [u8; 32],
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for SessionParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionParams")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +169,8 @@ impl Task {
         match reply {
             Some(ServerMsg::Welcome { you, members }) => {
                 backoff.reset();
+                // Audio captured while connecting is stale; sending it would play as a burst.
+                while self.out_rx.try_recv().is_ok() {}
                 self.emit(SessionEvent::Connected { you, members });
             }
             Some(ServerMsg::Rejected { reason }) => {

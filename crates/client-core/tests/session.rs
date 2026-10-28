@@ -173,3 +173,29 @@ async fn stuck_server_login_times_out_and_retries() {
     let e = wait_for(&mut a, Duration::from_secs(15), |e| matches!(e, SessionEvent::Disconnected { .. })).await;
     assert!(e.is_some(), "session hung in login");
 }
+
+#[test]
+fn debug_output_hides_password() {
+    let p = SessionParams {
+        server: "a:1".into(),
+        fingerprint: [0; 32],
+        username: "ala".into(),
+        password: "tajne-haslo".into(),
+    };
+    assert!(!format!("{p:?}").contains("tajne-haslo"));
+}
+
+#[tokio::test]
+async fn audio_queued_before_login_is_not_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = server::start(config(&dir, 0)).await.unwrap();
+    let mut b = session(&srv, "ola", "x", srv.fingerprint());
+    connected(&mut b).await;
+    let mut a = session(&srv, "ala", "x", srv.fingerprint());
+    // Captured while still connecting; by the time we are in, it is stale.
+    for seq in 100..110 {
+        a.audio_out.try_send(EncodedFrame::new(seq, b"stare").unwrap()).unwrap();
+    }
+    connected(&mut a).await;
+    assert_eq!(exchange(&a, &mut b, 1).await.map(|f| f.1), Some(1));
+}
