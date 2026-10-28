@@ -69,6 +69,8 @@ pub struct Window {
     /// Last on-screen rectangle while neither minimised nor maximised; saved on exit.
     normal: Cell<RECT>,
     taskbar_created: u32,
+    /// Class icons (large, small); freed with the window state.
+    icons: (HICON, HICON),
     inner: RefCell<Inner>,
 }
 
@@ -82,11 +84,13 @@ impl Window {
             let _ = InitCommonControlsEx(&icc);
             let instance: HINSTANCE = GetModuleHandleW(None)?.into();
             let icon = make_icon(&tray_pixels(TrayState::Connected, false, 32), 32);
+            let small = make_icon(&tray_pixels(TrayState::Connected, false, 16), 16);
             let class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(wndproc),
                 hInstance: instance,
                 hIcon: icon,
+                hIconSm: small,
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                 hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut c_void),
                 lpszClassName: CLASS,
@@ -104,6 +108,7 @@ impl Window {
                 minimized: Cell::new(false),
                 normal: Cell::new(rect),
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+                icons: (icon, small),
                 inner: RefCell::new(Inner { app, render: Render::default(), tray: None }),
             });
             // This reference belongs to the window; WM_NCDESTROY gives it back.
@@ -122,6 +127,11 @@ impl Window {
                 Some(instance),
                 Some(raw.cast()),
             )?;
+            // Elevated (run as admin), UIPI would drop these from medium-integrity Explorer,
+            // and after an Explorer restart the tray icon, the only way back, would be gone.
+            for m in [win.taskbar_created, WM_APP_TRAY] {
+                let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
+            }
             win.dpi.set(GetDpiForWindow(hwnd).max(96));
             let _ = win.controls.set(create_controls(hwnd, instance));
             win.apply_fonts();
@@ -326,6 +336,7 @@ impl Window {
             }
             WM_ENDSESSION if wp.0 != 0 => {
                 self.save_settings();
+                self.close();
                 Some(LRESULT(0))
             }
             WM_COMMAND => {
@@ -490,7 +501,9 @@ impl Window {
         let tree = self.controls().tree;
         let mut hit = TVHITTESTINFO::default();
         unsafe {
-            GetCursorPos(&mut hit.pt).ok()?;
+            // Where the click was, not where the cursor is by now.
+            let pos = GetMessagePos();
+            hit.pt = POINT { x: (pos & 0xFFFF) as i16 as i32, y: (pos >> 16) as i16 as i32 };
             let _ = ScreenToClient(tree, &mut hit.pt);
             SendMessageW(tree, TVM_HITTEST, None, Some(LPARAM(&mut hit as *mut _ as isize)));
             if hit.hItem.0 == 0 || (hit.flags.0 & TVHT_ONITEM.0) == 0 {
@@ -526,12 +539,16 @@ impl Window {
 
     fn show(&self) {
         let hwnd = self.hwnd();
+        let iconic = unsafe { IsIconic(hwnd) }.as_bool();
         unsafe {
-            let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
+            let _ = ShowWindow(hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
             let _ = SetForegroundWindow(hwnd);
-            SetTimer(Some(hwnd), TIMER_ACTIVITY, 100, None);
         }
-        self.act(Action::WindowShown);
+        // Restoring from minimised already did both in WM_SIZE.
+        if !iconic {
+            unsafe { SetTimer(Some(hwnd), TIMER_ACTIVITY, 100, None) };
+            self.act(Action::WindowShown);
+        }
     }
 
     fn hide(&self) {
@@ -581,6 +598,11 @@ impl Drop for Window {
         for f in [normal, bold] {
             if !f.is_invalid() {
                 let _ = unsafe { DeleteObject(f.into()) };
+            }
+        }
+        for i in [self.icons.0, self.icons.1] {
+            if !i.is_invalid() {
+                let _ = unsafe { DestroyIcon(i) };
             }
         }
     }

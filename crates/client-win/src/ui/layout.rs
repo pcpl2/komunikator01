@@ -130,11 +130,18 @@ pub fn layout(hwnd: HWND, c: &Controls, dpi: u32) {
         place(b, x, m, s(bw), bar_h);
         x += s(bw) + gap;
     }
-    let top = m + bar_h + m;
+    // The checkbox ends the bar; a narrow window gets it on a second bar row.
+    let (top_w, mut bar_bottom) = (s(150), m + bar_h);
+    if x + gap + top_w <= w - m {
+        place(c.top, x + gap, m + (bar_h - row_h) / 2, top_w, row_h);
+    } else {
+        place(c.top, m, bar_bottom + gap, top_w, row_h);
+        bar_bottom += gap + row_h;
+    }
+    let top = bar_bottom + m;
     let bottom = (h - status_h - m - row_h - gap).max(top);
     let left_w = ((w - 3 * m) * 40 / 100).max(0);
-    place(c.tree, m, top, left_w, bottom - top);
-    place(c.top, m, bottom + gap, left_w, row_h);
+    place(c.tree, m, top, left_w, bottom + gap + row_h - top);
     let rx = 2 * m + left_w;
     let rw = (w - rx - m).max(0);
     let send_w = s(80);
