@@ -528,8 +528,9 @@ impl Roster {
                     members.iter().filter(|m| m.id != *you).map(|m| (m.id, (m.name.clone(), m.room))).collect();
                 self.e2e.clear();
             }
+            // Like the lobby, a repeat for a known id keeps the first name.
             SessionEvent::MemberJoined(m) if m.id != self.you => {
-                self.members.insert(m.id, (m.name.clone(), m.room));
+                self.members.entry(m.id).or_insert_with(|| (m.name.clone(), m.room)).1 = m.room;
             }
             SessionEvent::MemberLeft(id) => {
                 self.members.remove(id);
@@ -788,6 +789,16 @@ mod tests {
             format_rooms(&sample_lobby()),
             vec!["* 10  Ogólny", "      ja, o[2Jla", "  11  Ranked", "      ala"]
         );
+    }
+
+    #[test]
+    fn roster_keeps_the_first_name_of_an_id() {
+        use protocol::MemberInfo;
+        let mut roster = Roster::default();
+        let joined = |name: &str, room| SessionEvent::MemberJoined(MemberInfo { id: 2, name: name.into(), room });
+        roster.observe(&joined("ola", Some(1)));
+        roster.observe(&joined("ewa", Some(3)));
+        assert_eq!(roster.members.get(&2), Some(&("ola".to_string(), Some(3))));
     }
 
     #[test]
