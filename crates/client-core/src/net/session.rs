@@ -26,6 +26,10 @@ const AUDIO_OUT_CAPACITY: usize = 64;
 const AUDIO_IN_CAPACITY: usize = 256;
 /// How often the E2E state machine is ticked (key switches, handshake retries).
 const E2E_TICK: Duration = Duration::from_millis(100);
+/// Queued control messages must make write progress this often, or we reconnect.
+const CTRL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Unwritten control bytes beyond this mean the server is not reading; reconnect.
+const CTRL_QUEUE_MAX: usize = 256 * 1024;
 
 // A sealed frame (largest Opus packet plus tag) must fit an audio datagram.
 const _: () = assert!(MAX_PACKET + TAG_LEN <= MAX_AUDIO_PAYLOAD);
@@ -262,8 +266,8 @@ impl Task {
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),
             _ => return closed_outcome(&conn),
         };
-        let mut link = Link { conn: &conn, send: &mut send, e2e };
-        let outcome = match link.output(first, &self.events).await {
+        let mut link = Link::new(&conn, &mut send, e2e);
+        let outcome = match link.output(first, &self.events) {
             Ok(()) => self.connected_loop(&mut link, &mut recv, &mut dec).await,
             Err(o) => o,
         };
@@ -331,6 +335,19 @@ impl Task {
                         None => return closed_outcome(link.conn),
                     }
                 }
+                // `write` is cancel-safe: if another branch wins, nothing was written.
+                w = link.send.write(&link.ctrl_out[link.ctrl_sent..]), if link.ctrl_pending() => match w {
+                    Ok(n) => {
+                        link.ctrl_sent += n;
+                        link.ctrl_deadline = Instant::now() + CTRL_WRITE_TIMEOUT;
+                        continue;
+                    }
+                    Err(_) => return closed_outcome(link.conn),
+                },
+                _ = tokio::time::sleep_until(link.ctrl_deadline.into()), if link.ctrl_pending() => {
+                    tracing::debug!("control stream stalled; reconnecting");
+                    return Outcome::Retry;
+                }
                 _ = tick.tick() => link.e2e.tick(Instant::now()),
                 Some(c) = self.cmd_rx.recv() => match c {
                     SessionCommand::TrustChanged(id) => link.e2e.trust_changed(id),
@@ -377,7 +394,7 @@ impl Task {
                     None => return Outcome::Stop,
                 },
             };
-            if let Err(o) = link.output(out, &self.events).await {
+            if let Err(o) = link.output(out, &self.events) {
                 return o;
             }
         }
@@ -390,22 +407,46 @@ struct Link<'a> {
     /// Control stream to the server.
     send: &'a mut SendStream,
     e2e: E2e,
+    /// Encoded control messages not yet written; `ctrl_out[ctrl_sent..]` is pending. Written
+    /// from the main loop so a server that stops reading cannot block audio or shutdown.
+    ctrl_out: Vec<u8>,
+    ctrl_sent: usize,
+    /// Pending control bytes must make progress by then, or the connection is dropped.
+    ctrl_deadline: Instant,
 }
 
-impl Link<'_> {
-    /// Reports the state machine's events and writes its messages to the control stream.
-    async fn output(
-        &mut self,
-        out: Output,
-        events: &mpsc::UnboundedSender<SessionEvent>,
-    ) -> Result<(), Outcome> {
+impl<'a> Link<'a> {
+    fn new(conn: &'a Connection, send: &'a mut SendStream, e2e: E2e) -> Self {
+        Self { conn, send, e2e, ctrl_out: Vec::new(), ctrl_sent: 0, ctrl_deadline: Instant::now() }
+    }
+
+    fn ctrl_pending(&self) -> bool {
+        self.ctrl_sent < self.ctrl_out.len()
+    }
+
+    /// Reports the state machine's events and queues its messages for the control stream.
+    /// Fails when the queue grows past `CTRL_QUEUE_MAX` (the server is not reading).
+    fn output(&mut self, out: Output, events: &mpsc::UnboundedSender<SessionEvent>) -> Result<(), Outcome> {
         for e in out.events {
             let _ = events.send(SessionEvent::E2e(e));
         }
+        if out.send.is_empty() {
+            return Ok(());
+        }
+        if !self.ctrl_pending() {
+            self.ctrl_out.clear();
+            self.ctrl_sent = 0;
+            self.ctrl_deadline = Instant::now() + CTRL_WRITE_TIMEOUT;
+        } else {
+            self.ctrl_out.drain(..self.ctrl_sent);
+            self.ctrl_sent = 0;
+        }
         for m in &out.send {
-            if self.send.write_all(&encode_frame(m)).await.is_err() {
-                return Err(closed_outcome(self.conn));
-            }
+            self.ctrl_out.extend_from_slice(&encode_frame(m));
+        }
+        if self.ctrl_out.len() - self.ctrl_sent > CTRL_QUEUE_MAX {
+            tracing::debug!("control queue overflow; reconnecting");
+            return Err(Outcome::Retry);
         }
         Ok(())
     }

@@ -65,8 +65,11 @@ pub fn session_with(srv: &RunningServer, user: &str, pw: &str, fingerprint: [u8;
     )
 }
 
-pub fn session(srv: &RunningServer, user: &str, pw: &str, fingerprint: [u8; 32]) -> SessionHandle {
-    session_with(srv, user, pw, fingerprint, &Device::new())
+/// A session on a fresh device. Keep the returned `Device` alive as long as the session: it
+/// owns the temp dir the trust store saves into.
+pub fn session(srv: &RunningServer, user: &str, pw: &str, fingerprint: [u8; 32]) -> (SessionHandle, Device) {
+    let dev = Device::new();
+    (session_with(srv, user, pw, fingerprint, &dev), dev)
 }
 
 /// Waits for the first event matching `pred`, failing after `wait`.

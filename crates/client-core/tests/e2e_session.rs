@@ -15,9 +15,9 @@ use tokio::time::timeout;
 async fn two_clients_exchange_encrypted_audio() {
     let dir = tempfile::tempdir().unwrap();
     let srv = server::start(config(&dir, 0)).await.unwrap();
-    let mut a = session(&srv, "ala", "x", srv.fingerprint());
+    let (mut a, _dev_a) = session(&srv, "ala", "x", srv.fingerprint());
     let a_id = connected(&mut a).await;
-    let mut b = session(&srv, "ola", "x", srv.fingerprint());
+    let (mut b, _dev_b) = session(&srv, "ola", "x", srv.fingerprint());
     let b_id = connected(&mut b).await;
     e2e_member(&mut a, Some(b_id), None).await;
     e2e_member(&mut b, Some(a_id), None).await;
@@ -53,7 +53,7 @@ async fn server_side_sees_only_ciphertext() {
         dec.push(&buf[..n]);
     }
 
-    let mut a = session(&srv, "ala", "x", srv.fingerprint());
+    let (mut a, _dev_a) = session(&srv, "ala", "x", srv.fingerprint());
     let a_id = connected(&mut a).await;
     let mut seq = 1;
     let d = loop {
@@ -79,7 +79,7 @@ async fn first_contact_reports_new_user() {
     let dev_a = Device::new();
     let mut a = session_with(&srv, "ala", "x", fp, &dev_a);
     let a_id = connected(&mut a).await;
-    let mut b = session(&srv, "ola", "x", fp);
+    let (mut b, _dev_b) = session(&srv, "ola", "x", fp);
     let b_id = connected(&mut b).await;
     assert_eq!(e2e_member(&mut a, Some(b_id), None).await, Trust::NewUser);
     assert_eq!(e2e_member(&mut b, Some(a_id), None).await, Trust::NewUser);
@@ -116,11 +116,12 @@ async fn audio_flows_after_reconnect() {
     let srv = server::start(config(&dir, 0)).await.unwrap();
     let port = srv.local_addr().port();
     let fp = srv.fingerprint();
-    let mut a = session(&srv, "ala", "x", fp);
-    let mut b = session(&srv, "ola", "x", fp);
+    let (mut a, _dev_a) = session(&srv, "ala", "x", fp);
+    let (mut b, _dev_b) = session(&srv, "ola", "x", fp);
     connected(&mut a).await;
     connected(&mut b).await;
-    assert!(exchange_payload(&a, &mut b, 1, b"glos").await.is_some());
+    // High capture seqs before, low after: a WireSeq reset would show up as got.1 < before.1.
+    let before = exchange_payload(&a, &mut b, 1000, b"glos").await.expect("audio before restart");
 
     srv.shutdown().await;
     let e = wait_for(&mut a, Duration::from_secs(20), |e| matches!(e, SessionEvent::Disconnected { .. })).await;
@@ -132,6 +133,8 @@ async fn audio_flows_after_reconnect() {
     connected(&mut b).await;
     while b.audio_in.try_recv().is_ok() {}
     // Sequence numbers restart low on purpose: the session must keep its nonces fresh anyway.
-    let got = exchange_payload(&a, &mut b, 1, b"glos").await;
-    assert_eq!(got.map(|f| (f.0, f.2)), Some((a_id, b"glos".to_vec())));
+    let got = exchange_payload(&a, &mut b, 1, b"glos").await.expect("audio after reconnect");
+    assert_eq!((got.0, got.2), (a_id, b"glos".to_vec()));
+    // The wire sequence (the nonce) is not reset by the reconnect.
+    assert!(got.1 > before.1, "seq after reconnect {} <= before {}", got.1, before.1);
 }
