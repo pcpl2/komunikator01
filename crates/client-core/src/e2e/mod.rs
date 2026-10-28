@@ -2,6 +2,7 @@
 
 pub mod announce;
 pub mod audio;
+pub mod group;
 pub mod identity;
 pub mod pair;
 pub mod trust;
@@ -11,3 +12,4 @@ pub use identity::{Identity, IdentityPublic};
 pub use trust::{safety_code, KnownDevices, Trust};
 pub use audio::{AudioOpener, AudioSealer, SenderKey, TAG_LEN};
 pub use pair::{Inner, PairChannel, PairError, PairMsg};
+pub use group::{E2e, E2eEvent, Output};

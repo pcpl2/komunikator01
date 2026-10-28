@@ -19,6 +19,9 @@ pub enum AnnounceError {
     NameMismatch,
     WrongRoom,
     Stale,
+    /// The announce carries this device's own identity (set by the room logic, never by
+    /// `verify_announce`): a device never pairs with itself.
+    OwnIdentity,
 }
 
 #[derive(Serialize, Deserialize)]
