@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod conn;
 pub mod room;
+pub mod store;
 pub mod tls;
 
 use std::net::SocketAddr;

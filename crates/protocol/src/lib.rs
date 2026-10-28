@@ -4,7 +4,11 @@ pub mod audio;
 pub mod control;
 pub mod framing;
 
-pub use control::{ClientMsg, MemberId, MemberInfo, RejectReason, ServerMsg};
+pub use control::{
+    normalize_room_name, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
+    RoomErrorReason, RoomId, RoomInfo, ServerMsg, DEFAULT_ROOM_NAME, MAX_CHAT_BLOB, MAX_ROOMS,
+    MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS,
+};
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
 
 /// Bumped whenever the wire format changes incompatibly.
@@ -36,6 +40,17 @@ pub fn parse_fingerprint(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_room_name_rules() {
+        assert_eq!(normalize_room_name("  Gra  "), Some("Gra".to_string()));
+        assert_eq!(normalize_room_name(""), None);
+        assert_eq!(normalize_room_name("   "), None);
+        assert!(normalize_room_name(&"ż".repeat(32)).is_some());
+        assert_eq!(normalize_room_name(&"ż".repeat(33)), None);
+        assert_eq!(normalize_room_name("a
+b"), None);
+    }
 
     #[test]
     fn fingerprint_hex_roundtrip() {

@@ -50,3 +50,50 @@ pub enum RejectReason {
     VersionMismatch { server: u16 },
     RateLimited,
 }
+
+pub type RoomId = u32;
+
+pub const MAX_ROOM_NAME_CHARS: usize = 32;
+pub const MAX_ROOMS: usize = 50;
+pub const MAX_ROOM_MEMBERS: usize = 20;
+/// Largest sealed chat blob the server will forward.
+pub const MAX_CHAT_BLOB: usize = 8192;
+pub const DEFAULT_ROOM_NAME: &str = "Ogólny";
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RoomInfo {
+    pub id: RoomId,
+    pub name: String,
+    /// Empty for the built-in room.
+    pub creator: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum RoomErrorReason {
+    InvalidName,
+    NameTaken,
+    TooManyRooms,
+    NotFound,
+    NotAllowed,
+    NotEmpty,
+    Full,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomChoice {
+    Default,
+    Room(RoomId),
+    Nowhere,
+}
+
+/// Trims the name; `None` if it is empty, too long, or contains control characters.
+pub fn normalize_room_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_ROOM_NAME_CHARS
+        || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
