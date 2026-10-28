@@ -288,7 +288,7 @@ impl Window {
         let v = app.view();
         render.draw(c, v, app.view_version(), notice);
         if let Some(t) = tray {
-            t.update(tray_state(v), v.unread > 0, tray_tip(v), self.dpi.get());
+            t.update(tray_state(v), v.unread > 0, tray_tip(v));
         }
     }
 
@@ -331,7 +331,6 @@ impl Window {
                 let _ = unsafe {
                     SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE)
                 };
-                self.reset_tray();
                 Some(LRESULT(0))
             }
             WM_CLOSE => {
@@ -393,7 +392,7 @@ impl Window {
                 Some(LRESULT(0))
             }
             m if m == self.taskbar_created && m != 0 => {
-                self.reset_tray();
+                self.taskbar_created();
                 Some(LRESULT(0))
             }
             _ => None,
@@ -599,10 +598,11 @@ impl Window {
         }
     }
 
-    fn reset_tray(&self) {
+    /// Explorer restarted: put the tray icon back.
+    fn taskbar_created(&self) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             if let Some(t) = &mut inner.tray {
-                t.reset();
+                t.taskbar_created();
             }
             self.draw(&mut inner);
         }
