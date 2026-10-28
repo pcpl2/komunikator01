@@ -110,4 +110,12 @@ mod tests {
         d.push(&[0xFF; 3]);
         assert_eq!(d.next::<ClientMsg>(), Err(FrameError::Malformed));
     }
+
+    #[test]
+    fn relay_messages_roundtrip() {
+        let msg = ClientMsg::Relay { to: 5, blob: vec![1; crate::MAX_BLOB] };
+        let mut dec = FrameDecoder::new();
+        dec.push(&encode_frame(&msg));
+        assert_eq!(dec.next::<ClientMsg>().unwrap(), Some(msg));
+    }
 }

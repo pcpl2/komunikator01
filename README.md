@@ -2,7 +2,7 @@
 
 Lekki komunikator głosowy dla małej grupy graczy: natywny klient na Windows (Rust, WASAPI, Opus) i serwer przekazujący dźwięk (QUIC) na Linuksie.
 
-Stan: **plan 1, fundament.** Klient działa w wierszu poleceń i ma jeden pokój. Szyfrowanie E2E, interfejs graficzny, czat i konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
+Stan: **plan 2, szyfrowanie end-to-end.** Klient działa w wierszu poleceń i ma jeden pokój. Interfejs graficzny, czat i konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
 
 ## Budowanie
 
@@ -38,6 +38,11 @@ komunikator --server adres.serwera:7700 --fingerprint <odcisk> --user ala
 - `d` + Enter: wycisza wszystkich (deafen).
 - `q` + Enter: kończy działanie.
 - `--list-devices` wypisuje urządzenia. Wybrane urządzenie ustawiasz przez `--capture-device <id>` i `--render-device <id>`; bez tych opcji używane są domyślne urządzenia komunikacyjne Windows.
+
+- `k` + Enter: lista osób z numerami, stanem zaufania i kodem bezpieczeństwa; `z <numer>` oznacza osobę jako zweryfikowaną (po głosowym porównaniu kodu), `a <numer>` akceptuje zmieniony klucz.
+- `--data-dir <katalog>`: gdzie leżą `identity.bin` (tożsamość chroniona DPAPI) i `known_devices.toml` (domyślnie `%APPDATA%\komunikator`).
+
+Dźwięk jest szyfrowany end-to-end: serwer nie może go odsłuchać. „Nowe urządzenie” oznacza, że znajomy ma nową tożsamość (np. nowy komputer): porównaj kod z nim głosowo. „Zmieniony klucz” (to samo urządzenie, inny klucz) to możliwe podszywanie się. Szczegóły i ograniczenia: [docs/e2e.md](docs/e2e.md).
 
 Klient po zerwaniu połączenia łączy się ponownie sam. Po odłączeniu słuchawek przechodzi na urządzenie domyślne.
 

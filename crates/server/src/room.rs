@@ -62,6 +62,23 @@ impl<C: Clone> Room<C> {
             .collect()
     }
 
+    pub fn get_mut(&mut self, id: MemberId) -> Option<&mut C> {
+        self.members.get_mut(&id).map(|m| &mut m.conn)
+    }
+
+    pub fn get(&self, id: MemberId) -> Option<&C> {
+        self.members.get(&id).map(|m| &m.conn)
+    }
+
+    /// Everyone but `id`, with their ids.
+    pub fn peers_with_ids(&self, id: MemberId) -> Vec<(MemberId, C)> {
+        self.members
+            .iter()
+            .filter(|(other, _)| **other != id)
+            .map(|(other, m)| (*other, m.conn.clone()))
+            .collect()
+    }
+
     pub fn contains(&self, id: MemberId) -> bool {
         self.members.contains_key(&id)
     }

@@ -94,9 +94,17 @@ impl Client {
         }
     }
 
+    async fn send_msg(&mut self, msg: &ClientMsg) {
+        self.send.write_all(&encode_frame(msg)).await.unwrap();
+    }
+
+    async fn quiet(&mut self, wait: Duration) -> bool {
+        timeout(wait, self.next_msg()).await.is_err()
+    }
+
     fn send_audio(&self, seq: u32, payload: &[u8]) {
         let mut d = Vec::new();
-        encode_upstream(seq, payload, &mut d);
+        encode_upstream(0, seq, payload, &mut d);
         self.conn.send_datagram(d.into()).unwrap();
     }
 
@@ -167,7 +175,7 @@ async fn version_mismatch_rejected() {
     c.hello("ala", "x", 99).await;
     assert_eq!(
         c.next_msg().await,
-        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: 1 } })
+        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: PROTOCOL_VERSION } })
     );
 }
 
@@ -293,4 +301,105 @@ async fn reconnecting_client_replaces_its_own_stale_connection() {
     let (_again, _, _) = Client::login_session(&srv, "ala", Some(7)).await;
     let (_third, _, members) = Client::login_session(&srv, "ala", Some(7)).await;
     assert!(members.is_empty());
+}
+
+#[tokio::test]
+async fn announce_reaches_others_and_late_joiners() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, ala_id, _) = Client::login(&srv, "ala").await;
+    let (mut ola, _, _) = Client::login(&srv, "ola").await;
+    assert!(matches!(ala.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    ala.send_msg(&ClientMsg::Announce { blob: b"A".to_vec() }).await;
+    assert_eq!(ola.next_msg().await, Some(ServerMsg::Announce { from: ala_id, blob: b"A".to_vec() }));
+    let (mut ewa, _, members) = Client::login(&srv, "ewa").await;
+    assert_eq!(members.len(), 2);
+    assert_eq!(ewa.next_msg().await, Some(ServerMsg::Announce { from: ala_id, blob: b"A".to_vec() }));
+    assert!(ewa.quiet(Duration::from_millis(300)).await);
+}
+
+#[tokio::test]
+async fn relay_goes_only_to_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, ala_id, _) = Client::login(&srv, "ala").await;
+    let (mut ola, ola_id, _) = Client::login(&srv, "ola").await;
+    let (mut ewa, _, _) = Client::login(&srv, "ewa").await;
+    // Drain membership events.
+    assert!(matches!(ala.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    assert!(matches!(ala.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    assert!(matches!(ola.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    ala.send_msg(&ClientMsg::Relay { to: ola_id, blob: b"x".to_vec() }).await;
+    assert_eq!(ola.next_msg().await, Some(ServerMsg::Relay { from: ala_id, blob: b"x".to_vec() }));
+    assert!(ewa.quiet(Duration::from_millis(300)).await);
+    assert!(ala.quiet(Duration::from_millis(100)).await);
+}
+
+#[tokio::test]
+async fn relay_to_absent_member_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, ala_id, _) = Client::login(&srv, "ala").await;
+    let (mut ola, _, _) = Client::login(&srv, "ola").await;
+    assert!(matches!(ala.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    ala.send_msg(&ClientMsg::Relay { to: 999, blob: b"x".to_vec() }).await;
+    ala.send_msg(&ClientMsg::Relay { to: ala_id, blob: b"self".to_vec() }).await;
+    assert!(ola.quiet(Duration::from_millis(300)).await);
+    assert!(ala.quiet(Duration::from_millis(100)).await);
+    assert!(ala.conn.close_reason().is_none());
+}
+
+#[tokio::test]
+async fn oversized_blob_disconnects() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, _, _) = Client::login(&srv, "ala").await;
+    ala.send_msg(&ClientMsg::Announce { blob: vec![0; protocol::MAX_BLOB + 1] }).await;
+    let err = timeout(Duration::from_secs(5), ala.conn.closed()).await.unwrap();
+    assert!(closed_with(&err, 2), "got {err:?}");
+}
+
+#[tokio::test]
+async fn hello_after_login_is_a_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, _, _) = Client::login(&srv, "ala").await;
+    ala.hello("ala", "x", PROTOCOL_VERSION).await;
+    let err = timeout(Duration::from_secs(5), ala.conn.closed()).await.unwrap();
+    assert!(closed_with(&err, 2), "got {err:?}");
+}
+
+#[tokio::test]
+async fn control_flood_is_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, _, _) = Client::login(&srv, "ala").await;
+    let (mut ola, ola_id, _) = Client::login(&srv, "ola").await;
+    assert!(matches!(ala.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    let mut batch = Vec::new();
+    for _ in 0..500 {
+        batch.extend(encode_frame(&ClientMsg::Relay { to: ola_id, blob: b"x".to_vec() }));
+    }
+    ala.send.write_all(&batch).await.unwrap();
+    let mut received = 0;
+    while let Ok(Some(_)) = timeout(Duration::from_millis(500), ola.next_msg()).await {
+        received += 1;
+    }
+    assert!(received > 0 && received <= 160, "received {received}");
+    assert!(ala.conn.close_reason().is_none());
+}
+
+#[tokio::test]
+async fn replaced_session_cannot_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut first, _, _) = Client::login(&srv, "ala").await;
+    let (mut ola, ola_id, _) = Client::login(&srv, "ola").await;
+    let (_second, _, _) = Client::login(&srv, "ala").await;
+    // Drain events ola saw (MemberLeft / MemberJoined for ala's replacement).
+    assert!(matches!(ola.next_msg().await, Some(ServerMsg::MemberLeft { .. })));
+    assert!(matches!(ola.next_msg().await, Some(ServerMsg::MemberJoined(_))));
+    first.send_msg(&ClientMsg::Relay { to: ola_id, blob: b"stare".to_vec() }).await;
+    first.send_msg(&ClientMsg::Announce { blob: b"stare".to_vec() }).await;
+    assert!(ola.quiet(Duration::from_millis(300)).await);
 }
