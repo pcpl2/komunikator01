@@ -184,6 +184,9 @@ fn main() -> anyhow::Result<()> {
 
 const HELP: &str = "komendy: m = mikrofon wł./wył., d = wycisz wszystkich, k = lista osób i kody, z <id> = zweryfikowany, a <id> = akceptuj zmieniony klucz, q = wyjście";
 
+/// Roster line for a member without a verified key: audio is never sent in the clear.
+const NO_KEY: &str = "brak klucza — nie słyszycie się do czasu ogłoszenia";
+
 fn toggle(label: &str, flag: &AtomicBool) {
     let now = !flag.fetch_xor(true, Ordering::Relaxed);
     println!("{label}: {}", if now { "TAK" } else { "nie" });
@@ -282,7 +285,7 @@ impl Roster {
                 Some((_, _, trust, code)) => {
                     println!("{id:>4}  {name}  {}  kod: {code}", trust_label(*trust))
                 }
-                None => println!("{id:>4}  {name}  brak ważnego klucza (bez szyfrowania do czasu ogłoszenia)"),
+                None => println!("{id:>4}  {name}  {NO_KEY}"),
             }
         }
     }
@@ -344,6 +347,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_key_text_does_not_suggest_plaintext_audio() {
+        assert!(!NO_KEY.contains("bez szyfrowania"));
+        assert!(NO_KEY.contains("nie słyszycie się"));
+    }
 
     #[test]
     fn accept_is_refused_unless_key_changed() {
