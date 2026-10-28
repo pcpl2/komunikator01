@@ -360,6 +360,7 @@ dependencies = [
  "snow",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
 ]
 
