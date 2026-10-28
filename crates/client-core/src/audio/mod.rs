@@ -2,5 +2,6 @@
 
 pub mod codec;
 pub mod frame;
+pub mod jitter;
 pub mod mixer;
 pub mod vad;
