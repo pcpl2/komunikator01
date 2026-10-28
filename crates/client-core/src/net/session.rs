@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use super::{client_config, Backoff, SERVER_NAME};
 use crate::audio::frame::{EncodedFrame, IncomingFrame, MAX_PACKET};
 use crate::chat::{self, ChatTextError};
-use crate::e2e::{E2e, E2eEvent, Identity, KnownDevices, Output, TAG_LEN};
+use crate::e2e::{ChatReplay, E2e, E2eEvent, Identity, KnownDevices, Output, TAG_LEN};
 use crate::lobby::{Lobby, RoomChange};
 
 /// Close code the server uses when this account logged in elsewhere.
@@ -148,6 +148,7 @@ pub fn spawn_session(rt: &tokio::runtime::Handle, params: SessionParams) -> Sess
         cmd_rx,
         stop: stop_rx,
         next_epoch: 0,
+        chat_replay: ChatReplay::default(),
         seq: WireSeq::default(),
         room_choice: RoomChoice::Default,
     };
@@ -174,6 +175,9 @@ struct Task {
     /// First sender-key epoch for the next room key set; carried across rooms and reconnects
     /// so no epoch repeats within a run.
     next_epoch: u16,
+    /// Chat replay log for the whole run, lent to the current `E2e`: rebuilding E2E state
+    /// (re-entering a room, reconnecting) must not let old chat blobs open again.
+    chat_replay: ChatReplay,
     seq: WireSeq,
     /// Sent in every `Hello`, so a reconnect returns to the last room the server confirmed.
     room_choice: RoomChoice,
@@ -286,19 +290,7 @@ impl Task {
         let (lobby, entered, queued) = match reply {
             Some(ServerMsg::Welcome { you, room, rooms, members }) => {
                 backoff.reset();
-                // Audio captured while connecting is stale; sending it would play as a burst.
-                while self.out_rx.try_recv().is_ok() {}
-                // Member ids from an old connection mean nothing now, and a new E2e reads the
-                // trust store fresh anyway; other commands issued while connecting still apply.
-                let mut queued = Vec::new();
-                while let Ok(c) = self.cmd_rx.try_recv() {
-                    if !matches!(c, SessionCommand::TrustChanged(_)) {
-                        queued.push(c);
-                    }
-                }
-                let (lobby, entered) = Lobby::new(you, room, rooms.clone(), members.clone());
-                self.emit(SessionEvent::Connected { you, room, rooms, members });
-                (lobby, entered, queued)
+                self.welcomed(you, room, rooms, members)
             }
             Some(ServerMsg::Rejected { reason }) => {
                 return match reason {
@@ -322,11 +314,49 @@ impl Task {
             Err(o) => o,
         };
         // Keys of the next connection must not reuse an epoch of this one.
-        if let Some(e2e) = &link.e2e {
-            self.next_epoch = e2e.next_epoch();
+        if let Some(e2e) = link.e2e.take() {
+            self.retire(e2e);
         }
         conn.close(VarInt::from_u32(0), b"");
         outcome
+    }
+
+    /// Starts a connection's state from the server's `Welcome`: returns my lobby view, the room
+    /// I start in, and the commands issued while connecting that still apply.
+    fn welcomed(
+        &mut self,
+        you: MemberId,
+        room: Option<RoomId>,
+        rooms: Vec<RoomInfo>,
+        members: Vec<MemberInfo>,
+    ) -> (Lobby, Option<RoomChange>, Vec<SessionCommand>) {
+        // Audio captured while connecting is stale; sending it would play as a burst.
+        while self.out_rx.try_recv().is_ok() {}
+        // Where the server actually put me (the room asked for may have been full or gone) is
+        // where a reconnect should return.
+        self.room_choice = room.map_or(RoomChoice::Nowhere, RoomChoice::Room);
+        let mut queued = Vec::new();
+        while let Ok(c) = self.cmd_rx.try_recv() {
+            match c {
+                // Member ids from an old connection mean nothing now, and a new E2e reads the
+                // trust store fresh anyway.
+                SessionCommand::TrustChanged(_) => {}
+                // Typed while offline: sending it later, maybe into another room, would surprise.
+                SessionCommand::SendChat(_) => {
+                    self.emit(SessionEvent::ChatNotSent(ChatSendError::NotConnected))
+                }
+                c => queued.push(c),
+            }
+        }
+        let (lobby, entered) = Lobby::new(you, room, rooms.clone(), members.clone());
+        self.emit(SessionEvent::Connected { you, room, rooms, members });
+        (lobby, entered, queued)
+    }
+
+    /// Takes back what outlives one room's E2E state: the epoch counter and the replay log.
+    fn retire(&mut self, old: E2e) {
+        self.next_epoch = old.next_epoch();
+        self.chat_replay = old.into_chat_replay();
     }
 
     async fn connect(&self) -> Option<Connection> {
@@ -510,7 +540,7 @@ impl Task {
             let out = match change {
                 RoomChange::Entered { room, members } => {
                     if let Some(old) = link.e2e.take() {
-                        self.next_epoch = old.next_epoch();
+                        self.retire(old);
                     }
                     let (e2e, out) = E2e::new(
                         self.params.identity.clone(),
@@ -520,6 +550,7 @@ impl Task {
                         room,
                         &members,
                         self.next_epoch,
+                        std::mem::take(&mut self.chat_replay),
                         now,
                         now_ms(),
                     );
@@ -528,7 +559,7 @@ impl Task {
                 }
                 RoomChange::Exited => {
                     if let Some(old) = link.e2e.take() {
-                        self.next_epoch = old.next_epoch();
+                        self.retire(old);
                     }
                     continue;
                 }
@@ -603,13 +634,17 @@ impl Task {
     }
 
     fn incoming_chat(&mut self, link: &mut Link<'_>, from: MemberId, blob: &[u8]) {
-        let name = link.lobby.name_of(from).unwrap_or("?").to_owned();
         let opened = match link.e2e.as_mut() {
-            Some(e2e) => e2e.open_chat(from, blob).map_err(|e| format!("{e:?}")),
+            // The name the sender's announce verified against: the server can relabel ids in
+            // the lobby, but not the name a peer's key is bound to.
+            Some(e2e) => e2e
+                .open_chat(from, blob)
+                .map(|text| (e2e.peer_name(from).unwrap_or("?").to_owned(), text))
+                .map_err(|e| format!("{e:?}")),
             None => Err("not in a room".to_owned()),
         };
         match opened {
-            Ok(text) => self.emit(SessionEvent::Chat(ChatLine {
+            Ok((name, text)) => self.emit(SessionEvent::Chat(ChatLine {
                 from,
                 name,
                 text: chat::sanitize(&text),
@@ -619,6 +654,7 @@ impl Task {
             Err(kind) => {
                 // The kind only; never the content.
                 tracing::debug!(from, error = %kind, "chat message did not open");
+                let name = link.lobby.name_of(from).unwrap_or("?").to_owned();
                 self.emit(SessionEvent::ChatUnreadable { from, name });
             }
         }
@@ -729,7 +765,66 @@ async fn read_msg(recv: &mut RecvStream, dec: &mut FrameDecoder) -> Option<Serve
 
 #[cfg(test)]
 mod tests {
-    use super::WireSeq;
+    use super::*;
+
+    /// A session task with no connection, plus the caller's ends of its channels.
+    fn task() -> (Task, SessionHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = KnownDevices::load(&dir.path().join("known.toml")).unwrap();
+        let params = SessionParams {
+            server: "127.0.0.1:1".into(),
+            fingerprint: [0; 32],
+            username: "ja".into(),
+            password: String::new(),
+            identity: Arc::new(Identity::generate()),
+            trust: Arc::new(Mutex::new(trust)),
+        };
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let (audio_out, out_rx) = mpsc::channel(1);
+        let (in_tx, audio_in) = mpsc::channel(1);
+        let (commands, cmd_rx) = mpsc::unbounded_channel();
+        let (stop, stop_rx) = watch::channel(false);
+        let task = Task {
+            params,
+            session: 1,
+            events: events_tx,
+            out_rx,
+            in_tx,
+            cmd_rx,
+            stop: stop_rx,
+            next_epoch: 0,
+            chat_replay: ChatReplay::default(),
+            seq: WireSeq::default(),
+            room_choice: RoomChoice::Room(7),
+        };
+        (task, SessionHandle { events, audio_out, audio_in, commands, stop }, dir)
+    }
+
+    fn member(id: MemberId, room: Option<RoomId>) -> MemberInfo {
+        MemberInfo { id, name: format!("m{id}"), room }
+    }
+
+    #[test]
+    fn reconnect_asks_for_the_room_the_server_gave() {
+        let (mut t, _h, _dir) = task();
+        // Asked for room 7 (full), landed in the default room 1.
+        t.welcomed(1, Some(1), Vec::new(), vec![member(1, Some(1))]);
+        assert_eq!(t.room_choice, RoomChoice::Room(1));
+        t.welcomed(1, None, Vec::new(), vec![member(1, None)]);
+        assert_eq!(t.room_choice, RoomChoice::Nowhere);
+    }
+
+    #[test]
+    fn chat_typed_while_connecting_is_reported_not_sent() {
+        let (mut t, mut h, _dir) = task();
+        h.commands.send(SessionCommand::SendChat("hej".into())).unwrap();
+        h.commands.send(SessionCommand::TrustChanged(3)).unwrap();
+        h.commands.send(SessionCommand::JoinRoom(2)).unwrap();
+        let (_, _, queued) = t.welcomed(1, Some(1), Vec::new(), vec![member(1, Some(1))]);
+        assert_eq!(queued, vec![SessionCommand::JoinRoom(2)]);
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::ChatNotSent(ChatSendError::NotConnected)));
+        assert!(matches!(h.events.try_recv(), Ok(SessionEvent::Connected { .. })));
+    }
 
     #[test]
     fn wire_seq_keeps_gaps_and_never_goes_back() {

@@ -67,14 +67,19 @@ impl Lobby {
         self.members.get(&id).map(|m| m.name.as_str())
     }
 
-    pub fn member_joined(&mut self, m: MemberInfo) -> Vec<RoomChange> {
+    /// A repeat for a known id keeps the first name: a hostile server must not be able to
+    /// relabel someone already listed (their chat would show under the new name).
+    pub fn member_joined(&mut self, mut m: MemberInfo) -> Vec<RoomChange> {
         let id = m.id;
         let room = m.room;
-        let previous = self.members.insert(id, m.clone());
         if id == self.you {
             // Only reachable if the server echoes me back; my room is tracked by moves.
             return Vec::new();
         }
+        if let Some(known) = self.members.get(&id) {
+            m.name = known.name.clone();
+        }
+        let previous = self.members.insert(id, m.clone());
         let was_here = previous.is_some_and(|p| p.room.is_some() && p.room == self.room);
         let is_here = room.is_some() && room == self.room;
         match (was_here, is_here) {
@@ -130,8 +135,13 @@ impl Lobby {
         }
     }
 
+    /// A "move" to the room I am already in changes nothing: re-entering would rebuild E2E
+    /// state, which a hostile server could use to make peers re-send keys.
     fn move_me(&mut self, room: Option<RoomId>) -> Vec<RoomChange> {
         let mut out = Vec::new();
+        if room == self.room {
+            return out;
+        }
         if self.room.is_some() {
             out.push(RoomChange::Exited);
         }
@@ -271,6 +281,25 @@ mod tests {
         // Deleting my own room (server should never) counts as leaving it.
         assert_eq!(l.room_deleted(10), vec![RoomChange::Exited]);
         assert_eq!(l.my_room(), None);
+    }
+
+    #[test]
+    fn known_member_is_not_renamed() {
+        let mut l = lobby();
+        // A repeated MemberJoined for ola's id must not make her show up as someone else.
+        assert_eq!(l.member_joined(m(2, "ewa", Some(10))), vec![]);
+        assert_eq!(l.name_of(2), Some("ola"));
+        // It still carries a room change.
+        assert_eq!(l.member_joined(m(2, "ewa", Some(11))), vec![RoomChange::Left(2)]);
+        assert_eq!(l.name_of(2), Some("ola"));
+        assert_eq!(l.members_in(Some(11)).len(), 2);
+    }
+
+    #[test]
+    fn my_move_to_my_own_room_changes_nothing() {
+        let mut l = lobby();
+        assert_eq!(l.member_moved(1, Some(10)), vec![]);
+        assert_eq!(l.my_room(), Some(10));
     }
 
     #[test]

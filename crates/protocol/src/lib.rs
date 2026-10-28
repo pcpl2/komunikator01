@@ -81,6 +81,9 @@ mod tests {
         assert_eq!(normalize_room_name(&"ż".repeat(33)), None);
         assert_eq!(normalize_room_name("a
 b"), None);
+        for bidi in ['\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}'] {
+            assert_eq!(normalize_room_name(&format!("Gra{bidi}x")), None, "{bidi:?}");
+        }
     }
 
     #[test]

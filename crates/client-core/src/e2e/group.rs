@@ -12,8 +12,9 @@
 //! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and a
 //!   member's chat opener receives exactly the keys its link's audio opener receives (it may
 //!   hold up to two older keys of the same identity across link rebuilds), so the rules above
-//!   hold for chat too; chat replay state is kept per key for the whole session, so
-//!   rebuilt links, recreated members and swapped identities cannot reset it;
+//!   hold for chat too; chat replay state is kept per key for the whole client run (the
+//!   session lends it to each `E2e` and takes it back), so rebuilt links, recreated members,
+//!   swapped identities, re-entered rooms and reconnects cannot reset it;
 //! - announces are signed for, and accepted only for, this room.
 
 use std::collections::HashMap;
@@ -107,7 +108,8 @@ pub struct E2e {
     sealer: AudioSealer,
     /// Always built from the same key as `sealer`.
     chat: ChatSealer,
-    /// Highest opened chat counter per sender key, for every member.
+    /// Highest opened chat counter per sender key, for every member; lent by the caller for
+    /// the whole client run and returned by `into_chat_replay`.
     chat_replay: ChatReplay,
     pending: Option<Pending>,
     /// Latest time seen from the caller, for `trust_changed` (which takes none).
@@ -167,6 +169,8 @@ impl Peer {
 impl E2e {
     /// Joins `room`: `members` as listed by the server's `Welcome` (I may be included). The
     /// returned `Output` carries my signed announce; my first sender key has epoch `next_epoch`.
+    /// `chat_replay` is the replay log of every earlier `E2e` of this run: a fresh one would let
+    /// the server replay chat sealed under keys peers re-send to the new state.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: Arc<Identity>,
@@ -176,6 +180,7 @@ impl E2e {
         room: RoomId,
         members: &[MemberInfo],
         next_epoch: u16,
+        chat_replay: ChatReplay,
         now: Instant,
         now_ms: u64,
     ) -> (Self, Output) {
@@ -202,7 +207,7 @@ impl E2e {
             peers,
             sealer: AudioSealer::new(me, &current),
             chat: ChatSealer::new(&current),
-            chat_replay: ChatReplay::default(),
+            chat_replay,
             current,
             pending: None,
             clock: now,
@@ -494,6 +499,17 @@ impl E2e {
         }
     }
 
+    /// The name `id`'s announce verified against; `None` until one has. Chat that opened
+    /// came from this name, whatever the server's lobby says now.
+    pub fn peer_name(&self, id: MemberId) -> Option<&str> {
+        self.peers.get(&id).filter(|p| p.identity.is_some()).map(|p| p.name.as_str())
+    }
+
+    /// Ends this room's state, handing the chat replay log back for the next `E2e`.
+    pub fn into_chat_replay(self) -> ChatReplay {
+        self.chat_replay
+    }
+
     #[cfg(test)]
     fn current_key(&self) -> &SenderKey {
         &self.current
@@ -612,6 +628,7 @@ mod tests {
                 self.room,
                 &members,
                 next_epoch,
+                ChatReplay::default(),
                 self.now,
                 self.now_ms,
             );
@@ -655,6 +672,7 @@ mod tests {
                 self.room,
                 &members,
                 0,
+                ChatReplay::default(),
                 self.now,
                 self.now_ms,
             );
@@ -667,6 +685,37 @@ mod tests {
             self.gone.insert(id, old);
             let c = Client { e2e, identity, trust, _dir: dir, name, inbox, events: Vec::new(), seq: 0 };
             self.clients.insert(id, c);
+            self.route(id, out);
+        }
+
+        /// Client `id` rebuilds its E2e for the same room (same id, device and trust store), as
+        /// the session does on a forced reconnect; other members notice nothing.
+        fn rebuild(&mut self, id: MemberId) {
+            let c = self.clients.remove(&id).unwrap();
+            let members: Vec<_> = self
+                .clients
+                .iter()
+                .map(|(&cid, c)| MemberInfo { id: cid, name: c.name.clone(), room: Some(1) })
+                .collect();
+            let next_epoch = c.e2e.next_epoch();
+            let (e2e, out) = E2e::new(
+                c.identity.clone(),
+                c.trust.clone(),
+                id,
+                c.name.clone(),
+                self.room,
+                &members,
+                next_epoch,
+                c.e2e.into_chat_replay(),
+                self.now,
+                self.now_ms,
+            );
+            let inbox = self
+                .announces
+                .iter()
+                .map(|(&from, blob)| ServerMsg::Announce { from, blob: blob.clone() })
+                .collect();
+            self.clients.insert(id, Client { e2e, inbox, ..c });
             self.route(id, out);
         }
 
@@ -1252,7 +1301,18 @@ mod tests {
         let _d = dir;
         let now = Instant::now();
         let (mut e, out) =
-            E2e::new(Arc::new(Identity::generate()), trust, 1, "a".into(), 1, &[], u16::MAX, now, T0_MS);
+            E2e::new(
+            Arc::new(Identity::generate()),
+            trust,
+            1,
+            "a".into(),
+            1,
+            &[],
+            u16::MAX,
+            ChatReplay::default(),
+            now,
+            T0_MS,
+        );
         assert!(matches!(out.send[..], [ClientMsg::Announce { .. }]));
         assert_eq!(e.next_epoch(), 0);
         e.member_joined(&MemberInfo { id: 2, name: "b".into(), room: Some(1) }, now);
@@ -1317,6 +1377,18 @@ mod tests {
         assert_eq!(read(&mut net, b, a, &blob).as_deref(), Ok("192.168.1.10:27015"));
         assert_eq!(read(&mut net, b, b, &blob), Err(ChatError::NoKey), "no link to myself");
         assert_eq!(read(&mut net, b, 55, &blob), Err(ChatError::NoKey));
+    }
+
+    #[test]
+    fn chat_sender_name_is_the_verified_one() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(net.client(b).e2e.peer_name(a), Some("a"));
+        assert_eq!(net.client(b).e2e.peer_name(55), None);
+        // Once its announce fails, no name is vouched for.
+        net.inject(b, ServerMsg::Announce { from: a, blob: vec![1, 2, 3] });
+        net.deliver();
+        assert_eq!(net.client(b).e2e.peer_name(a), None);
     }
 
     #[test]
@@ -1430,6 +1502,22 @@ mod tests {
     }
 
     #[test]
+    fn chat_replay_survives_my_e2e_rebuild() {
+        let (mut net, ids) = room(&["a", "b"]);
+        // b initiates, so its rebuilt links re-pair and a re-sends its current key.
+        let (b, a) = net.roles(ids[0], ids[1]);
+        let old = chat(&mut net, a, "stary");
+        assert_eq!(read(&mut net, b, a, &old).as_deref(), Ok("stary"));
+        net.rebuild(b);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        assert_eq!(read(&mut net, b, a, &old), Err(ChatError::Replay));
+        let fresh = chat(&mut net, a, "nowy");
+        assert_eq!(read(&mut net, b, a, &fresh).as_deref(), Ok("nowy"), "the link came back");
+    }
+
+    #[test]
     fn new_identity_starts_with_fresh_chat_keys() {
         let (mut net, ids) = room(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
@@ -1527,7 +1615,7 @@ mod tests {
         net.deliver();
         let room_id = net.room;
         let forged = ChatSealer::new(&stolen).with_counter(u32::MAX).seal(room_id, m, "cisza").unwrap();
-        let _ = read(&mut net, a, m, &forged);
+        assert_eq!(read(&mut net, a, m, &forged).as_deref(), Ok("cisza"), "the forged blob did open");
         let next = chat(&mut net, b, "druga");
         assert_eq!(read(&mut net, a, b, &next).as_deref(), Ok("druga"));
     }

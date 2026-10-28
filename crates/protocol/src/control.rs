@@ -127,12 +127,17 @@ pub enum RoomChoice {
     Nowhere,
 }
 
-/// Trims the name; `None` if it is empty, too long, or contains control characters.
+/// Bidi controls can visually reorder a name (spoofing another room's).
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Trims the name; `None` if it is empty, too long, or contains control or bidi characters.
 pub fn normalize_room_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > MAX_ROOM_NAME_CHARS
-        || name.chars().any(char::is_control)
+        || name.chars().any(|c| c.is_control() || is_bidi_control(c))
     {
         return None;
     }

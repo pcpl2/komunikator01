@@ -43,6 +43,12 @@ pub fn sanitize(text: &str) -> String {
     strip_unwanted(text).chars().take(MAX_CHAT_CHARS).collect()
 }
 
+/// Cleans a server-supplied name (member, room) for display: like `sanitize`, but on one
+/// line, so a hostile server cannot fake console lines or reorder text.
+pub fn sanitize_name(name: &str) -> String {
+    name.chars().filter(|&c| !c.is_control() && !is_bidi_control(c)).collect()
+}
+
 /// Validates text typed by the user. Length is checked after stripping and
 /// trimming, so over-long input is rejected rather than silently cut.
 pub fn prepare_outgoing(text: &str) -> Result<String, ChatTextError> {
@@ -208,6 +214,12 @@ mod tests {
         assert_eq!(prepare_outgoing("   "), Err(ChatTextError::Empty));
         assert!(prepare_outgoing(&"😀".repeat(2000)).is_ok());
         assert_eq!(prepare_outgoing(&"a".repeat(2001)), Err(ChatTextError::TooLong));
+    }
+
+    #[test]
+    fn sanitize_name_keeps_one_plain_line() {
+        assert_eq!(sanitize_name("o\u{202E}la\n[12:00] ewa\x1b[2J\t"), "ola[12:00] ewa[2J");
+        assert_eq!(sanitize_name("Żółw"), "Żółw");
     }
 
     #[test]
