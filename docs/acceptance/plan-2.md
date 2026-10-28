@@ -20,7 +20,7 @@ Nie sprawdzono tu: przepływu dźwięku (brak mikrofonu; klienty działały bez 
 2. Porównanie kodów bezpieczeństwa głosowo (`k`): kody u obu osób identyczne; po zgodności `z <id>`.
 3. Wejście kogoś w trakcie rozmowy: słychać go i on słyszy innych w ciągu ok. 1 s, bez trzasków; nie słyszy tego, co było mówione przed jego wejściem.
 4. Wyjście kogoś w trakcie rozmowy: pozostali nie mają przerwy w dźwięku (okno 2 s na poprzednią epokę).
-5. Usunięcie `identity.bin` (lub uruchomienie z innego `--data-dir`) na jednym komputerze: pozostali widzą wyraźne ostrzeżenie „zmieniony klucz” (przy tej samej nazwie i urządzeniu) albo „nowe urządzenie”, a dźwięk dla zmienionego klucza wraca dopiero po `a <id>`.
+5. Usunięcie `identity.bin` (lub uruchomienie z innego `--data-dir`) na jednym komputerze: ta osoba dostaje komunikat o nowej tożsamości, a pozostali widzą ją jako „NOWE URZĄDZENIE” z nowym kodem bezpieczeństwa; dźwięk działa dalej. Ostrzeżenie „zmieniony klucz” w takim scenariuszu **nie** pojawia się (tylko gdy ten sam identyfikator urządzenia przyjdzie z innym kluczem).
 6. RAM i CPU po 30 min rozmowy bez zmian względem planu 1 (working set < 30 MB, CPU < 1%).
 7. Restart serwera w trakcie: dźwięk wraca sam, kody i zaufanie bez zmian.
 

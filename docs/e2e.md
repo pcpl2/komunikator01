@@ -4,7 +4,7 @@ Dźwięk jest szyfrowany na urządzeniu nadawcy i odszyfrowywany dopiero u odbio
 
 ## Tożsamość urządzenia
 
-Każde urządzenie ma długoterminową tożsamość: klucz Ed25519 (podpisy), klucz X25519 (Noise) i losowy 16-bajtowy identyfikator urządzenia. Na Windows plik `identity.bin` (katalog `--data-dir`, domyślnie `%APPDATA%\komunikator`) to wynik DPAPI w zakresie bieżącego użytkownika; plik nie działa na innym koncie ani komputerze. Gdy pliku nie da się odszyfrować, jest odkładany jako `identity.bin.broken` i powstaje nowa tożsamość. Znajomi zobaczą wtedy ostrzeżenie o zmianie klucza. Przy innym błędzie odczytu (np. brak dostępu) klient się zatrzymuje, nic nie nadpisując.
+Każde urządzenie ma długoterminową tożsamość: klucz Ed25519 (podpisy), klucz X25519 (Noise) i losowy 16-bajtowy identyfikator urządzenia. Na Windows plik `identity.bin` (katalog `--data-dir`, domyślnie `%APPDATA%\komunikator`) to wynik DPAPI w zakresie bieżącego użytkownika; plik nie działa na innym koncie ani komputerze. Gdy pliku nie da się odszyfrować, jest odkładany jako `identity.bin.broken` i powstaje nowa tożsamość. Nowa tożsamość ma nowy losowy identyfikator urządzenia, więc znajomi zobaczą Cię jako „nowe urządzenie” (dźwięk działa dalej) i powinni porównać z Tobą kod bezpieczeństwa. Ostrzeżenie „zmieniony klucz” pojawia się tylko wtedy, gdy ten sam identyfikator urządzenia przyjdzie z innym kluczem, np. przy podszywaniu się. Przy innym błędzie odczytu (np. brak dostępu) klient się zatrzymuje, nic nie nadpisując.
 
 ## Ogłoszenie
 

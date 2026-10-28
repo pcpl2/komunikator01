@@ -42,7 +42,7 @@ komunikator --server adres.serwera:7700 --fingerprint <odcisk> --user ala
 - `k` + Enter: lista osób z numerami, stanem zaufania i kodem bezpieczeństwa; `z <numer>` oznacza osobę jako zweryfikowaną (po głosowym porównaniu kodu), `a <numer>` akceptuje zmieniony klucz.
 - `--data-dir <katalog>`: gdzie leżą `identity.bin` (tożsamość chroniona DPAPI) i `known_devices.toml` (domyślnie `%APPDATA%\komunikator`).
 
-Dźwięk jest szyfrowany end-to-end: serwer nie może go odsłuchać. Ostrzeżenie „zmieniony klucz” oznacza nowe urządzenie lub podszywanie się, więc porównaj kod z osobą głosowo. Szczegóły i ograniczenia: [docs/e2e.md](docs/e2e.md).
+Dźwięk jest szyfrowany end-to-end: serwer nie może go odsłuchać. „Nowe urządzenie” oznacza, że znajomy ma nową tożsamość (np. nowy komputer): porównaj kod z nim głosowo. „Zmieniony klucz” (to samo urządzenie, inny klucz) to możliwe podszywanie się. Szczegóły i ograniczenia: [docs/e2e.md](docs/e2e.md).
 
 Klient po zerwaniu połączenia łączy się ponownie sam. Po odłączeniu słuchawek przechodzi na urządzenie domyślne.
 

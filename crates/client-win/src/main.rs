@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         IdentityStatus::Created => println!("utworzono nową tożsamość urządzenia (klucz szyfrowania)"),
         IdentityStatus::Replaced { broken } => println!(
             "UWAGA: nie udało się odczytać poprzedniej tożsamości urządzenia (zachowana jako {}).\n\
-             Utworzono nową. Znajomi zobaczą ostrzeżenie o zmianie klucza i muszą je zaakceptować.",
+             Utworzono nową. Znajomi zobaczą Cię jako „nowe urządzenie” i powinni porównać z Tobą kod bezpieczeństwa.",
             broken.display()
         ),
     }
@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    println!("komendy: m = mikrofon wł./wył., d = wycisz wszystkich, k = lista osób i kody, z <id> = zweryfikowany, a <id> = akceptuj zmieniony klucz, q = wyjście");
+    println!("{HELP}");
     let mut roster = Roster::default();
     let exit_code = rt.block_on(async {
         loop {
@@ -155,13 +155,12 @@ fn main() -> anyhow::Result<()> {
                     Some("d") => toggle("dźwięk wyciszony", &controls.deafened),
                     Some("k") => roster.print(),
                     Some("q") | None => return 0,
-                    Some(line) => {
-                        if let Some((verb, arg)) = line.split_once(' ') {
-                            if matches!(verb, "z" | "a") {
-                                roster.trust_command(verb == "z", arg.trim(), &trust, &session.commands);
-                            }
+                    Some(line) => match line.split_once(' ') {
+                        Some((verb @ ("z" | "a"), arg)) => {
+                            roster.trust_command(verb == "z", arg.trim(), &trust, &session.commands)
                         }
-                    }
+                        _ => println!("{HELP}"),
+                    },
                 },
             }
         }
@@ -173,6 +172,8 @@ fn main() -> anyhow::Result<()> {
     let _ = render.join();
     std::process::exit(exit_code);
 }
+
+const HELP: &str = "komendy: m = mikrofon wł./wył., d = wycisz wszystkich, k = lista osób i kody, z <id> = zweryfikowany, a <id> = akceptuj zmieniony klucz, q = wyjście";
 
 fn toggle(label: &str, flag: &AtomicBool) {
     let now = !flag.fetch_xor(true, Ordering::Relaxed);
@@ -299,6 +300,10 @@ impl Roster {
                 store.verify(name, identity);
                 println!("{name} oznaczony jako zweryfikowany");
             } else {
+                if *trust_state != Trust::KeyChanged {
+                    println!("klucz {name} się nie zmienił, nie ma czego akceptować");
+                    return;
+                }
                 store.accept(name, identity);
                 println!("zaakceptowano klucz {name}; to urządzenie jest znane, ale niezweryfikowane");
             }
@@ -322,4 +327,31 @@ fn trust_label(t: Trust) -> &'static str {
 fn main() {
     let _ = Cli::parse();
     eprintln!("komunikator działa tylko na Windows");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_is_refused_unless_key_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = Mutex::new(KnownDevices::load(&dir.path().join("k.toml")).unwrap());
+        let id = IdentityPublic { sign: [1; 32], dh: [2; 32], device: [3; 16] };
+        {
+            let mut t = trust.lock().unwrap();
+            t.check("ala", &id);
+            t.verify("ala", &id);
+        }
+        let mut roster = Roster::default();
+        roster.e2e.insert(5, ("ala".into(), id, Trust::Verified, "0000".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        roster.trust_command(false, "5", &trust, &tx);
+        assert!(rx.try_recv().is_err(), "no TrustChanged for a stray accept");
+        assert_eq!(trust.lock().unwrap().check("ala", &id), Trust::Verified);
+        // A changed key is accepted.
+        roster.e2e.insert(5, ("ala".into(), id, Trust::KeyChanged, "0000".into()));
+        roster.trust_command(false, "5", &trust, &tx);
+        assert_eq!(rx.try_recv(), Ok(SessionCommand::TrustChanged(5)));
+    }
 }
