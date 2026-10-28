@@ -22,7 +22,7 @@ pub fn config(dir: &tempfile::TempDir, port: u16) -> ServerConfig {
         data_dir: dir.path().to_owned(),
         users: ["ala", "ola", "ewa"]
             .iter()
-            .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x() })
+            .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x(), admin: false })
             .collect(),
     }
 }

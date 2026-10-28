@@ -19,6 +19,9 @@ pub struct ServerConfig {
 pub struct UserEntry {
     pub name: String,
     pub password_hash: String,
+    /// May delete rooms created by others.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 fn default_bind() -> SocketAddr {
@@ -44,6 +47,7 @@ mod tests {
         assert_eq!(c.bind, "0.0.0.0:7700".parse().unwrap());
         assert_eq!(c.users.len(), 1);
         assert_eq!(c.users[0].name, "ala");
+        assert!(c.users[0].admin);
     }
 
     #[test]
@@ -51,5 +55,12 @@ mod tests {
         let c: ServerConfig = toml::from_str("data_dir = \"/tmp\"").unwrap();
         assert_eq!(c.bind.port(), 7700);
         assert!(c.users.is_empty());
+    }
+
+    #[test]
+    fn admin_defaults_to_false() {
+        let text = "data_dir = \"/tmp\"\n[[users]]\nname = \"ola\"\npassword_hash = \"h\"";
+        let c: ServerConfig = toml::from_str(text).unwrap();
+        assert!(!c.users[0].admin);
     }
 }

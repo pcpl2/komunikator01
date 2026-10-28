@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use protocol::audio::{encode_upstream, parse_downstream, MAX_AUDIO_PAYLOAD, MAX_DATAGRAM};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, ServerMsg,
-    PROTOCOL_VERSION,
+    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    RoomId, ServerMsg, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use tokio::sync::{mpsc, watch};
@@ -215,6 +215,7 @@ impl Task {
             username: self.params.username.clone(),
             password: self.params.password.clone(),
             session: self.session,
+            room: RoomChoice::Default,
         };
         let login = async {
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
@@ -233,8 +234,13 @@ impl Task {
             conn.close(VarInt::from_u32(0), b"");
             return Outcome::Retry;
         };
-        let (e2e, first) = match reply {
-            Some(ServerMsg::Welcome { you, members }) => {
+        let (e2e, first, room) = match reply {
+            Some(ServerMsg::Welcome { you, room, members, .. }) => {
+                // Only the others in my room share keys with me; in no room, nobody does.
+                let members: Vec<MemberInfo> = members
+                    .into_iter()
+                    .filter(|m| m.id != you && room.is_some() && m.room == room)
+                    .collect();
                 backoff.reset();
                 // Audio captured while connecting is stale; sending it would play as a burst.
                 while self.out_rx.try_recv().is_ok() {}
@@ -252,7 +258,7 @@ impl Task {
                     now_ms(),
                 );
                 self.emit(SessionEvent::Connected { you, members });
-                (e2e, first)
+                (e2e, first, room)
             }
             Some(ServerMsg::Rejected { reason }) => {
                 return match reason {
@@ -266,7 +272,7 @@ impl Task {
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),
             _ => return closed_outcome(&conn),
         };
-        let mut link = Link::new(&conn, &mut send, e2e);
+        let mut link = Link::new(&conn, &mut send, e2e, room);
         let outcome = match link.output(first, &self.events) {
             Ok(()) => self.connected_loop(&mut link, &mut recv, &mut dec).await,
             Err(o) => o,
@@ -315,7 +321,9 @@ impl Task {
                 m = read_msg(recv, dec) => {
                     let now = Instant::now();
                     match m {
-                        Some(ServerMsg::MemberJoined(m)) => {
+                        Some(ServerMsg::MemberJoined(m))
+                            if link.room.is_some() && m.room == link.room =>
+                        {
                             let out = link.e2e.member_joined(&m, now);
                             self.emit(SessionEvent::MemberJoined(m));
                             out
@@ -407,6 +415,8 @@ struct Link<'a> {
     /// Control stream to the server.
     send: &'a mut SendStream,
     e2e: E2e,
+    /// My room as of the `Welcome`; only its members take part in E2E.
+    room: Option<RoomId>,
     /// Encoded control messages not yet written; `ctrl_out[ctrl_sent..]` is pending. Written
     /// from the main loop so a server that stops reading cannot block audio or shutdown.
     ctrl_out: Vec<u8>,
@@ -416,8 +426,16 @@ struct Link<'a> {
 }
 
 impl<'a> Link<'a> {
-    fn new(conn: &'a Connection, send: &'a mut SendStream, e2e: E2e) -> Self {
-        Self { conn, send, e2e, ctrl_out: Vec::new(), ctrl_sent: 0, ctrl_deadline: Instant::now() }
+    fn new(conn: &'a Connection, send: &'a mut SendStream, e2e: E2e, room: Option<RoomId>) -> Self {
+        Self {
+            conn,
+            send,
+            e2e,
+            room,
+            ctrl_out: Vec::new(),
+            ctrl_sent: 0,
+            ctrl_deadline: Instant::now(),
+        }
     }
 
     fn ctrl_pending(&self) -> bool {

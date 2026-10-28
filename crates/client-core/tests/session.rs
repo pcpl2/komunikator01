@@ -154,10 +154,10 @@ async fn deaf_server() -> (std::net::SocketAddr, [u8; 32], tempfile::TempDir) {
             let Ok((mut send, mut recv)) = conn.accept_bi().await else { continue };
             let mut buf = [0u8; 256];
             let _ = recv.read(&mut buf).await; // the Hello; nothing is read after it
-            let welcome = ServerMsg::Welcome { you: 1, members: vec![] };
+            let welcome = ServerMsg::Welcome { you: 1, room: Some(1), rooms: vec![], members: vec![] };
             let _ = send.write_all(&encode_frame(&welcome)).await;
             for id in 2..200u16 {
-                let m = ServerMsg::MemberJoined(MemberInfo { id, name: format!("u{id}") });
+                let m = ServerMsg::MemberJoined(MemberInfo { id, name: format!("u{id}"), room: Some(1) });
                 let _ = send.write_all(&encode_frame(&m)).await;
             }
             held.push((conn, send, recv));

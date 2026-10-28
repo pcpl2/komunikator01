@@ -40,6 +40,7 @@ async fn server_side_sees_only_ciphertext() {
         username: "ewa".into(),
         password: "x".into(),
         session: 7,
+        room: protocol::RoomChoice::Default,
     };
     send.write_all(&encode_frame(&hello)).await.unwrap();
     let mut dec = FrameDecoder::new();

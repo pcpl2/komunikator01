@@ -52,8 +52,13 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let endpoint = bind_endpoint(quic_config(&identity)?, &reset_key, config.bind).await?;
     let dummy_hash =
         tokio::task::spawn_blocking(|| auth::hash_password("dummy-password-for-timing")).await?;
+    let store = store::Store::open(&config.data_dir.join("komunikator.db"))?;
+    let rooms = store.rooms()?;
+    let admins = config.users.iter().filter(|u| u.admin).map(|u| u.name.clone()).collect();
     let shared = Arc::new(conn::Shared {
-        room: Mutex::new(room::Room::new()),
+        registry: Mutex::new(room::Registry::new(rooms)),
+        store: Mutex::new(store),
+        admins,
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
         users: config.users.into_iter().map(|u| (u.name, u.password_hash)).collect(),
         dummy_hash,

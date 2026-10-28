@@ -1,6 +1,6 @@
-//! One client connection: login on the control stream, then audio relay.
+//! One client connection: login on the control stream, then room traffic and audio relay.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use protocol::audio::{upstream_to_downstream, MAX_DATAGRAM};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, ServerMsg,
-    MAX_BLOB, PROTOCOL_VERSION,
+    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    RoomErrorReason, RoomId, ServerMsg, MAX_BLOB, MAX_CHAT_BLOB, PROTOCOL_VERSION,
 };
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use serde::de::DeserializeOwned;
@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::auth::{verify_password, LoginLimiter};
-use crate::room::Room;
+use crate::room::Registry;
+use crate::store::{Store, StoreError};
 
 /// Application close code: the account logged in elsewhere.
 pub const CLOSE_REPLACED: u32 = 1;
@@ -29,25 +30,32 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const LINGER: Duration = Duration::from_secs(2);
 const AUDIO_RATE_PER_S: u32 = 100;
 const AUDIO_BURST: u32 = 20;
-/// Replaced client runs remembered per account.
-/// Control messages (Announce/Relay) per second and burst, per connection.
+/// Control messages per second and burst, per connection.
 const CTRL_RATE_PER_S: u32 = 50;
 const CTRL_BURST: u32 = 100;
+/// Chat messages per second and burst, per connection, on top of the control limit.
+pub const CHAT_RATE_PER_S: u32 = 5;
+pub const CHAT_BURST: u32 = 20;
+/// Replaced client runs remembered per account.
 const RETIRED_PER_USER: usize = 8;
 
-/// A room member as seen by other connections.
+/// An online member as seen by other connections.
 #[derive(Clone)]
 pub(crate) struct Peer {
     conn: Connection,
     ctrl: mpsc::UnboundedSender<ServerMsg>,
     /// The client run this connection belongs to (`ClientMsg::Hello::session`).
     session: u64,
-    /// Last key-exchange blob this member announced (opaque; never logged).
+    /// Last key-exchange blob this member announced in its current room (opaque; never logged).
     announce: Option<Arc<[u8]>>,
 }
 
 pub(crate) struct Shared {
-    pub(crate) room: Mutex<Room<Peer>>,
+    pub(crate) registry: Mutex<Registry<Peer>>,
+    /// Locked only while holding `registry`, so room changes cannot race.
+    pub(crate) store: Mutex<Store>,
+    /// Users who may delete anyone's room.
+    pub(crate) admins: HashSet<String>,
     pub(crate) limiter: Mutex<LoginLimiter>,
     /// Username → Argon2id hash.
     pub(crate) users: HashMap<String, String>,
@@ -110,7 +118,7 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
         }
         _ => return Ok(()),
     };
-    let ClientMsg::Hello { version, username, password, session } = hello else {
+    let ClientMsg::Hello { version, username, password, session, room } = hello else {
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
         return Ok(());
     };
@@ -123,8 +131,8 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     }
 
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-    let Some(id) = join_room(&shared, &username, Peer { conn: conn.clone(), ctrl: ctrl_tx, session, announce: None })
-    else {
+    let peer = Peer { conn: conn.clone(), ctrl: ctrl_tx, session, announce: None };
+    let Some(id) = log_in(&shared, &username, peer, room) else {
         tracing::info!(%ip, user = %username, "replaced client tried to come back");
         send_and_close(send, &conn, ServerMsg::SessionReplaced, CLOSE_REPLACED).await;
         return Ok(());
@@ -133,14 +141,14 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     let writer = tokio::spawn(write_ctrl(send, ctrl_rx, conn.clone()));
 
     let end = tokio::select! {
-        e = control_loop(&mut recv, &mut dec, id, &shared) => e,
+        e = control_loop(&mut recv, &mut dec, id, &username, &shared) => e,
         e = datagram_loop(&conn, id, &shared) => e,
     };
     if let End::Violation = end {
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
     }
     writer.abort();
-    leave_room(&shared, id);
+    log_out(&shared, id);
     tracing::info!(user = %username, id, "left");
     Ok(())
 }
@@ -184,16 +192,16 @@ async fn check_login(
 }
 
 /// `None` when this client run was already replaced by a login elsewhere.
-fn join_room(shared: &Shared, username: &str, peer: Peer) -> Option<MemberId> {
+fn log_in(shared: &Shared, username: &str, peer: Peer, choice: RoomChoice) -> Option<MemberId> {
     let welcome_tx = peer.ctrl.clone();
     let session = peer.session;
-    let mut room = shared.room.lock().unwrap();
+    let mut reg = shared.registry.lock().unwrap();
     let mut retired = shared.retired.lock().unwrap();
     if retired.get(username).is_some_and(|r| r.contains(&session)) {
         return None;
     }
-    let outcome = room.join(username, peer);
-    let others = room.peers(outcome.id);
+    let outcome = reg.login(username, peer, choice);
+    let others = reg.others(outcome.id);
     if let Some((old_id, old)) = &outcome.replaced {
         // The same run reconnecting over its own stale connection is not a replacement.
         if old.session != session {
@@ -208,28 +216,48 @@ fn join_room(shared: &Shared, username: &str, peer: Peer) -> Option<MemberId> {
             let _ = p.ctrl.send(ServerMsg::MemberLeft { id: *old_id });
         }
     }
-    let me = MemberInfo { id: outcome.id, name: username.to_owned() };
+    let me = MemberInfo { id: outcome.id, name: username.to_owned(), room: outcome.room };
     for p in &others {
         let _ = p.ctrl.send(ServerMsg::MemberJoined(me.clone()));
     }
-    let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, members: outcome.members });
-    // Same room lock as Welcome, so these always follow it and precede any later Announce.
-    for (from, p) in room.peers_with_ids(outcome.id) {
-        if let Some(blob) = &p.announce {
-            let _ = welcome_tx.send(ServerMsg::Announce { from, blob: blob.to_vec() });
-        }
-    }
+    let (rooms, members) = reg.snapshot();
+    let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, room: outcome.room, rooms, members });
+    // Same lock as Welcome, so these always follow it and precede any later Announce.
+    replay_announces(&reg, outcome.id, &welcome_tx);
     Some(outcome.id)
 }
 
-fn leave_room(shared: &Shared, id: MemberId) {
-    let mut room = shared.room.lock().unwrap();
+fn log_out(shared: &Shared, id: MemberId) {
+    let mut reg = shared.registry.lock().unwrap();
     // `None` when this session was already replaced; its departure was announced then.
-    if room.leave(id).is_some() {
-        for p in room.peers(id) {
+    if reg.leave(id).is_some() {
+        for p in reg.others(id) {
             let _ = p.ctrl.send(ServerMsg::MemberLeft { id });
         }
     }
+}
+
+/// Sends `to` the stored announces of the others in `id`'s room.
+fn replay_announces(reg: &Registry<Peer>, id: MemberId, to: &mpsc::UnboundedSender<ServerMsg>) {
+    for (from, p) in reg.room_peers(id) {
+        if let Some(blob) = &p.announce {
+            let _ = to.send(ServerMsg::Announce { from, blob: blob.to_vec() });
+        }
+    }
+}
+
+fn send_to(reg: &Registry<Peer>, id: MemberId, msg: ServerMsg) {
+    if let Some(p) = reg.get(id) {
+        let _ = p.ctrl.send(msg);
+    }
+}
+
+/// To everyone online, `id` included.
+fn send_to_all(reg: &Registry<Peer>, id: MemberId, msg: ServerMsg) {
+    for p in reg.others(id) {
+        let _ = p.ctrl.send(msg.clone());
+    }
+    send_to(reg, id, msg);
 }
 
 async fn write_ctrl(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<ServerMsg>, conn: Connection) {
@@ -256,9 +284,11 @@ async fn control_loop(
     recv: &mut RecvStream,
     dec: &mut FrameDecoder,
     id: MemberId,
+    username: &str,
     shared: &Shared,
 ) -> End {
     let mut bucket = TokenBucket::new(CTRL_RATE_PER_S, CTRL_BURST);
+    let mut chat_bucket = TokenBucket::new(CHAT_RATE_PER_S, CHAT_BURST);
     loop {
         let msg = match read_msg::<ClientMsg>(recv, dec).await {
             Ok(Some(m)) => m,
@@ -269,26 +299,102 @@ async fn control_loop(
             ClientMsg::Announce { blob } | ClientMsg::Relay { blob, .. } if blob.len() > MAX_BLOB => {
                 return End::Violation;
             }
+            ClientMsg::Chat { blob } if blob.len() > MAX_CHAT_BLOB => return End::Violation,
             ClientMsg::Hello { .. } => return End::Violation,
             _ if !bucket.try_take(Instant::now()) => {}
+            ClientMsg::Chat { .. } if !chat_bucket.try_take(Instant::now()) => {}
             ClientMsg::Announce { blob } => {
-                let mut room = shared.room.lock().unwrap();
+                let mut reg = shared.registry.lock().unwrap();
                 // A replaced session lingers to read its notice but must not be heard.
-                let Some(me) = room.get_mut(id) else { continue };
+                let Some(me) = reg.get_mut(id) else { continue };
                 me.announce = Some(Arc::from(blob.as_slice()));
-                for p in room.peers(id) {
+                for (_, p) in reg.room_peers(id) {
                     let _ = p.ctrl.send(ServerMsg::Announce { from: id, blob: blob.clone() });
                 }
             }
             ClientMsg::Relay { to, blob } => {
-                let room = shared.room.lock().unwrap();
-                if to == id || !room.contains(id) {
-                    continue;
-                }
-                if let Some(p) = room.get(to) {
-                    let _ = p.ctrl.send(ServerMsg::Relay { from: id, blob });
+                let reg = shared.registry.lock().unwrap();
+                let room = reg.room_of(id);
+                if to != id && room.is_some() && reg.room_of(to) == room {
+                    send_to(&reg, to, ServerMsg::Relay { from: id, blob });
                 }
             }
+            // Opaque and never logged.
+            ClientMsg::Chat { blob } => {
+                let reg = shared.registry.lock().unwrap();
+                for (_, p) in reg.room_peers(id) {
+                    let _ = p.ctrl.send(ServerMsg::Chat { from: id, blob: blob.clone() });
+                }
+            }
+            ClientMsg::JoinRoom { room } => move_member(shared, id, Some(room)),
+            ClientMsg::LeaveRoom => move_member(shared, id, None),
+            ClientMsg::CreateRoom { name } => create_room(shared, id, username, &name),
+            ClientMsg::DeleteRoom { room } => delete_room(shared, id, username, room),
+        }
+    }
+}
+
+fn move_member(shared: &Shared, id: MemberId, room: Option<RoomId>) {
+    let mut reg = shared.registry.lock().unwrap();
+    match reg.move_to(id, room) {
+        Err(reason) => send_to(&reg, id, ServerMsg::RoomError { reason }),
+        Ok(false) => {}
+        Ok(true) => {
+            // It was meant for the old room's members.
+            if let Some(me) = reg.get_mut(id) {
+                me.announce = None;
+            }
+            send_to_all(&reg, id, ServerMsg::MemberMoved { id, room });
+            if let Some(me) = reg.get(id) {
+                replay_announces(&reg, id, &me.ctrl);
+            }
+        }
+    }
+}
+
+fn create_room(shared: &Shared, id: MemberId, username: &str, name: &str) {
+    let mut reg = shared.registry.lock().unwrap();
+    // A replaced session lingers to read its notice but may not act.
+    if !reg.contains(id) {
+        return;
+    }
+    let name = match reg.check_new_room(name) {
+        Ok(name) => name,
+        Err(reason) => return send_to(&reg, id, ServerMsg::RoomError { reason }),
+    };
+    let created = shared.store.lock().unwrap().create_room(&name, username);
+    match created {
+        Ok(info) => {
+            reg.add_room(info.clone());
+            send_to_all(&reg, id, ServerMsg::RoomCreated(info));
+        }
+        Err(StoreError::NameTaken) => {
+            send_to(&reg, id, ServerMsg::RoomError { reason: RoomErrorReason::NameTaken });
+        }
+        Err(StoreError::Db(_)) => {
+            tracing::warn!("room store failed to create a room");
+            send_to(&reg, id, ServerMsg::RoomError { reason: RoomErrorReason::NotFound });
+        }
+    }
+}
+
+fn delete_room(shared: &Shared, id: MemberId, username: &str, room: RoomId) {
+    let mut reg = shared.registry.lock().unwrap();
+    if !reg.contains(id) {
+        return;
+    }
+    if let Err(reason) = reg.check_delete(room, username, shared.admins.contains(username)) {
+        return send_to(&reg, id, ServerMsg::RoomError { reason });
+    }
+    let deleted = shared.store.lock().unwrap().delete_room(room);
+    match deleted {
+        Ok(_) => {
+            reg.remove_room(room);
+            send_to_all(&reg, id, ServerMsg::RoomDeleted { room });
+        }
+        Err(_) => {
+            tracing::warn!("room store failed to delete a room");
+            send_to(&reg, id, ServerMsg::RoomError { reason: RoomErrorReason::NotFound });
         }
     }
 }
@@ -305,15 +411,9 @@ async fn datagram_loop(conn: &Connection, id: MemberId, shared: &Shared) -> End 
         }
         let Ok(down) = upstream_to_downstream(id, &d) else { continue };
         let down = Bytes::from(down);
-        let peers = {
-            let room = shared.room.lock().unwrap();
-            // A replaced session lingers to read its notice but must not be heard.
-            if !room.contains(id) {
-                continue;
-            }
-            room.peers(id)
-        };
-        for p in peers {
+        // Empty for a session in no room, or a replaced one lingering to read its notice.
+        let peers = shared.registry.lock().unwrap().room_peers(id);
+        for (_, p) in peers {
             let _ = p.conn.send_datagram(down.clone());
         }
     }

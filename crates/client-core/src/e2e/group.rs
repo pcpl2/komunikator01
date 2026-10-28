@@ -551,11 +551,11 @@ mod tests {
         ) -> MemberId {
             let id = self.next_id;
             self.next_id += 1;
-            let info = MemberInfo { id, name: name.into() };
+            let info = MemberInfo { id, name: name.into(), room: Some(1) };
             let mut members = Vec::new();
             for (&cid, c) in self.clients.iter_mut() {
                 c.inbox.push_back(ServerMsg::MemberJoined(info.clone()));
-                members.push(MemberInfo { id: cid, name: c.name.clone() });
+                members.push(MemberInfo { id: cid, name: c.name.clone(), room: Some(1) });
             }
             let (e2e, out) = E2e::new(
                 identity.clone(),
@@ -591,8 +591,11 @@ mod tests {
         fn hijack(&mut self, id: MemberId) {
             let old = self.clients.remove(&id).unwrap();
             self.announces.remove(&id);
-            let members: Vec<_> =
-                self.clients.iter().map(|(&cid, c)| MemberInfo { id: cid, name: c.name.clone() }).collect();
+            let members: Vec<_> = self
+                .clients
+                .iter()
+                .map(|(&cid, c)| MemberInfo { id: cid, name: c.name.clone(), room: Some(1) })
+                .collect();
             let (dir, trust) = store();
             let identity = Arc::new(Identity::generate());
             let (e2e, out) =
@@ -639,7 +642,12 @@ mod tests {
                             c.inbox.push_back(ServerMsg::Relay { from, blob });
                         }
                     }
-                    ClientMsg::Hello { .. } => {}
+                    ClientMsg::Hello { .. }
+                    | ClientMsg::JoinRoom { .. }
+                    | ClientMsg::LeaveRoom
+                    | ClientMsg::CreateRoom { .. }
+                    | ClientMsg::DeleteRoom { .. }
+                    | ClientMsg::Chat { .. } => {}
                 }
             }
         }
@@ -975,7 +983,7 @@ mod tests {
                 let msg = if step % 8 == 0 {
                     ServerMsg::MemberLeft { id: 90 }
                 } else {
-                    ServerMsg::MemberJoined(MemberInfo { id: 90, name: "x".into() })
+                    ServerMsg::MemberJoined(MemberInfo { id: 90, name: "x".into(), room: Some(1) })
                 };
                 net.inject(a, msg);
             }
@@ -998,7 +1006,7 @@ mod tests {
         let (a, b) = (ids[0], ids[1]);
         let ghost = 99;
         let b_blob = net.announces[&b].clone();
-        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: ghost, name: "ghost".into() }));
+        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: ghost, name: "ghost".into(), room: Some(1) }));
         net.inject(a, ServerMsg::Announce { from: ghost, blob: b_blob });
         net.deliver();
         net.tick(600);
@@ -1017,7 +1025,7 @@ mod tests {
         let a = ids[0];
         let twin = 98;
         let a_blob = net.announces[&a].clone();
-        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: twin, name: "a".into() }));
+        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: twin, name: "a".into(), room: Some(1) }));
         net.inject(a, ServerMsg::Announce { from: twin, blob: a_blob });
         net.deliver();
         net.tick(1100);
@@ -1049,7 +1057,7 @@ mod tests {
         let (mut net, ids) = room(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
         let c = 77;
-        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: c, name: "c".into() }));
+        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: c, name: "c".into(), room: Some(1) }));
         net.deliver();
         let b_to_a: Vec<_> =
             net.relays.iter().filter(|r| r.0 == b && r.1 == a).map(|r| r.2.clone()).collect();
@@ -1156,7 +1164,7 @@ mod tests {
         let a = ids[0];
         let start = net.client(a).e2e.next_epoch();
         let e0 = net.frame(a).epoch;
-        net.call(a, |e, now, _| e.member_joined(&MemberInfo { id: 40, name: "x".into() }, now));
+        net.call(a, |e, now, _| e.member_joined(&MemberInfo { id: 40, name: "x".into(), room: Some(1) }, now));
         net.tick(400);
         net.call(a, |e, now, _| e.member_left(40, now));
         net.tick(400);
@@ -1175,7 +1183,7 @@ mod tests {
             E2e::new(Arc::new(Identity::generate()), trust, 1, "a".into(), &[], u16::MAX, now, T0_MS);
         assert!(matches!(out.send[..], [ClientMsg::Announce { .. }]));
         assert_eq!(e.next_epoch(), 0);
-        e.member_joined(&MemberInfo { id: 2, name: "b".into() }, now);
+        e.member_joined(&MemberInfo { id: 2, name: "b".into(), room: Some(1) }, now);
         e.tick(now + Duration::from_millis(600));
         assert_eq!(e.seal(1, b"x", &mut Vec::new()), Some(0));
         assert_eq!(e.next_epoch(), 1);
@@ -1213,7 +1221,7 @@ mod tests {
             assert!(!net.client(a).e2e.open(b, 0, 0, blob, now, &mut Vec::new()));
         }
         net.call(a, |e, now, _| e.member_left(a, now));
-        net.call(a, |e, now, _| e.member_joined(&MemberInfo { id: a, name: "a".into() }, now));
+        net.call(a, |e, now, _| e.member_joined(&MemberInfo { id: a, name: "a".into(), room: Some(1) }, now));
         net.deliver();
         net.tick(1100);
     }

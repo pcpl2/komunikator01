@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use protocol::audio::{encode_upstream, parse_downstream};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, ServerMsg,
-    PROTOCOL_VERSION,
+    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    ServerMsg, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use server::{RunningServer, ServerConfig, UserEntry};
@@ -20,7 +20,7 @@ fn hash_x() -> String {
 async fn start_server(dir: &tempfile::TempDir) -> RunningServer {
     let users = ["ala", "ola", "ewa"]
         .iter()
-        .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x() })
+        .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x(), admin: false })
         .collect();
     let config = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -54,7 +54,13 @@ impl Client {
     }
 
     async fn hello_session(&mut self, name: &str, pw: &str, version: u16, session: u64) {
-        let msg = ClientMsg::Hello { version, username: name.into(), password: pw.into(), session };
+        let msg = ClientMsg::Hello {
+            version,
+            username: name.into(),
+            password: pw.into(),
+            session,
+            room: RoomChoice::Default,
+        };
         self.send.write_all(&encode_frame(&msg)).await.unwrap();
     }
 
@@ -89,7 +95,10 @@ impl Client {
             None => c.hello(name, "x", PROTOCOL_VERSION).await,
         }
         match c.next_msg().await {
-            Some(ServerMsg::Welcome { you, members }) => (c, you, members),
+            // Everyone lands in the default room; return the others, as before rooms existed.
+            Some(ServerMsg::Welcome { you, members, .. }) => {
+                (c, you, members.into_iter().filter(|m| m.id != you).collect())
+            }
             other => panic!("expected Welcome, got {other:?}"),
         }
     }
@@ -126,10 +135,10 @@ async fn welcome_and_member_events() {
     let (mut ala, ala_id, members) = Client::login(&srv, "ala").await;
     assert!(members.is_empty());
     let (ola, ola_id, members) = Client::login(&srv, "ola").await;
-    assert_eq!(members, [MemberInfo { id: ala_id, name: "ala".into() }]);
+    assert_eq!(members, [MemberInfo { id: ala_id, name: "ala".into(), room: Some(1) }]);
     assert_eq!(
         ala.next_msg().await,
-        Some(ServerMsg::MemberJoined(MemberInfo { id: ola_id, name: "ola".into() }))
+        Some(ServerMsg::MemberJoined(MemberInfo { id: ola_id, name: "ola".into(), room: Some(1) }))
     );
     ola.conn.close(VarInt::from_u32(0), b"bye");
     assert_eq!(ala.next_msg().await, Some(ServerMsg::MemberLeft { id: ola_id }));
@@ -223,7 +232,7 @@ async fn second_login_replaces_first() {
     assert_eq!(members.len(), 1, "only ola remains besides the new session");
     assert_eq!(
         first.next_msg().await,
-        Some(ServerMsg::MemberJoined(MemberInfo { id: ola_id, name: "ola".into() }))
+        Some(ServerMsg::MemberJoined(MemberInfo { id: ola_id, name: "ola".into(), room: Some(1) }))
     );
     assert_eq!(first.next_msg().await, Some(ServerMsg::SessionReplaced));
     let err = timeout(Duration::from_secs(5), first.conn.closed()).await.unwrap();
@@ -231,7 +240,7 @@ async fn second_login_replaces_first() {
     assert_eq!(watcher.next_msg().await, Some(ServerMsg::MemberLeft { id: first_id }));
     assert_eq!(
         watcher.next_msg().await,
-        Some(ServerMsg::MemberJoined(MemberInfo { id: second_id, name: "ala".into() }))
+        Some(ServerMsg::MemberJoined(MemberInfo { id: second_id, name: "ala".into(), room: Some(1) }))
     );
 }
 

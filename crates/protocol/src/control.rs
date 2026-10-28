@@ -8,6 +8,8 @@ pub type MemberId = u16;
 pub struct MemberInfo {
     pub id: MemberId,
     pub name: String,
+    /// `None` while the member is online but in no room.
+    pub room: Option<RoomId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -19,22 +21,46 @@ pub enum ClientMsg {
         /// Random per client run, kept across reconnects. Lets the server tell a client
         /// coming back from a network drop from one that was already replaced elsewhere.
         session: u64,
+        /// Where to land after login.
+        room: RoomChoice,
     },
-    /// Opaque key-exchange blob (e.g. a public key) for every other member.
+    /// Opaque key-exchange blob for every other member of my room.
     Announce { blob: Vec<u8> },
-    /// Opaque blob for one member.
+    /// Opaque blob for one member of my room.
     Relay { to: MemberId, blob: Vec<u8> },
+    JoinRoom { room: RoomId },
+    LeaveRoom,
+    CreateRoom { name: String },
+    DeleteRoom { room: RoomId },
+    /// Sealed chat message for my room; the server only forwards it.
+    Chat { blob: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ServerMsg {
     Welcome {
         you: MemberId,
+        room: Option<RoomId>,
+        rooms: Vec<RoomInfo>,
+        /// Everyone online, me included.
         members: Vec<MemberInfo>,
     },
+    /// Came online.
     MemberJoined(MemberInfo),
+    /// Went offline.
     MemberLeft {
         id: MemberId,
+    },
+    MemberMoved {
+        id: MemberId,
+        room: Option<RoomId>,
+    },
+    RoomCreated(RoomInfo),
+    RoomDeleted {
+        room: RoomId,
+    },
+    RoomError {
+        reason: RoomErrorReason,
     },
     Rejected {
         reason: RejectReason,
@@ -42,6 +68,7 @@ pub enum ServerMsg {
     SessionReplaced,
     Announce { from: MemberId, blob: Vec<u8> },
     Relay { from: MemberId, blob: Vec<u8> },
+    Chat { from: MemberId, blob: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

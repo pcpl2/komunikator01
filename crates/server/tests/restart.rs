@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use protocol::audio::encode_upstream;
-use protocol::{encode_frame, ClientMsg, PROTOCOL_VERSION};
+use protocol::{encode_frame, ClientMsg, RoomChoice, PROTOCOL_VERSION};
 use quinn::Endpoint;
 use tokio::time::timeout;
 
@@ -55,7 +55,7 @@ async fn killed_server_restart_ends_old_connections_quickly() {
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     let conn = endpoint.connect(addr, client_core::net::SERVER_NAME).unwrap().await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
-    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, username: "ala".into(), password: "x".into(), session: 1 };
+    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, username: "ala".into(), password: "x".into(), session: 1, room: RoomChoice::Default };
     send.write_all(&encode_frame(&hello)).await.unwrap();
 
     first.kill().unwrap();

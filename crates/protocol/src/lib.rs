@@ -12,7 +12,7 @@ pub use control::{
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Largest key-exchange blob accepted in Announce/Relay.
 pub const MAX_BLOB: usize = 1024;
 pub const ALPN: &[u8] = b"komunikator/1";
