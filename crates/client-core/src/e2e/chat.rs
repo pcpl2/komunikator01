@@ -1,9 +1,12 @@
 //! Authenticated encryption of chat messages under the sender keys used for audio.
 
+use std::collections::VecDeque;
+
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use protocol::{MemberId, RoomId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::audio::{SenderKey, TAG_LEN};
 use crate::chat::MAX_CHAT_CHARS;
@@ -13,6 +16,8 @@ pub(super) const CHAT_INFO: &[u8] = b"komunikator/chat/v1";
 const AAD_LEN: usize = CHAT_INFO.len() + 4 + 2 + 2 + 4;
 /// Epochs kept per sender: the current one plus two rotations of late messages.
 const KEPT_EPOCHS: usize = 3;
+/// Keys whose highest opened counter `ChatReplay` remembers.
+const REPLAY_KEYS: usize = 64;
 
 /// Wire form of a chat message (the `blob` of `ClientMsg::Chat`).
 #[derive(Serialize, Deserialize)]
@@ -86,11 +91,41 @@ impl ChatSealer {
     }
 }
 
+/// Fingerprint of a sender's chat key: the replay log's key.
+type KeyId = [u8; 32];
+
+/// Highest counter opened per chat key, shared by all senders.
+///
+/// Keyed by the key itself, not by member, identity or epoch: the server can recreate members
+/// and swap identities (which rebuilds openers), and a restarted app reuses epochs, but every
+/// run draws fresh random keys, so only a true replay hits an entry. At most `REPLAY_KEYS`
+/// keys, oldest first out.
+#[derive(Default)]
+pub struct ChatReplay {
+    seen: VecDeque<(KeyId, u32)>,
+}
+
+impl ChatReplay {
+    fn last(&self, id: &KeyId) -> Option<u32> {
+        self.seen.iter().find(|(k, _)| k == id).map(|&(_, c)| c)
+    }
+
+    fn mark(&mut self, id: KeyId, counter: u32) {
+        if let Some(entry) = self.seen.iter_mut().find(|(k, _)| *k == id) {
+            entry.1 = counter;
+            return;
+        }
+        if self.seen.len() == REPLAY_KEYS {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((id, counter));
+    }
+}
+
 struct Slot {
     epoch: u16,
     cipher: ChaCha20Poly1305,
-    /// Highest counter opened under this key.
-    last: Option<u32>,
+    id: KeyId,
 }
 
 /// Decrypts chat of one sender. Holds the `KEPT_EPOCHS` newest keys, so a message sealed just
@@ -99,7 +134,7 @@ struct Slot {
 /// Unlike `AudioOpener`, a key older than the newest is still accepted (and dropped if it is
 /// not among the three newest). That is safe: keys arrive only over the sender's own Noise
 /// channel, so only the sender can add them, and a known epoch's key is never replaced, so its
-/// replay state cannot be reset.
+/// replay state, kept in `ChatReplay` by key, cannot be reset.
 #[derive(Default)]
 pub struct ChatOpener {
     slots: Vec<Slot>,
@@ -111,11 +146,12 @@ impl ChatOpener {
     }
 
     pub fn add_key(&mut self, key: &SenderKey) {
-        // A peer must not swap the key of an epoch we already hold (it would reset the counter).
+        // A peer must not swap the key of an epoch we already hold.
         if self.slots.iter().any(|s| s.epoch == key.epoch) {
             return;
         }
-        self.slots.push(Slot { epoch: key.epoch, cipher: cipher(key), last: None });
+        let id = Sha256::digest(key.chat_key()).into();
+        self.slots.push(Slot { epoch: key.epoch, cipher: cipher(key), id });
         if self.slots.len() > KEPT_EPOCHS {
             // Ages relative to the newest epoch, in wrapping u16 order.
             let newest = self
@@ -129,15 +165,22 @@ impl ChatOpener {
         }
     }
 
-    /// The control stream is ordered, so per epoch only strictly increasing counters open.
-    pub fn open(&mut self, room: RoomId, sender: MemberId, blob: &[u8]) -> Result<String, ChatError> {
+    /// The control stream is ordered, so per key only strictly increasing counters open;
+    /// `replay` holds the counters (see `ChatReplay`).
+    pub fn open(
+        &mut self,
+        room: RoomId,
+        sender: MemberId,
+        blob: &[u8],
+        replay: &mut ChatReplay,
+    ) -> Result<String, ChatError> {
         let (sealed, rest) =
             postcard::take_from_bytes::<SealedChat>(blob).map_err(|_| ChatError::Malformed)?;
         if !rest.is_empty() || sealed.ct.len() < TAG_LEN {
             return Err(ChatError::Malformed);
         }
-        let slot = self.slots.iter_mut().find(|s| s.epoch == sealed.epoch).ok_or(ChatError::UnknownEpoch)?;
-        if slot.last.is_some_and(|l| sealed.counter <= l) {
+        let slot = self.slots.iter().find(|s| s.epoch == sealed.epoch).ok_or(ChatError::UnknownEpoch)?;
+        if replay.last(&slot.id).is_some_and(|l| sealed.counter <= l) {
             return Err(ChatError::Replay);
         }
         let mut pt = sealed.ct;
@@ -146,7 +189,7 @@ impl ChatOpener {
         slot.cipher
             .decrypt_in_place_detached(&nonce(sealed.counter), &aad, &mut pt, tag.as_slice().into())
             .map_err(|_| ChatError::BadTag)?;
-        slot.last = Some(sealed.counter);
+        replay.mark(slot.id, sealed.counter);
         let text = String::from_utf8(pt).map_err(|_| ChatError::NotUtf8)?;
         if text.chars().count() > MAX_CHAT_CHARS {
             return Err(ChatError::Malformed);
@@ -177,12 +220,29 @@ mod tests {
         postcard::to_allocvec(&SealedChat { epoch: k.epoch, counter, ct }).unwrap()
     }
 
-    fn opener(keys: &[&SenderKey]) -> ChatOpener {
-        let mut o = ChatOpener::new();
-        for k in keys {
-            o.add_key(k);
+    /// An opener with its own replay log.
+    #[derive(Default)]
+    struct Rx {
+        o: ChatOpener,
+        r: ChatReplay,
+    }
+
+    impl Rx {
+        fn add_key(&mut self, k: &SenderKey) {
+            self.o.add_key(k);
         }
-        o
+
+        fn open(&mut self, room: RoomId, sender: MemberId, blob: &[u8]) -> Result<String, ChatError> {
+            self.o.open(room, sender, blob, &mut self.r)
+        }
+    }
+
+    fn opener(keys: &[&SenderKey]) -> Rx {
+        let mut rx = Rx::default();
+        for k in keys {
+            rx.add_key(k);
+        }
+        rx
     }
 
     #[test]
@@ -274,5 +334,26 @@ mod tests {
         assert_eq!(o.open(1, S, &trailing), Err(ChatError::Malformed));
         let short = postcard::to_allocvec(&SealedChat { epoch: k.epoch, counter: 0, ct: vec![0; TAG_LEN - 1] }).unwrap();
         assert_eq!(o.open(1, S, &short), Err(ChatError::Malformed), "ct shorter than the tag");
+    }
+
+    #[test]
+    fn replay_log_is_shared_and_bounded() {
+        let k = SenderKey::generate(1);
+        let blob = ChatSealer::new(&k).seal(1, S, "x").unwrap();
+        let mut r = ChatReplay::default();
+        let mut first = ChatOpener::new();
+        first.add_key(&k);
+        assert!(first.open(1, S, &blob, &mut r).is_ok());
+        // A fresh opener holding the same key still sees the replay.
+        let mut second = ChatOpener::new();
+        second.add_key(&k);
+        assert_eq!(second.open(1, S, &blob, &mut r), Err(ChatError::Replay));
+        for _ in 0..2 * REPLAY_KEYS {
+            let other = SenderKey::generate(1);
+            let mut o = ChatOpener::new();
+            o.add_key(&other);
+            assert!(o.open(1, S, &ChatSealer::new(&other).seal(1, S, "y").unwrap(), &mut r).is_ok());
+        }
+        assert_eq!(r.seen.len(), REPLAY_KEYS);
     }
 }

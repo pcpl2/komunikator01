@@ -11,7 +11,8 @@
 //!   key before frames use it;
 //! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and a
 //!   member's chat opener receives exactly the keys its link's audio opener does, so the rules
-//!   above hold for chat too; chat replay state outlives link rebuilds for the same identity;
+//!   above hold for chat too; chat replay state is kept per key for the whole session, so
+//!   rebuilt links, recreated members and swapped identities cannot reset it;
 //! - announces are signed for, and accepted only for, this room.
 
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use protocol::{ClientMsg, MemberId, MemberInfo, RoomId};
 
 use super::announce::{sign_announce, verify_announce, AnnounceError};
 use super::audio::{AudioOpener, AudioSealer, SenderKey};
-use super::chat::{ChatError, ChatOpener, ChatSealer};
+use super::chat::{ChatError, ChatOpener, ChatReplay, ChatSealer};
 use super::identity::{Identity, IdentityPublic};
 use super::pair::{Inner, PairChannel, PairError};
 use super::trust::{safety_code, KnownDevices, Trust};
@@ -73,11 +74,12 @@ struct Peer {
     identity: Option<IdentityPublic>,
     /// Present only while the member is eligible (verified, not `KeyChanged`).
     link: Option<Link>,
-    /// Chat keys and replay state of `chat_identity`. Kept on the peer, not the link: a link
-    /// rebuilt for the same identity (which the server can force) must not forget which
-    /// messages already opened. Fed only from this member's own channel, beside `Link::opener`.
+    /// Chat keys of `chat_identity`, fed only from this member's own channel, beside
+    /// `Link::opener`. Replay state lives in `E2e::chat_replay`, so neither a rebuilt link nor
+    /// a recreated peer resets it.
     chat: ChatOpener,
-    /// Identity whose keys `chat` holds; a different identity starts from an empty opener.
+    /// Identity whose keys `chat` holds; a different identity starts from an empty opener, so
+    /// its keys are not shadowed by another device's key of the same epoch.
     chat_identity: Option<IdentityPublic>,
 }
 
@@ -106,6 +108,8 @@ pub struct E2e {
     sealer: AudioSealer,
     /// Always built from the same key as `sealer`.
     chat: ChatSealer,
+    /// Highest opened chat counter per sender key, for every member.
+    chat_replay: ChatReplay,
     pending: Option<Pending>,
     /// Latest time seen from the caller, for `trust_changed` (which takes none).
     clock: Instant,
@@ -199,6 +203,7 @@ impl E2e {
             peers,
             sealer: AudioSealer::new(me, &current),
             chat: ChatSealer::new(&current),
+            chat_replay: ChatReplay::default(),
             current,
             pending: None,
             clock: now,
@@ -482,7 +487,7 @@ impl E2e {
 
     pub fn open_chat(&mut self, from: MemberId, blob: &[u8]) -> Result<String, ChatError> {
         match self.peers.get_mut(&from) {
-            Some(peer) if peer.link.is_some() => peer.chat.open(self.room, from, blob),
+            Some(peer) if peer.link.is_some() => peer.chat.open(self.room, from, blob, &mut self.chat_replay),
             _ => Err(ChatError::NoKey),
         }
     }
@@ -661,6 +666,20 @@ mod tests {
             let c = Client { e2e, identity, trust, _dir: dir, name, inbox, events: Vec::new(), seq: 0 };
             self.clients.insert(id, c);
             self.route(id, out);
+        }
+
+        /// Puts the device parked in `gone` under `id` back in place of the current one.
+        fn swap_device(&mut self, id: MemberId) {
+            let parked = self.gone.remove(&id).unwrap();
+            let current = self.clients.insert(id, parked).unwrap();
+            self.gone.insert(id, current);
+        }
+
+        /// `(initiator, responder)` of the pair: only the initiator's new link sends `Hello1`, so a
+        /// link rebuilt there re-pairs without the other side rotating its key.
+        fn roles(&mut self, x: MemberId, y: MemberId) -> (MemberId, MemberId) {
+            let (px, py) = (self.client(x).identity.public(), self.client(y).identity.public());
+            if px.sign < py.sign { (x, y) } else { (y, x) }
         }
 
         fn leave(&mut self, id: MemberId) {
@@ -1392,7 +1411,7 @@ mod tests {
     #[test]
     fn chat_replay_survives_link_rebuild() {
         let (mut net, ids) = room(&["a", "b"]);
-        let (a, b) = (ids[0], ids[1]);
+        let (b, a) = net.roles(ids[0], ids[1]);
         let old = chat(&mut net, a, "stary");
         assert!(read(&mut net, b, a, &old).is_ok());
         // The server breaks b's link to a with junk, then restores it with a's genuine announce.
@@ -1421,5 +1440,69 @@ mod tests {
         let new = chat(&mut net, b, "nowe urządzenie");
         assert_eq!(read(&mut net, a, b, &new).as_deref(), Ok("nowe urządzenie"));
         assert!(read(&mut net, a, b, &old).is_err(), "the old device's keys are gone");
+    }
+
+    #[test]
+    fn chat_replay_survives_member_recreated() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = net.roles(ids[0], ids[1]);
+        let old = chat(&mut net, b, "stary");
+        assert!(read(&mut net, a, b, &old).is_ok());
+        let b_ann = net.announces[&b].clone();
+        // The server pretends b left and came back under the same id: a builds a fresh Peer.
+        net.inject(a, ServerMsg::MemberLeft { id: b });
+        let name = net.client(b).name.clone();
+        net.inject(a, ServerMsg::MemberJoined(MemberInfo { id: b, name, room: Some(1) }));
+        net.deliver();
+        net.inject(a, ServerMsg::Announce { from: b, blob: b_ann });
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        assert_eq!(read(&mut net, a, b, &old), Err(ChatError::Replay));
+        let fresh = chat(&mut net, b, "nowy");
+        assert_eq!(read(&mut net, a, b, &fresh).as_deref(), Ok("nowy"), "the link came back");
+    }
+
+    #[test]
+    fn chat_replay_survives_identity_flip() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = net.roles(ids[0], ids[1]);
+        let old = chat(&mut net, b, "stary");
+        assert!(read(&mut net, a, b, &old).is_ok());
+        let b1_ann = net.announces[&b].clone();
+        // X1 -> X2: the server hands b's id to its own device.
+        net.hijack(b);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        // X2 -> X1: the original device is back under the same id.
+        net.swap_device(b);
+        net.announces.insert(b, b1_ann.clone());
+        net.inject(a, ServerMsg::Announce { from: b, blob: b1_ann });
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        assert_eq!(read(&mut net, a, b, &old), Err(ChatError::Replay));
+        let fresh = chat(&mut net, b, "nowy");
+        assert_eq!(read(&mut net, a, b, &fresh).as_deref(), Ok("nowy"), "X1 is paired again");
+    }
+
+    #[test]
+    fn restarted_sender_with_new_key_is_not_replay() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let old = chat(&mut net, b, "przed restartem");
+        assert!(read(&mut net, a, b, &old).is_ok());
+        // b restarts the app: same identity, epochs and counters start over with a fresh key.
+        net.leave(b);
+        net.deliver();
+        let gone = net.gone.remove(&b).unwrap();
+        let b2 = net.join_with("b", gone.identity, gone.trust, gone._dir, 0);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        let new = chat(&mut net, b2, "po restarcie");
+        assert_eq!(super::super::chat::blob_epoch(&new), super::super::chat::blob_epoch(&old));
+        assert_eq!(read(&mut net, a, b2, &new).as_deref(), Ok("po restarcie"));
     }
 }
