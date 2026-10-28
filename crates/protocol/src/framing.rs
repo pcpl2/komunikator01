@@ -51,6 +51,15 @@ impl FrameDecoder {
         self.buf.drain(..4 + len);
         Ok(Some(msg))
     }
+
+    /// The body of the complete frame at the front, e.g. one `next` just failed to decode.
+    pub fn front_body(&self) -> Option<&[u8]> {
+        let len = u32::from_le_bytes(self.buf.get(..4)?.try_into().unwrap()) as usize;
+        if len > MAX_FRAME {
+            return None;
+        }
+        self.buf.get(4..4 + len)
+    }
 }
 
 #[cfg(test)]

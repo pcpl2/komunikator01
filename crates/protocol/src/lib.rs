@@ -5,7 +5,7 @@ pub mod control;
 pub mod framing;
 
 pub use control::{
-    normalize_room_name, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
+    hello_version, normalize_room_name, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
     RoomErrorReason, RoomId, RoomInfo, ServerMsg, DEFAULT_ROOM_NAME, MAX_CHAT_BLOB, MAX_ROOMS,
     MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS,
 };
@@ -40,6 +40,37 @@ pub fn parse_fingerprint(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_and_rejected_keep_their_wire_index() {
+        let hello = ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+            username: "ala".into(),
+            password: "x".into(),
+            session: 1,
+            room: RoomChoice::Default,
+        };
+        assert_eq!(encode_frame(&hello)[4], 0);
+        let rejected = ServerMsg::Rejected { reason: RejectReason::BadCredentials };
+        assert_eq!(encode_frame(&rejected)[4], 3);
+    }
+
+    #[test]
+    fn hello_version_reads_any_hello_prefix() {
+        #[derive(serde::Serialize)]
+        enum V2 {
+            Hello { version: u16, username: String, password: String, session: u64 },
+        }
+        let v2 = V2::Hello { version: 2, username: "ala".into(), password: "x".into(), session: 1 };
+        let frame = encode_frame(&v2);
+        assert_eq!(hello_version(&frame[4..]), Some(2));
+        let announce = encode_frame(&ClientMsg::Announce { blob: vec![1] });
+        assert_eq!(hello_version(&announce[4..]), None);
+        let mut dec = FrameDecoder::new();
+        dec.push(&frame);
+        assert!(dec.next::<ClientMsg>().is_err());
+        assert_eq!(dec.front_body(), Some(&frame[4..]));
+    }
 
     #[test]
     fn normalize_room_name_rules() {

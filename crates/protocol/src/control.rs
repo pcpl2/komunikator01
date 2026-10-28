@@ -12,6 +12,10 @@ pub struct MemberInfo {
     pub room: Option<RoomId>,
 }
 
+// Variant order of `ClientMsg`, `ServerMsg` and `RejectReason` is wire format (postcard
+// encodes the index): append new variants only, so old and new peers still agree on
+// `Hello` and `Rejected` and can negotiate the version.
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ClientMsg {
     Hello {
@@ -51,6 +55,13 @@ pub enum ServerMsg {
     MemberLeft {
         id: MemberId,
     },
+    /// Index 3 in every version, so any client can read a `VersionMismatch`.
+    Rejected {
+        reason: RejectReason,
+    },
+    SessionReplaced,
+    Announce { from: MemberId, blob: Vec<u8> },
+    Relay { from: MemberId, blob: Vec<u8> },
     MemberMoved {
         id: MemberId,
         room: Option<RoomId>,
@@ -62,13 +73,16 @@ pub enum ServerMsg {
     RoomError {
         reason: RoomErrorReason,
     },
-    Rejected {
-        reason: RejectReason,
-    },
-    SessionReplaced,
-    Announce { from: MemberId, blob: Vec<u8> },
-    Relay { from: MemberId, blob: Vec<u8> },
     Chat { from: MemberId, blob: Vec<u8> },
+}
+
+/// The `version` of a frame body that starts like a `ClientMsg::Hello` of any protocol
+/// version (variant 0, then the u16 version), even if the rest no longer decodes.
+pub fn hello_version(body: &[u8]) -> Option<u16> {
+    match postcard::take_from_bytes::<(u32, u16)>(body) {
+        Ok(((0, version), _)) => Some(version),
+        _ => None,
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

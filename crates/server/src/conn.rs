@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use protocol::audio::{upstream_to_downstream, MAX_DATAGRAM};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    encode_frame, hello_version, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
     RoomErrorReason, RoomId, ServerMsg, MAX_BLOB, MAX_CHAT_BLOB, PROTOCOL_VERSION,
 };
 use quinn::{Connection, RecvStream, SendStream, VarInt};
@@ -113,7 +113,14 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     let hello = match timeout(HELLO_TIMEOUT, read_msg::<ClientMsg>(&mut recv, &mut dec)).await {
         Ok(Ok(Some(m))) => m,
         Ok(Err(End::Violation)) => {
-            conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
+            // A Hello of another protocol version may not decode; still tell it why.
+            match dec.front_body().and_then(hello_version) {
+                Some(v) if v != PROTOCOL_VERSION => {
+                    let reason = RejectReason::VersionMismatch { server: PROTOCOL_VERSION };
+                    send_and_close(send, &conn, ServerMsg::Rejected { reason }, 0).await;
+                }
+                _ => conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation"),
+            }
             return Ok(());
         }
         _ => return Ok(()),

@@ -1,5 +1,6 @@
 //! A server session that reconnects on its own until told to stop or a fatal error.
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -234,7 +235,7 @@ impl Task {
             conn.close(VarInt::from_u32(0), b"");
             return Outcome::Retry;
         };
-        let (e2e, first, room) = match reply {
+        let (e2e, first, room, reported) = match reply {
             Some(ServerMsg::Welcome { you, room, members, .. }) => {
                 // Only the others in my room share keys with me; in no room, nobody does.
                 let members: Vec<MemberInfo> = members
@@ -257,8 +258,9 @@ impl Task {
                     Instant::now(),
                     now_ms(),
                 );
+                let reported = members.iter().map(|m| m.id).collect();
                 self.emit(SessionEvent::Connected { you, members });
-                (e2e, first, room)
+                (e2e, first, room, reported)
             }
             Some(ServerMsg::Rejected { reason }) => {
                 return match reason {
@@ -272,7 +274,7 @@ impl Task {
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),
             _ => return closed_outcome(&conn),
         };
-        let mut link = Link::new(&conn, &mut send, e2e, room);
+        let mut link = Link::new(&conn, &mut send, e2e, room, reported);
         let outcome = match link.output(first, &self.events) {
             Ok(()) => self.connected_loop(&mut link, &mut recv, &mut dec).await,
             Err(o) => o,
@@ -325,10 +327,11 @@ impl Task {
                             if link.room.is_some() && m.room == link.room =>
                         {
                             let out = link.e2e.member_joined(&m, now);
+                            link.reported.insert(m.id);
                             self.emit(SessionEvent::MemberJoined(m));
                             out
                         }
-                        Some(ServerMsg::MemberLeft { id }) => {
+                        Some(ServerMsg::MemberLeft { id }) if link.reported.remove(&id) => {
                             self.emit(SessionEvent::MemberLeft(id));
                             link.e2e.member_left(id, now)
                         }
@@ -417,6 +420,8 @@ struct Link<'a> {
     e2e: E2e,
     /// My room as of the `Welcome`; only its members take part in E2E.
     room: Option<RoomId>,
+    /// Members reported in `Connected`/`MemberJoined`; only their departures are reported.
+    reported: HashSet<MemberId>,
     /// Encoded control messages not yet written; `ctrl_out[ctrl_sent..]` is pending. Written
     /// from the main loop so a server that stops reading cannot block audio or shutdown.
     ctrl_out: Vec<u8>,
@@ -426,12 +431,19 @@ struct Link<'a> {
 }
 
 impl<'a> Link<'a> {
-    fn new(conn: &'a Connection, send: &'a mut SendStream, e2e: E2e, room: Option<RoomId>) -> Self {
+    fn new(
+        conn: &'a Connection,
+        send: &'a mut SendStream,
+        e2e: E2e,
+        room: Option<RoomId>,
+        reported: HashSet<MemberId>,
+    ) -> Self {
         Self {
             conn,
             send,
             e2e,
             room,
+            reported,
             ctrl_out: Vec::new(),
             ctrl_sent: 0,
             ctrl_deadline: Instant::now(),

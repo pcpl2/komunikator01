@@ -189,6 +189,24 @@ async fn version_mismatch_rejected() {
 }
 
 #[tokio::test]
+async fn v2_hello_gets_version_mismatch() {
+    /// The v2 `ClientMsg::Hello`, without `room`.
+    #[derive(serde::Serialize)]
+    enum V2ClientMsg {
+        Hello { version: u16, username: String, password: String, session: u64 },
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+    let hello = V2ClientMsg::Hello { version: 2, username: "ala".into(), password: "x".into(), session: 1 };
+    c.send.write_all(&encode_frame(&hello)).await.unwrap();
+    assert_eq!(
+        c.next_msg().await,
+        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: 3 } })
+    );
+}
+
+#[tokio::test]
 async fn sixth_attempt_is_rate_limited() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;
