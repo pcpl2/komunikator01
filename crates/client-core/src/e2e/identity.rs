@@ -1,3 +1,4 @@
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
@@ -65,9 +66,14 @@ impl Identity {
         }
         let sign = SigningKey::from_bytes(b[1..33].try_into().ok()?);
         let dh_secret: [u8; 32] = b[33..65].try_into().ok()?;
+        let dh: [u8; 32] = b[65..97].try_into().ok()?;
+        // The stored public must match the secret, or Noise KK handshakes fail silently.
+        if MontgomeryPoint::mul_base_clamped(dh_secret).to_bytes() != dh {
+            return None;
+        }
         let public = IdentityPublic {
             sign: sign.verifying_key().to_bytes(),
-            dh: b[65..97].try_into().ok()?,
+            dh,
             device: b[97..113].try_into().ok()?,
         };
         Some(Identity { sign, dh_secret, public })
@@ -99,6 +105,14 @@ mod tests {
         let mut bad = id.to_bytes();
         bad[0] = 2;
         assert!(Identity::from_bytes(&bad).is_none());
+    }
+
+    #[test]
+    fn from_bytes_rejects_mismatched_dh_public() {
+        let id = Identity::generate();
+        let mut b = id.to_bytes();
+        b[65] ^= 1;
+        assert!(Identity::from_bytes(&b).is_none());
     }
 
     #[test]

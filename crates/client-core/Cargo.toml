@@ -19,6 +19,7 @@ postcard.workspace = true
 ed25519-dalek.workspace = true
 snow.workspace = true
 getrandom.workspace = true
+curve25519-dalek.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
