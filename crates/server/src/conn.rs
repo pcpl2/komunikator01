@@ -42,6 +42,7 @@ pub(crate) struct Shared {
     pub(crate) limiter: Mutex<LoginLimiter>,
     /// Username → Argon2id hash.
     pub(crate) users: HashMap<String, String>,
+    pub(crate) verify_slots: tokio::sync::Semaphore,
 }
 
 /// Simple token bucket limiting audio datagrams per connection.
@@ -129,24 +130,33 @@ async fn check_login(
     username: &str,
     password: String,
 ) -> Option<RejectReason> {
-    if shared.limiter.lock().unwrap().is_blocked(ip, Instant::now()) {
-        return Some(RejectReason::RateLimited);
-    }
     if version != PROTOCOL_VERSION {
         return Some(RejectReason::VersionMismatch { server: PROTOCOL_VERSION });
+    }
+    {
+        // Count the attempt before verifying, so parallel guesses cannot all slip through.
+        let mut limiter = shared.limiter.lock().unwrap();
+        if limiter.is_blocked(ip, Instant::now()) {
+            return Some(RejectReason::RateLimited);
+        }
+        limiter.record_failure(ip, Instant::now());
     }
     // Unknown users are checked against a dummy hash so timing does not reveal account names.
     let (hash, known) = match shared.users.get(username) {
         Some(h) => (h.clone(), true),
         None => (dummy_hash().to_owned(), false),
     };
-    let ok = tokio::task::spawn_blocking(move || verify_password(&hash, &password))
-        .await
-        .unwrap_or(false);
+    // Each Argon2 check takes ~19 MiB; bound how many run at once.
+    let ok = match shared.verify_slots.acquire().await {
+        Ok(_permit) => tokio::task::spawn_blocking(move || verify_password(&hash, &password))
+            .await
+            .unwrap_or(false),
+        Err(_) => false,
+    };
     if ok && known {
+        shared.limiter.lock().unwrap().forgive(ip);
         None
     } else {
-        shared.limiter.lock().unwrap().record_failure(ip, Instant::now());
         Some(RejectReason::BadCredentials)
     }
 }

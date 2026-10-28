@@ -44,6 +44,16 @@ impl LoginLimiter {
         self.failures.entry(ip).or_default().push(now);
     }
 
+    /// Withdraws the most recent failure, used once a pre-counted attempt succeeds.
+    pub fn forgive(&mut self, ip: IpAddr) {
+        if let Some(f) = self.failures.get_mut(&ip) {
+            f.pop();
+            if f.is_empty() {
+                self.failures.remove(&ip);
+            }
+        }
+    }
+
     fn prune(&mut self, ip: IpAddr, now: Instant) {
         let window = self.window;
         if let Some(f) = self.failures.get_mut(&ip) {

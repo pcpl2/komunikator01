@@ -168,6 +168,26 @@ async fn sixth_attempt_is_rate_limited() {
 }
 
 #[tokio::test]
+async fn parallel_guesses_are_rate_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let mut clients = Vec::new();
+    for _ in 0..20 {
+        clients.push(Client::connect(srv.local_addr(), srv.fingerprint()).await);
+    }
+    for c in clients.iter_mut() {
+        c.hello("ala", "zle", PROTOCOL_VERSION).await;
+    }
+    let mut bad_credentials = 0;
+    for c in clients.iter_mut() {
+        if c.next_msg().await == Some(ServerMsg::Rejected { reason: RejectReason::BadCredentials }) {
+            bad_credentials += 1;
+        }
+    }
+    assert!(bad_credentials <= 5, "{bad_credentials} guesses were checked");
+}
+
+#[tokio::test]
 async fn second_login_replaces_first() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;

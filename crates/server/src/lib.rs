@@ -19,6 +19,7 @@ pub use conn::TokenBucket;
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const BIND_RETRIES: u32 = 30;
+const CONCURRENT_PASSWORD_CHECKS: usize = 4;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct RunningServer {
@@ -51,6 +52,7 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
         room: Mutex::new(room::Room::new()),
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
         users: config.users.into_iter().map(|u| (u.name, u.password_hash)).collect(),
+        verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
     });
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
