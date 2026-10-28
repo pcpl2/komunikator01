@@ -45,3 +45,8 @@ impl IncomingFrame {
         &self.data[..self.len as usize]
     }
 }
+
+pub const SAMPLE_RATE: u32 = 48_000;
+/// 20 ms at 48 kHz.
+pub const FRAME_SAMPLES: usize = 960;
+pub type Pcm = [f32; FRAME_SAMPLES];
