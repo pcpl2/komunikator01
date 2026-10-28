@@ -311,6 +311,14 @@ impl AppState {
         self.finish();
     }
 
+    /// The session could not even start (e.g. the account was changed and the new client
+    /// failed); shown like a fatal session error until the next `reset_session`.
+    pub fn session_failed(&mut self, reason: String) {
+        self.reset_session();
+        self.set_status(Status::Fatal(reason));
+        self.finish();
+    }
+
     pub fn view(&self) -> &View {
         &self.view
     }
@@ -390,7 +398,9 @@ impl AppState {
             return None;
         };
         // Typing the group forces a look at the code instead of a reflexive click.
-        if info.code.split(' ').next() != Some(group.trim()) {
+        let group = group.trim();
+        let well_formed = group.len() == 4 && group.bytes().all(|b| b.is_ascii_digit());
+        if !well_formed || info.code.split(' ').next() != Some(group) {
             self.set_notice(Some(WRONG_GROUP.to_owned()));
             return None;
         }
@@ -800,6 +810,22 @@ mod tests {
     }
 
     #[test]
+    fn group_must_be_four_digits_even_if_the_code_is_odd() {
+        let mut s = online();
+        for (code, group) in [("", ""), (" 1111", ""), ("abcd 1111", "abcd"), ("12 34", "12")] {
+            s.on_event(SessionEvent::E2e(E2eEvent::Member {
+                id: 2,
+                name: "ola".into(),
+                identity: ID,
+                trust: Trust::Known,
+                code: code.into(),
+            }));
+            assert_eq!(s.on_action(Action::VerifyMember { id: 2, group: group.into() }), vec![], "{code:?}");
+            assert_eq!(s.view().notice.as_deref(), Some(WRONG_GROUP));
+        }
+    }
+
+    #[test]
     fn accept_only_when_key_changed() {
         let mut s = online();
         s.on_event(e2e(2, "ola", Trust::Known));
@@ -886,6 +912,16 @@ mod tests {
         s.on_event(SessionEvent::RoomError(RoomErrorReason::NameTaken));
         let later = RoomInfo { id: 15, ..mine };
         assert_eq!(s.on_event(SessionEvent::RoomCreated(later)), vec![]);
+    }
+
+    #[test]
+    fn session_that_could_not_start_is_fatal() {
+        let mut s = online();
+        s.session_failed("nie udało się połączyć: brak sieci".into());
+        assert_eq!(s.view().status, Status::Fatal("nie udało się połączyć: brak sieci".into()));
+        assert!(s.view().rooms.is_empty());
+        s.reset_session();
+        assert_eq!(s.view().status, Status::Connecting);
     }
 
     #[test]

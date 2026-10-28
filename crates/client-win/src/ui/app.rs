@@ -44,7 +44,13 @@ pub fn run(opts: Options) -> i32 {
     }
     let mut settings = settings;
     if let Some(b) = broken.filter(|_| !opts.smoke) {
-        let text = format!("Plik ustawień był uszkodzony i został odłożony jako {}.", b.display());
+        let text = match b {
+            Ok(p) => format!("Plik ustawień był uszkodzony i został odłożony jako {}.", p.display()),
+            Err(why) => format!(
+                "Plik ustawień był uszkodzony i nie udało się go odłożyć ({why}).\n\
+                 Zostanie zastąpiony ustawieniami domyślnymi."
+            ),
+        };
         message_box(None, &text, MB_ICONWARNING);
     }
     if account(&settings).is_none() {

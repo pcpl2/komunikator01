@@ -114,6 +114,15 @@ mod tests {
     }
 
     #[test]
+    fn nan_sensitivity_still_opens_on_speech() {
+        let mut v = Vad::new(f32::NAN);
+        assert!(v.process(&sine(300.0, SPEECH_AMP, 0)));
+        let mut v = Vad::new(0.5);
+        v.set_sensitivity(f32::NAN);
+        assert!(v.process(&sine(300.0, SPEECH_AMP, 0)));
+    }
+
+    #[test]
     fn hangover_is_15_frames() {
         let mut v = Vad::new(0.5);
         assert!(v.process(&sine(300.0, SPEECH_AMP, 0)));

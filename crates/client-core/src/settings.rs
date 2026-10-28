@@ -81,6 +81,13 @@ impl Settings {
             && !self.username.is_empty()
             && !self.password_protected.is_empty()
     }
+
+    /// Values a hand-edited file may get wrong, brought back into range.
+    fn sanitized(mut self) -> Settings {
+        self.vad_sensitivity =
+            if self.vad_sensitivity.is_nan() { Settings::default().vad_sensitivity } else { self.vad_sensitivity.clamp(0.0, 1.0) };
+        self
+    }
 }
 
 pub struct SettingsStore {
@@ -89,12 +96,14 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     /// Loads the file. Missing means defaults. A file that cannot be read, is not UTF-8 or does
-    /// not parse is moved to `<file>.broken` (replacing an older one) and defaults are used; the
-    /// third value is where it went, so the caller can tell the user.
-    pub fn load(path: &Path) -> (SettingsStore, Settings, Option<PathBuf>) {
+    /// not parse is set aside as `<file>.broken` (replacing an older one) and defaults are used.
+    /// The third value tells the caller what to tell the user: `Some(Ok(path))` where the file
+    /// went, `Some(Err(reason))` when it could not be set aside (the next save overwrites it).
+    pub fn load(path: &Path) -> (SettingsStore, Settings, Option<Result<PathBuf, String>>) {
         let store = SettingsStore { path: path.to_path_buf() };
-        let parsed = match std::fs::read(path) {
-            Ok(bytes) => std::str::from_utf8(&bytes)
+        let read = std::fs::read(path);
+        let parsed = match &read {
+            Ok(bytes) => std::str::from_utf8(bytes)
                 .map_err(|e| e.to_string())
                 .and_then(|t| toml::from_str::<Settings>(t).map_err(|e| e.to_string()))
                 .map(Some),
@@ -102,15 +111,23 @@ impl SettingsStore {
             Err(e) => Err(e.to_string()),
         };
         match parsed {
-            Ok(s) => (store, s.unwrap_or_default(), None),
+            Ok(s) => (store, s.map(Settings::sanitized).unwrap_or_default(), None),
             Err(e) => {
                 let mut broken = path.as_os_str().to_owned();
                 broken.push(".broken");
                 let broken = PathBuf::from(broken);
-                tracing::warn!("unusable settings {}: {e}; moved to {}", path.display(), broken.display());
                 let _ = std::fs::remove_file(&broken);
-                let moved = std::fs::rename(path, &broken).is_ok().then_some(broken);
-                (store, Settings::default(), moved)
+                // Renaming fails when another program holds the file open; a copy still keeps it.
+                let set_aside = match (std::fs::rename(path, &broken), &read) {
+                    (Ok(()), _) => Ok(broken),
+                    (Err(_), Ok(bytes)) => std::fs::write(&broken, bytes).map(|()| broken).map_err(|e| e.to_string()),
+                    (Err(e), Err(_)) => Err(e.to_string()),
+                };
+                match &set_aside {
+                    Ok(p) => tracing::warn!("unusable settings {}: {e}; set aside as {}", path.display(), p.display()),
+                    Err(why) => tracing::warn!("unusable settings {}: {e}; not set aside: {why}", path.display()),
+                }
+                (store, Settings::default(), Some(set_aside))
             }
         }
     }
@@ -212,10 +229,60 @@ mod tests {
             let (_, s, broken) = SettingsStore::load(&p);
             let expected = d.path().join("settings.toml.broken");
             assert_eq!(s, Settings::default());
-            assert_eq!(broken, Some(expected.clone()));
+            assert_eq!(broken, Some(Ok(expected.clone())));
             assert_eq!(std::fs::read(&expected).unwrap(), junk);
             assert!(!p.exists());
         }
+    }
+
+    /// Rename fails (the file is open without delete sharing), so the bytes are copied instead.
+    #[cfg(windows)]
+    #[test]
+    fn broken_settings_are_copied_when_they_cannot_be_moved() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let (d, p) = path();
+        std::fs::write(&p, b"this is [not toml").unwrap();
+        let _held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&p).unwrap();
+        let (_, s, broken) = SettingsStore::load(&p);
+        let expected = d.path().join("settings.toml.broken");
+        assert_eq!(s, Settings::default());
+        assert_eq!(broken, Some(Ok(expected.clone())));
+        assert_eq!(std::fs::read(&expected).unwrap(), b"this is [not toml");
+        assert!(p.exists(), "rename should have failed, leaving the original");
+    }
+
+    #[test]
+    fn broken_settings_that_cannot_be_set_aside_report_why() {
+        let (d, p) = path();
+        std::fs::write(&p, b"this is [not toml").unwrap();
+        // A directory where the copy should go: neither rename nor write can succeed.
+        std::fs::create_dir(d.path().join("settings.toml.broken")).unwrap();
+        let (_, s, broken) = SettingsStore::load(&p);
+        assert_eq!(s, Settings::default());
+        assert!(matches!(broken, Some(Err(ref reason)) if !reason.is_empty()), "{broken:?}");
+    }
+
+    #[test]
+    fn vad_sensitivity_is_clamped_and_nan_is_default() {
+        for (text, want) in [("nan", 0.5), ("-3.0", 0.0), ("7.5", 1.0), ("0.25", 0.25), ("inf", 1.0)] {
+            let (_d, p) = path();
+            std::fs::write(&p, format!("vad_sensitivity = {text}\n")).unwrap();
+            let (_, s, broken) = SettingsStore::load(&p);
+            assert!(broken.is_none());
+            assert_eq!(s.vad_sensitivity, want, "{text}");
+        }
+    }
+
+    #[test]
+    fn save_creates_missing_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("komunikator").join("nested").join("settings.toml");
+        let (store, s, _) = SettingsStore::load(&p);
+        store.save(&s).unwrap();
+        let (_, loaded, broken) = SettingsStore::load(&p);
+        assert!(broken.is_none());
+        assert_eq!(loaded, s);
     }
 
     #[test]
