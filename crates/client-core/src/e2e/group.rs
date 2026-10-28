@@ -27,6 +27,12 @@ const SWITCH_DELAY: Duration = Duration::from_millis(500);
 /// Minimum spacing of `Hello1`s to one member (restarts and retries), so a hostile server
 /// cannot make us loop at full speed.
 const HELLO_INTERVAL: Duration = Duration::from_secs(1);
+/// A coalesced rotation may postpone the switch at most this long past its first deadline, so
+/// continuous churn cannot keep the sealer on a key that departed members hold.
+const MAX_DEFER: Duration = Duration::from_secs(1);
+/// Re-announce period: keeps the server's cached announce (replayed to newcomers) far from
+/// `ANNOUNCE_MAX_SKEW_MS`.
+const REANNOUNCE: Duration = Duration::from_secs(30 * 60);
 /// Rooms are not implemented yet; every announce is for room 0.
 const ROOM: u32 = 0;
 
@@ -40,10 +46,16 @@ pub enum E2eEvent {
 pub struct Output {
     pub send: Vec<ClientMsg>,
     pub events: Vec<E2eEvent>,
+    /// Test log of sender keys sent: (recipient, epoch).
+    #[cfg(test)]
+    pub keys_sent: Vec<(MemberId, u16)>,
 }
 
 struct Pending {
     key: SenderKey,
+    /// Deadline set by the first change of this rotation; coalescing never defers past
+    /// `first_due + MAX_DEFER`.
+    first_due: Instant,
     switch_at: Instant,
 }
 
@@ -53,6 +65,9 @@ struct Peer {
     min_epoch: u16,
     /// Identity from the member's latest announce, if it verified.
     identity: Option<IdentityPublic>,
+    /// Identity that last had a link (and so may hold my keys); a link for any other identity
+    /// first raises `min_epoch` past every key that one could have received.
+    keyed: Option<IdentityPublic>,
     /// Present only while the member is eligible (verified, not `KeyChanged`).
     link: Option<Link>,
 }
@@ -72,12 +87,16 @@ pub struct E2e {
     my_public: IdentityPublic,
     trust: Arc<Mutex<KnownDevices>>,
     me: MemberId,
+    my_name: String,
     peers: HashMap<MemberId, Peer>,
     current: SenderKey,
     sealer: AudioSealer,
     pending: Option<Pending>,
     /// Latest time seen from the caller, for `trust_changed` (which takes none).
     clock: Instant,
+    /// `(instant, unix ms)` at construction, to derive wall-clock time for re-announces.
+    base: (Instant, u64),
+    last_announce: Instant,
 }
 
 /// `e` is `min` or newer in wrapping u16 epoch order.
@@ -95,6 +114,8 @@ fn send_key(out: &mut Output, to: MemberId, link: &mut Link, min_epoch: u16, key
     }
     if let Ok(blob) = link.channel.send(&Inner::SenderKey { epoch: key.epoch, key: *key.secret() }) {
         relay(out, to, blob);
+        #[cfg(test)]
+        out.keys_sent.push((to, key.epoch));
     }
 }
 
@@ -112,6 +133,12 @@ fn hello(out: &mut Output, to: MemberId, link: &mut Link, now: Instant) {
     link.restart_due = false;
     if let Some(h1) = link.channel.start() {
         relay(out, to, h1);
+    }
+}
+
+impl Peer {
+    fn new(name: String, min_epoch: u16) -> Self {
+        Self { name, min_epoch, identity: None, keyed: None, link: None }
     }
 }
 
@@ -134,30 +161,42 @@ impl E2e {
             .iter()
             .filter(|m| m.id != me)
             .map(|m| {
-                let peer = Peer { name: m.name.clone(), min_epoch: next_epoch, identity: None, link: None };
+                let peer = Peer::new(m.name.clone(), next_epoch);
                 (m.id, peer)
             })
             .collect();
         let out = Output {
             send: vec![ClientMsg::Announce { blob: sign_announce(&identity, &my_name, ROOM, now_ms) }],
-            events: Vec::new(),
+            ..Output::default()
         };
         let e2e = Self {
             my_public: identity.public(),
             identity,
             trust,
             me,
+            my_name,
             peers,
             sealer: AudioSealer::new(me, &current),
             current,
             pending: None,
             clock: now,
+            base: (now, now_ms),
+            last_announce: now,
         };
         (e2e, out)
     }
 
     fn observe(&mut self, now: Instant) {
         self.clock = self.clock.max(now);
+    }
+
+    /// Broadcasts a freshly signed announce (wall clock derived from the construction base).
+    fn announce_self(&mut self, now: Instant, out: &mut Output) {
+        let (base, base_ms) = self.base;
+        let now_ms = base_ms.saturating_add(now.saturating_duration_since(base).as_millis() as u64);
+        let blob = sign_announce(&self.identity, &self.my_name, ROOM, now_ms);
+        out.send.push(ClientMsg::Announce { blob });
+        self.last_announce = now;
     }
 
     fn trust_store(&self) -> MutexGuard<'_, KnownDevices> {
@@ -178,7 +217,26 @@ impl E2e {
                 send_key(out, id, link, peer.min_epoch, &key);
             }
         }
-        self.pending = Some(Pending { key, switch_at: now + SWITCH_DELAY });
+        let fresh = now + SWITCH_DELAY;
+        let (first_due, switch_at) = match &self.pending {
+            Some(p) => (p.first_due, fresh.min(p.first_due + MAX_DEFER)),
+            None => (fresh, fresh),
+        };
+        self.pending = Some(Pending { key, first_due, switch_at });
+    }
+
+    /// Rotates and raises `id`'s floor to the new key: called when an identity that may hold my
+    /// keys stops being the one I talk to, so whoever comes next gets only keys made after.
+    fn reset_floor(&mut self, id: MemberId, now: Instant, out: &mut Output) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.link = None;
+            peer.keyed = None;
+        }
+        self.rotate(now, out);
+        let newest = self.newest_epoch();
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.min_epoch = newest;
+        }
     }
 
     fn member_event(&self, id: MemberId, trust: Trust) -> Option<E2eEvent> {
@@ -194,8 +252,13 @@ impl E2e {
 
     /// Creates the pairwise channel to an eligible member; the initiator sends `Hello1`.
     fn open_link(&mut self, id: MemberId, now: Instant, out: &mut Output) {
-        let Some(peer) = self.peers.get_mut(&id) else { return };
+        let Some(peer) = self.peers.get(&id) else { return };
         let Some(their) = peer.identity else { return };
+        if peer.keyed.is_some_and(|k| k != their) {
+            self.reset_floor(id, now, out);
+        }
+        let Some(peer) = self.peers.get_mut(&id) else { return };
+        peer.keyed = Some(their);
         let mut link = Link {
             channel: PairChannel::new(&self.identity, &their),
             opener: AudioOpener::new(id),
@@ -215,8 +278,9 @@ impl E2e {
         }
         // Rotate first: the newcomer's floor is the fresh key, never one it could have recorded.
         self.rotate(now, &mut out);
-        let peer = Peer { name: m.name.clone(), min_epoch: self.newest_epoch(), identity: None, link: None };
-        self.peers.insert(m.id, peer);
+        self.peers.insert(m.id, Peer::new(m.name.clone(), self.newest_epoch()));
+        // The server replays cached announces to the newcomer; make sure mine is fresh.
+        self.announce_self(now, &mut out);
         out
     }
 
@@ -248,8 +312,9 @@ impl E2e {
                 let had_identity = peer.identity.take().is_some();
                 out.events.push(E2eEvent::Rejected { id: from, reason });
                 if had_identity {
-                    // It may hold my current key; keep future audio from it.
-                    self.rotate(now, &mut out);
+                    // It may hold my current key: keep future audio from it, and from whatever
+                    // identity this member presents next.
+                    self.reset_floor(from, now, &mut out);
                 }
                 return out;
             }
@@ -266,11 +331,7 @@ impl E2e {
         }
         if changed {
             // A different device now speaks for this member: it gets only keys from now on.
-            self.rotate(now, &mut out);
-            let newest = self.newest_epoch();
-            if let Some(peer) = self.peers.get_mut(&from) {
-                peer.min_epoch = newest;
-            }
+            self.reset_floor(from, now, &mut out);
         }
         out.events.extend(self.member_event(from, trust));
         if trust != Trust::KeyChanged {
@@ -322,10 +383,8 @@ impl E2e {
         out.events.extend(self.member_event(id, trust));
         let has_link = self.peers.get(&id).is_some_and(|p| p.link.is_some());
         if trust == Trust::KeyChanged {
-            if let Some(peer) = self.peers.get_mut(&id) {
-                if peer.link.take().is_some() {
-                    self.rotate(self.clock, &mut out);
-                }
+            if has_link {
+                self.reset_floor(id, self.clock, &mut out);
             }
         } else if !has_link {
             self.open_link(id, self.clock, &mut out);
@@ -342,6 +401,9 @@ impl E2e {
                 self.sealer = AudioSealer::new(self.me, &p.key);
                 self.current = p.key;
             }
+        }
+        if now.saturating_duration_since(self.last_announce) >= REANNOUNCE {
+            self.announce_self(now, &mut out);
         }
         for (&id, peer) in &mut self.peers {
             if let Some(link) = peer.link.as_mut() {
@@ -371,6 +433,11 @@ impl E2e {
             Some(link) => link.opener.open(epoch, seq, ct, now, out),
             None => false,
         }
+    }
+
+    #[cfg(test)]
+    fn current_key(&self) -> &SenderKey {
+        &self.current
     }
 
     /// First epoch for the next connection, so keys never repeat an epoch across reconnects.
@@ -416,6 +483,8 @@ mod tests {
         gone: BTreeMap<MemberId, Client>,
         announces: BTreeMap<MemberId, Vec<u8>>,
         relays: Vec<(MemberId, MemberId, Vec<u8>)>,
+        /// (from, to, epoch) of every sender key sent.
+        keys: Vec<(MemberId, MemberId, u16)>,
     }
 
     fn store() -> (Arc<tempfile::TempDir>, Arc<Mutex<KnownDevices>>) {
@@ -434,6 +503,7 @@ mod tests {
                 gone: BTreeMap::new(),
                 announces: BTreeMap::new(),
                 relays: Vec::new(),
+                keys: Vec::new(),
             }
         }
 
@@ -495,6 +565,28 @@ mod tests {
             id
         }
 
+        /// The server hands member `id` (same id and name) to a brand-new device.
+        fn hijack(&mut self, id: MemberId) {
+            let old = self.clients.remove(&id).unwrap();
+            self.announces.remove(&id);
+            let members: Vec<_> =
+                self.clients.iter().map(|(&cid, c)| MemberInfo { id: cid, name: c.name.clone() }).collect();
+            let (dir, trust) = store();
+            let identity = Arc::new(Identity::generate());
+            let (e2e, out) =
+                E2e::new(identity.clone(), trust.clone(), id, old.name.clone(), &members, 0, self.now, self.now_ms);
+            let inbox = self
+                .announces
+                .iter()
+                .map(|(&from, blob)| ServerMsg::Announce { from, blob: blob.clone() })
+                .collect();
+            let name = old.name.clone();
+            self.gone.insert(id, old);
+            let c = Client { e2e, identity, trust, _dir: dir, name, inbox, events: Vec::new(), seq: 0 };
+            self.clients.insert(id, c);
+            self.route(id, out);
+        }
+
         fn leave(&mut self, id: MemberId) {
             let c = self.clients.remove(&id).unwrap();
             self.gone.insert(id, c);
@@ -505,6 +597,7 @@ mod tests {
         }
 
         fn route(&mut self, from: MemberId, out: Output) {
+            self.keys.extend(out.keys_sent.iter().map(|&(to, e)| (from, to, e)));
             if let Some(c) = self.clients.get_mut(&from) {
                 c.events.extend(out.events);
             }
@@ -668,12 +761,123 @@ mod tests {
         let (mut net, ids) = room(&["a", "b", "c"]);
         let (a, b, c) = (ids[0], ids[1], ids[2]);
         assert!(net.all_hear());
+        let start = net.relays.len();
         net.leave(c);
         net.deliver();
         net.tick(600);
+        assert!(!net.relays[start..].iter().any(|r| r.0 == a && r.1 == c));
         let f = net.frame(a);
         assert!(!net.opens(c, a, &f));
         assert!(net.opens(b, a, &f));
+    }
+
+    #[test]
+    fn leaving_within_window_gets_no_newer_key() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let c = net.join("c");
+        net.deliver();
+        net.tick(100);
+        assert!(net.keys.iter().any(|k| k.0 == a && k.1 == c), "c got the join key");
+        let start = net.relays.len();
+        net.leave(c);
+        net.deliver();
+        net.tick(600);
+        assert!(!net.relays[start..].iter().any(|r| r.0 == a && r.1 == c));
+        let f = net.frame(a);
+        assert!(!net.opens(c, a, &f));
+        assert!(net.opens(b, a, &f));
+    }
+
+    #[test]
+    fn rejoin_within_window_cannot_open_earlier_frames() {
+        let (mut net, ids) = room(&["a", "b", "c"]);
+        let (a, c) = (ids[0], ids[2]);
+        let old = net.frame(a);
+        net.leave(c);
+        net.deliver();
+        net.tick(100);
+        let before = net.frame(a);
+        let c2 = net.rejoin(c);
+        net.deliver();
+        assert!(!net.opens(c2, a, &old));
+        assert!(!net.opens(c2, a, &before));
+        net.tick(600);
+        assert!(!net.opens(c2, a, &before));
+        assert!(net.all_hear());
+    }
+
+    #[test]
+    fn junk_then_new_device_gets_no_old_key() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert!(net.all_hear());
+        let old = net.frame(a);
+        net.inject(a, ServerMsg::Announce { from: b, blob: vec![1, 2, 3] });
+        net.deliver();
+        let start = net.keys.len();
+        net.hijack(b);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        let to_b2: Vec<u16> =
+            net.keys[start..].iter().filter(|k| k.0 == a && k.1 == b).map(|k| k.2).collect();
+        assert!(!to_b2.is_empty(), "the new device is paired");
+        assert!(to_b2.iter().all(|&e| at_least(e, old.epoch.wrapping_add(1))), "{to_b2:?} vs {}", old.epoch);
+        assert!(!net.opens(b, a, &old));
+    }
+
+    #[test]
+    fn long_session_newcomer_accepts_members() {
+        const HOUR: u64 = 3_600_000;
+        // Joining re-announces: the newcomer sees fresh announces despite stale cached ones.
+        let (mut net, _) = room(&["a", "b"]);
+        net.now += Duration::from_millis(2 * HOUR);
+        net.now_ms += 2 * HOUR;
+        let _c = net.join("c");
+        net.deliver();
+        net.tick(600);
+        assert!(net.all_hear());
+        // Ticks re-announce periodically: the server's cache never goes stale.
+        let (mut net, ids) = room(&["a", "b"]);
+        for _ in 0..5 {
+            net.tick(HOUR / 2);
+        }
+        for (&id, name) in ids.iter().zip(["a", "b"]) {
+            assert!(verify_announce(&net.announces[&id], name, ROOM, net.now_ms).is_ok());
+        }
+    }
+
+    #[test]
+    fn churn_does_not_starve_switch() {
+        let (mut net, ids) = room(&["a", "b", "c"]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let f0 = net.frame(a);
+        assert!(net.opens(b, a, &f0));
+        let e0 = f0.epoch;
+        net.leave(c);
+        net.deliver();
+        let mut switched_at = None;
+        for step in 1..=30u64 {
+            if step % 4 == 0 {
+                let msg = if step % 8 == 0 {
+                    ServerMsg::MemberLeft { id: 90 }
+                } else {
+                    ServerMsg::MemberJoined(MemberInfo { id: 90, name: "x".into() })
+                };
+                net.inject(a, msg);
+            }
+            net.tick(100);
+            let f = net.frame(a);
+            if f.epoch != e0 && switched_at.is_none() {
+                switched_at = Some(step * 100);
+            }
+            if switched_at.is_some() {
+                assert!(!net.opens(c, a, &f), "leaver hears at {} ms", step * 100);
+            }
+            assert!(net.opens(b, a, &f), "gap at {} ms", step * 100);
+        }
+        assert!(switched_at.is_some_and(|t| t <= 1500), "switched at {switched_at:?}");
     }
 
     #[test]
@@ -756,8 +960,14 @@ mod tests {
         net.deliver();
         net.tick(1100);
         assert!(net.all_hear());
-        let f = net.frame(b);
-        assert!(!net.opens(a, c, &f));
+        // a must not have filed b's key under c: a frame sealed as c with b's key fails.
+        let b_key = net.client(b).e2e.current_key().clone();
+        let now = net.now;
+        let (mut ct, mut pt) = (Vec::new(), Vec::new());
+        let e = AudioSealer::new(c, &b_key).seal(1000, b"opus", &mut ct).unwrap();
+        assert!(!net.client(a).e2e.open(c, e, 1000, &ct, now, &mut pt));
+        let e = AudioSealer::new(b, &b_key).seal(1000, b"opus", &mut ct).unwrap();
+        assert!(net.client(a).e2e.open(b, e, 1000, &ct, now, &mut pt), "control: key is real");
     }
 
     fn same_device(old: &Identity) -> Identity {
