@@ -14,8 +14,6 @@ use tokio::sync::mpsc;
 use crate::{FrameSink, FrameSource};
 
 const MAX_VOICES: usize = 16;
-/// A sender silent this long (60 s) gives up its decoder slot.
-const VOICE_IDLE_FRAMES: u32 = 3_000;
 
 /// Shared switches flipped by the UI, hotkeys or the console.
 #[derive(Default)]
@@ -61,7 +59,8 @@ pub fn capture_loop(
 }
 
 struct Voice {
-    id: MemberId,
+    /// `None` while the slot has never been used.
+    id: Option<MemberId>,
     jitter: JitterBuffer,
     decoder: Decoder,
     idle_frames: u32,
@@ -75,25 +74,40 @@ pub fn render_loop(
     controls: Arc<Controls>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut voices: Vec<Option<Box<Voice>>> = (0..MAX_VOICES).map(|_| None).collect();
+    // Every slot and decoder is made up front so the real-time loop never allocates.
+    let voices: Result<Vec<Box<Voice>>, _> = (0..MAX_VOICES)
+        .map(|_| {
+            Decoder::new().map(|decoder| {
+                Box::new(Voice {
+                    id: None,
+                    jitter: JitterBuffer::new(),
+                    decoder,
+                    idle_frames: 0,
+                    pcm: [0.0; FRAME_SAMPLES],
+                })
+            })
+        })
+        .collect();
+    let mut voices = match voices {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("render not started: {e}");
+            return;
+        }
+    };
     let mut out = [0f32; FRAME_SAMPLES];
     while !stop.load(Ordering::Relaxed) {
         while let Ok(f) = inp.try_recv() {
-            if let Some(v) = voice_for(&mut voices, f.sender) {
-                v.jitter.push(f.seq, f.payload());
-                v.idle_frames = 0;
-            }
+            let v = voice_for(&mut voices, f.sender);
+            v.jitter.push(f.seq, f.payload());
+            v.idle_frames = 0;
         }
 
         out.fill(0.0);
-        for slot in voices.iter_mut() {
-            let Some(v) = slot else { continue };
-            v.idle_frames += 1;
+        for v in voices.iter_mut().filter(|v| v.id.is_some()) {
+            v.idle_frames = v.idle_frames.saturating_add(1);
             if v.jitter.pop(&mut v.decoder, &mut v.pcm) == Pop::Audio {
                 accumulate(&mut out, &v.pcm, 1.0);
-            }
-            if v.idle_frames > VOICE_IDLE_FRAMES {
-                *slot = None;
             }
         }
         clip(&mut out);
@@ -107,24 +121,24 @@ pub fn render_loop(
     }
 }
 
-/// The voice slot for `id`, claiming a free one for a new sender.
-fn voice_for(voices: &mut [Option<Box<Voice>>], id: MemberId) -> Option<&mut Voice> {
-    let index = match voices.iter().position(|v| v.as_ref().is_some_and(|v| v.id == id)) {
-        Some(i) => i,
-        None => {
-            let free = voices.iter().position(Option::is_none)?;
-            let decoder = Decoder::new().ok()?;
-            voices[free] = Some(Box::new(Voice {
-                id,
-                jitter: JitterBuffer::new(),
-                decoder,
-                idle_frames: 0,
-                pcm: [0.0; FRAME_SAMPLES],
-            }));
-            free
+/// The voice slot for `id`. A new sender takes an unused slot, or else the one
+/// silent the longest (senders that left keep their slot until then).
+fn voice_for(voices: &mut [Box<Voice>], id: MemberId) -> &mut Voice {
+    if let Some(i) = voices.iter().position(|v| v.id == Some(id)) {
+        return &mut voices[i];
+    }
+    let v = voices
+        .iter_mut()
+        .max_by_key(|v| if v.id.is_none() { u32::MAX } else { v.idle_frames })
+        .expect("MAX_VOICES > 0");
+    if v.id.is_some() {
+        if let Err(e) = v.decoder.reset() {
+            tracing::warn!("opus decoder reset failed: {e}");
         }
-    };
-    voices[index].as_deref_mut()
+        v.jitter = JitterBuffer::new();
+    }
+    v.id = Some(id);
+    v
 }
 
 #[cfg(test)]
@@ -238,6 +252,30 @@ mod tests {
         assert_eq!(frames.len(), 12);
         assert!(peak(&frames[5..]) > 0.1, "audio plays");
         assert!(peak(&frames[5..]) > 0.16, "two senders are summed");
+    }
+
+    #[test]
+    fn new_sender_is_heard_when_all_slots_were_used() {
+        let (tx, rx) = mpsc::channel(256);
+        let mut buf = [0u8; 256];
+        // 16 earlier senders (e.g. ids left over from reconnects) took every slot.
+        for sender in 1..=16 {
+            let len = Encoder::new().unwrap().encode(&[0.0; FRAME_SAMPLES], &mut buf).unwrap();
+            tx.try_send(IncomingFrame::new(sender, 0, &buf[..len]).unwrap()).unwrap();
+        }
+        let mut enc = Encoder::new().unwrap();
+        for n in 0..10 {
+            let len = enc.encode(&sine(n), &mut buf).unwrap();
+            tx.try_send(IncomingFrame::new(17, n as u32, &buf[..len]).unwrap()).unwrap();
+        }
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        render_loop(
+            Recorder { frames: frames.clone(), limit: 12 },
+            rx,
+            Arc::new(Controls::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(peak(&frames.take()[5..]) > 0.1, "sender 17 plays");
     }
 
     #[test]

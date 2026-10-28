@@ -32,6 +32,11 @@ impl Decoder {
         Ok(Self(opus::Decoder::new(SAMPLE_RATE, Channels::Mono)?))
     }
 
+    /// Forgets the previous speaker before the decoder is reused for another one.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(self.0.reset_state()?)
+    }
+
     /// Decodes `packet`, or conceals a lost frame when `None`. With `fec`, `packet`
     /// is the frame after the lost one and its redundancy data is used instead.
     pub fn decode(&mut self, packet: Option<&[u8]>, fec: bool, out: &mut Pcm) -> anyhow::Result<()> {

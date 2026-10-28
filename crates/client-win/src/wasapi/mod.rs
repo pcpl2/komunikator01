@@ -8,6 +8,8 @@ pub use capture::WasapiCapture;
 pub use mmcss::{enter_pro_audio, MmcssGuard};
 pub use render::WasapiRender;
 
+use std::mem::ManuallyDrop;
+
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
@@ -41,7 +43,8 @@ impl From<windows::core::Error> for AudioError {
 
 /// An initialized, event-driven shared-mode client plus its event handle.
 struct Stream {
-    client: IAudioClient,
+    /// Released by hand in `drop`, before the event it signals is closed.
+    client: ManuallyDrop<IAudioClient>,
     event: HANDLE,
     tracker: Option<DefaultTracker>,
 }
@@ -50,6 +53,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
+            ManuallyDrop::drop(&mut self.client);
             let _ = CloseHandle(self.event);
         }
     }
@@ -105,7 +109,7 @@ fn open_stream(flow: EDataFlow, device_id: Option<&str>, buffer_ms: i64) -> Resu
             None => Some(DefaultTracker { enumerator, flow, id: device_id_of(&device)?, frames: 0 }),
         };
         let event = CreateEventW(None, false, false, None)?;
-        let stream = Stream { client, event, tracker };
+        let stream = Stream { client: ManuallyDrop::new(client), event, tracker };
         stream.client.SetEventHandle(stream.event)?;
         Ok(stream)
     }
