@@ -235,7 +235,14 @@ async fn datagram_loop(conn: &Connection, id: MemberId, shared: &Shared) -> End 
         }
         let Ok(down) = upstream_to_downstream(id, &d) else { continue };
         let down = Bytes::from(down);
-        let peers = shared.room.lock().unwrap().peers(id);
+        let peers = {
+            let room = shared.room.lock().unwrap();
+            // A replaced session lingers to read its notice but must not be heard.
+            if !room.contains(id) {
+                continue;
+            }
+            room.peers(id)
+        };
         for p in peers {
             let _ = p.conn.send_datagram(down.clone());
         }

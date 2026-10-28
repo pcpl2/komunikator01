@@ -239,3 +239,16 @@ async fn datagram_flood_is_rate_limited() {
     assert!(received > 0 && received <= 120, "received {received}");
     assert!(ala.conn.close_reason().is_none());
 }
+
+#[tokio::test]
+async fn replaced_session_stops_relaying_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (first, _, _) = Client::login(&srv, "ala").await;
+    let (ola, _, _) = Client::login(&srv, "ola").await;
+    let (second, _, _) = Client::login(&srv, "ala").await;
+    // The old connection lingers up to 2 s to read SessionReplaced; it must not be heard.
+    first.send_audio(1, b"stare");
+    assert_eq!(ola.recv_audio(Duration::from_millis(300)).await, None);
+    assert_eq!(second.recv_audio(Duration::from_millis(100)).await, None);
+}
