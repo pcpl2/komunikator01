@@ -9,10 +9,11 @@ use protocol::audio::audio_aad;
 use protocol::MemberId;
 use sha2::Sha256;
 
+use super::chat::CHAT_INFO;
+
 pub const TAG_LEN: usize = 16;
 const OLD_EPOCH_GRACE: Duration = Duration::from_secs(2);
 const AUDIO_INFO: &[u8] = b"komunikator/audio/v1";
-const CHAT_INFO: &[u8] = b"komunikator/chat/v1";
 
 #[derive(Clone)]
 pub struct SenderKey {

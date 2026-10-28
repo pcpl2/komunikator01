@@ -9,9 +9,9 @@
 //! - a member's sender keys are accepted only from that member's own channel;
 //! - every join/leave rotates my key; the sealer switches 500 ms later so peers have the new
 //!   key before frames use it;
-//! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and each
-//!   link's chat opener receives exactly the keys its audio opener does, so the rules above
-//!   hold for chat too;
+//! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and a
+//!   member's chat opener receives exactly the keys its link's audio opener does, so the rules
+//!   above hold for chat too; chat replay state outlives link rebuilds for the same identity;
 //! - announces are signed for, and accepted only for, this room.
 
 use std::collections::HashMap;
@@ -73,14 +73,18 @@ struct Peer {
     identity: Option<IdentityPublic>,
     /// Present only while the member is eligible (verified, not `KeyChanged`).
     link: Option<Link>,
+    /// Chat keys and replay state of `chat_identity`. Kept on the peer, not the link: a link
+    /// rebuilt for the same identity (which the server can force) must not forget which
+    /// messages already opened. Fed only from this member's own channel, beside `Link::opener`.
+    chat: ChatOpener,
+    /// Identity whose keys `chat` holds; a different identity starts from an empty opener.
+    chat_identity: Option<IdentityPublic>,
 }
 
 struct Link {
     channel: PairChannel,
     /// Holds only keys received over `channel`.
     opener: AudioOpener,
-    /// Fed exactly the keys `opener` gets.
-    chat: ChatOpener,
     initiator: bool,
     last_hello: Option<Instant>,
     /// Minimum spacing before the next `Hello1`: `HELLO_INTERVAL`, doubled on each re-send
@@ -153,7 +157,7 @@ fn hello(out: &mut Output, to: MemberId, link: &mut Link, now: Instant) {
 
 impl Peer {
     fn new(name: String, min_epoch: u16) -> Self {
-        Self { name, min_epoch, identity: None, link: None }
+        Self { name, min_epoch, identity: None, link: None, chat: ChatOpener::new(), chat_identity: None }
     }
 }
 
@@ -287,7 +291,6 @@ impl E2e {
         let mut link = Link {
             channel: PairChannel::new(&self.identity, &their),
             opener: AudioOpener::new(id),
-            chat: ChatOpener::new(),
             initiator: self.my_public.sign < their.sign,
             last_hello: None,
             hello_interval: HELLO_INTERVAL,
@@ -355,6 +358,10 @@ impl E2e {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.identity = Some(identity);
             peer.link = None;
+            if peer.chat_identity != Some(identity) {
+                peer.chat = ChatOpener::new();
+                peer.chat_identity = Some(identity);
+            }
         }
         if changed {
             // A different device now speaks for this member: it gets only keys from now on.
@@ -372,14 +379,15 @@ impl E2e {
         let mut out = Output::default();
         let Some(peer) = self.peers.get_mut(&from) else { return out };
         let min_epoch = peer.min_epoch;
-        let Some(link) = peer.link.as_mut() else { return out };
+        let Peer { link, chat, .. } = peer;
+        let Some(link) = link.as_mut() else { return out };
         match link.channel.receive(blob) {
             Ok((reply, Some(Inner::SenderKey { epoch, key }))) => {
                 if let Some(r) = reply {
                     relay(&mut out, from, r);
                 }
                 let key = SenderKey::from_parts(epoch, key);
-                link.chat.add_key(&key);
+                chat.add_key(&key);
                 link.opener.add_key(key);
             }
             Ok((reply, None)) => {
@@ -473,9 +481,9 @@ impl E2e {
     }
 
     pub fn open_chat(&mut self, from: MemberId, blob: &[u8]) -> Result<String, ChatError> {
-        match self.peers.get_mut(&from).and_then(|p| p.link.as_mut()) {
-            Some(link) => link.chat.open(self.room, from, blob),
-            None => Err(ChatError::NoKey),
+        match self.peers.get_mut(&from) {
+            Some(peer) if peer.link.is_some() => peer.chat.open(self.room, from, blob),
+            _ => Err(ChatError::NoKey),
         }
     }
 
@@ -1379,5 +1387,39 @@ mod tests {
             verify_announce(&net.announces[&a], "a", 2, net.now_ms),
             Err(AnnounceError::WrongRoom)
         );
+    }
+
+    #[test]
+    fn chat_replay_survives_link_rebuild() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let old = chat(&mut net, a, "stary");
+        assert!(read(&mut net, b, a, &old).is_ok());
+        // The server breaks b's link to a with junk, then restores it with a's genuine announce.
+        net.inject(b, ServerMsg::Announce { from: a, blob: vec![1, 2, 3] });
+        net.deliver();
+        let genuine = net.announces[&a].clone();
+        net.inject(b, ServerMsg::Announce { from: a, blob: genuine });
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        assert_eq!(read(&mut net, b, a, &old), Err(ChatError::Replay));
+        let fresh = chat(&mut net, a, "nowy");
+        assert_eq!(read(&mut net, b, a, &fresh).as_deref(), Ok("nowy"), "the link came back");
+    }
+
+    #[test]
+    fn new_identity_starts_with_fresh_chat_keys() {
+        let (mut net, ids) = room(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let old = chat(&mut net, b, "stare urządzenie");
+        assert!(read(&mut net, a, b, &old).is_ok());
+        net.hijack(b);
+        net.deliver();
+        net.tick(600);
+        net.tick(1100);
+        let new = chat(&mut net, b, "nowe urządzenie");
+        assert_eq!(read(&mut net, a, b, &new).as_deref(), Ok("nowe urządzenie"));
+        assert!(read(&mut net, a, b, &old).is_err(), "the old device's keys are gone");
     }
 }

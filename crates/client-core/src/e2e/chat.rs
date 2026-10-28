@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use super::audio::{SenderKey, TAG_LEN};
 use crate::chat::MAX_CHAT_CHARS;
 
-const CHAT_INFO: &[u8] = b"komunikator/chat/v1";
+/// HKDF info of the chat key and prefix of the AAD.
+pub(super) const CHAT_INFO: &[u8] = b"komunikator/chat/v1";
 const AAD_LEN: usize = CHAT_INFO.len() + 4 + 2 + 2 + 4;
 /// Epochs kept per sender: the current one plus two rotations of late messages.
 const KEPT_EPOCHS: usize = 3;
@@ -94,6 +95,11 @@ struct Slot {
 
 /// Decrypts chat of one sender. Holds the `KEPT_EPOCHS` newest keys, so a message sealed just
 /// before a rotation still opens after it.
+///
+/// Unlike `AudioOpener`, a key older than the newest is still accepted (and dropped if it is
+/// not among the three newest). That is safe: keys arrive only over the sender's own Noise
+/// channel, so only the sender can add them, and a known epoch's key is never replaced, so its
+/// replay state cannot be reset.
 #[derive(Default)]
 pub struct ChatOpener {
     slots: Vec<Slot>,
@@ -261,7 +267,12 @@ mod tests {
         let k = SenderKey::generate(1);
         let mut o = opener(&[&k]);
         for junk in [&[][..], &[1], &[1, 0, 3, 1, 2, 3], &[0xff; 40]] {
-            assert!(matches!(o.open(1, S, junk), Err(ChatError::Malformed | ChatError::UnknownEpoch)), "{junk:?}");
+            assert_eq!(o.open(1, S, junk), Err(ChatError::Malformed), "{junk:?}");
         }
+        let mut trailing = ChatSealer::new(&k).seal(1, S, "x").unwrap();
+        trailing.push(0);
+        assert_eq!(o.open(1, S, &trailing), Err(ChatError::Malformed));
+        let short = postcard::to_allocvec(&SealedChat { epoch: k.epoch, counter: 0, ct: vec![0; TAG_LEN - 1] }).unwrap();
+        assert_eq!(o.open(1, S, &short), Err(ChatError::Malformed), "ct shorter than the tag");
     }
 }
