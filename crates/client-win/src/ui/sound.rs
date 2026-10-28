@@ -1,7 +1,7 @@
 //! Short synthesized notification tones, played from memory.
 use client_core::app::SoundKind;
 use windows::core::PCWSTR;
-use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT, SND_PURGE};
 
 const RATE: u32 = 48_000;
 /// 8000 / 32767 is about -12.2 dBFS: audible over voice without startling anyone.
@@ -75,16 +75,31 @@ impl Sounds {
         Self { wavs: ALL.map(tone_wav) }
     }
 
-    /// Fire and forget; a new tone replaces one still playing. SND_ASYNC needs the buffer
-    /// to outlive playback, which holds because `Sounds` lives as long as the app.
+    /// Fire and forget; a new tone replaces one still playing. SND_ASYNC keeps reading the
+    /// buffer from a background thread, which `Drop` stops before the buffers are freed.
     pub fn play(&self, kind: SoundKind) {
-        let idx = ALL.iter().position(|&k| k == kind).unwrap_or(0);
+        let idx = match kind {
+            SoundKind::Muted => 0,
+            SoundKind::Unmuted => 1,
+            SoundKind::Joined => 2,
+            SoundKind::Left => 3,
+            SoundKind::Chat => 4,
+        };
         unsafe {
             let _ = PlaySoundW(
                 PCWSTR(self.wavs[idx].as_ptr().cast()),
                 None,
                 SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
             );
+        }
+    }
+}
+
+impl Drop for Sounds {
+    fn drop(&mut self) {
+        // Stop any async playback still reading `wavs`.
+        unsafe {
+            let _ = PlaySoundW(PCWSTR::null(), None, SND_PURGE);
         }
     }
 }
@@ -112,6 +127,16 @@ mod tests {
     }
     fn u32_at(b: &[u8], i: usize) -> u32 {
         u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+    }
+
+    #[test]
+    fn sounds_dropped_while_playing_is_safe() {
+        for _ in 0..50 {
+            for k in KINDS {
+                let s = Sounds::new();
+                s.play(k);
+            }
+        }
     }
 
     #[test]

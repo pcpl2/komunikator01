@@ -100,11 +100,12 @@ pub fn parse(s: &str) -> Option<Hotkey> {
         }
     }
     let vk = vk?;
-    let standalone = matches!(vk, VK_PAUSE | VK_SCROLL | 0x7C..=0x87);
-    if mods == 0 && !standalone {
-        return None;
-    }
-    Some(Hotkey { mods, vk })
+    valid(mods, vk).then_some(Hotkey { mods, vk })
+}
+
+/// A modifier is required unless the key is F13-F24, Pause or ScrollLock.
+fn valid(mods: u32, vk: u16) -> bool {
+    mods != 0 || matches!(vk, VK_PAUSE | VK_SCROLL | 0x7C..=0x87)
 }
 
 /// Canonical text, modifiers in the order Ctrl+Alt+Shift+Win.
@@ -156,7 +157,7 @@ pub fn from_control_value(v: u16) -> Option<Hotkey> {
     if f & HOTKEYF_ALT != 0 {
         mods |= MOD_ALT;
     }
-    Some(Hotkey { mods, vk })
+    valid(mods, vk).then_some(Hotkey { mods, vk })
 }
 
 pub fn describe(e: &HotkeyError) -> &'static str {
@@ -232,6 +233,9 @@ mod tests {
         // The native control cannot express Win: it is dropped.
         assert_eq!(to_control_value(&parse("Win+M").unwrap()) >> 8, 0);
         assert_eq!(from_control_value(0), None);
+        // Same modifier rule as `parse`.
+        assert_eq!(from_control_value(0x78), None); // bare F9
+        assert!(from_control_value(0x7C).is_some()); // bare F13
     }
 
     #[test]

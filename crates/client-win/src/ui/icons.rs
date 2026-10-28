@@ -48,7 +48,9 @@ pub fn make_icon(pixels: &[u32], size: u32) -> HICON {
     assert_eq!(pixels.len(), (size * size) as usize);
     unsafe {
         let color = CreateBitmap(size as i32, size as i32, 1, 32, Some(pixels.as_ptr().cast()));
-        let mask = CreateBitmap(size as i32, size as i32, 1, 1, None);
+        // 1-bpp rows are padded to 16 bits; all zero = every pixel opaque (alpha is in `color`).
+        let mask_bits = vec![0u8; (size as usize).div_ceil(16) * 2 * size as usize];
+        let mask = CreateBitmap(size as i32, size as i32, 1, 1, Some(mask_bits.as_ptr().cast()));
         let info = ICONINFO {
             fIcon: BOOL(1),
             xHotspot: 0,
