@@ -74,8 +74,12 @@ impl KnownDevices {
     /// (e.g. access denied) are returned and the file is left alone.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let mut recovered_from = None;
-        let records = match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<FileFormat>(&text) {
+        let records = match std::fs::read(path) {
+            // Invalid UTF-8 is as unusable as invalid TOML, so both take the set-aside path.
+            Ok(bytes) => match std::str::from_utf8(&bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|text| toml::from_str::<FileFormat>(text).map_err(|e| e.to_string()))
+            {
                 Ok(f) => f.device,
                 Err(e) => {
                     let mut broken = path.as_os_str().to_owned();
@@ -304,6 +308,18 @@ mod tests {
         // The new store is written fresh and loads cleanly.
         let k2 = KnownDevices::load(&p).unwrap();
         assert_eq!(k2.recovered_from(), None);
+    }
+
+    #[test]
+    fn non_utf8_trust_file_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("known_devices.toml");
+        std::fs::write(&p, [0xff, 0xfe, 0x00]).unwrap();
+        let k = KnownDevices::load(&p).unwrap();
+        let broken = dir.path().join("known_devices.toml.broken");
+        assert_eq!(k.recovered_from(), Some(broken.as_path()));
+        assert_eq!(std::fs::read(&broken).unwrap(), [0xff, 0xfe, 0x00]);
+        assert!(k.records.is_empty());
     }
 
     #[test]

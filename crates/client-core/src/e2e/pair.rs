@@ -140,7 +140,8 @@ impl PairChannel {
     }
 
     /// Completes against the latest `Hello1`, else the one before it. A failed read leaves a
-    /// handshake state as it was (snow restores it), so junk discards neither pending state.
+    /// handshake state usable: snow does not restore it, but message 2's `ee`/`se` `mix_key`
+    /// re-derives the cipher key before decrypting, so junk discards neither pending state.
     /// Answering the latest clears both; answering the previous keeps the latest, since the
     /// responder may still adopt it, and its answer then replaces the session.
     fn on_hello2(&mut self, h: &[u8]) -> Result<(), PairError> {
