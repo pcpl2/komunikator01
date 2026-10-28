@@ -91,15 +91,17 @@ impl ChatSealer {
     }
 }
 
-/// Fingerprint of a sender's chat key: the replay log's key.
+/// Fingerprint of a chat key as received from one identity: SHA-256 of that identity's sign
+/// key and the chat key. Binding the owner keeps one member from spending another's counters
+/// by re-sharing its key; member ids are not used because the server can renumber them.
 type KeyId = [u8; 32];
 
 /// Highest counter opened per chat key, shared by all senders.
 ///
-/// Keyed by the key itself, not by member, identity or epoch: the server can recreate members
+/// Keyed by (owner identity, key), not by member id or epoch: the server can recreate members
 /// and swap identities (which rebuilds openers), and a restarted app reuses epochs, but every
 /// run draws fresh random keys, so only a true replay hits an entry. At most `REPLAY_KEYS`
-/// keys, oldest first out.
+/// keys; the least recently used is evicted, never a key still in use.
 #[derive(Default)]
 pub struct ChatReplay {
     seen: VecDeque<(KeyId, u32)>,
@@ -111,11 +113,9 @@ impl ChatReplay {
     }
 
     fn mark(&mut self, id: KeyId, counter: u32) {
-        if let Some(entry) = self.seen.iter_mut().find(|(k, _)| *k == id) {
-            entry.1 = counter;
-            return;
-        }
-        if self.seen.len() == REPLAY_KEYS {
+        if let Some(i) = self.seen.iter().position(|(k, _)| *k == id) {
+            self.seen.remove(i);
+        } else if self.seen.len() == REPLAY_KEYS {
             self.seen.pop_front();
         }
         self.seen.push_back((id, counter));
@@ -128,21 +128,26 @@ struct Slot {
     id: KeyId,
 }
 
-/// Decrypts chat of one sender. Holds the `KEPT_EPOCHS` newest keys, so a message sealed just
+/// Decrypts chat of one sender identity (`owner`). Holds the `KEPT_EPOCHS` newest keys, so a message sealed just
 /// before a rotation still opens after it.
 ///
 /// Unlike `AudioOpener`, a key older than the newest is still accepted (and dropped if it is
 /// not among the three newest). That is safe: keys arrive only over the sender's own Noise
 /// channel, so only the sender can add them, and a known epoch's key is never replaced, so its
-/// replay state, kept in `ChatReplay` by key, cannot be reset.
-#[derive(Default)]
+/// replay state, kept in `ChatReplay` by (owner, key), cannot be reset.
 pub struct ChatOpener {
+    /// Sign key of the identity whose channel feeds this opener.
+    owner: [u8; 32],
     slots: Vec<Slot>,
 }
 
 impl ChatOpener {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(owner: &[u8; 32]) -> Self {
+        Self { owner: *owner, slots: Vec::new() }
+    }
+
+    pub fn owner(&self) -> &[u8; 32] {
+        &self.owner
     }
 
     pub fn add_key(&mut self, key: &SenderKey) {
@@ -150,7 +155,10 @@ impl ChatOpener {
         if self.slots.iter().any(|s| s.epoch == key.epoch) {
             return;
         }
-        let id = Sha256::digest(key.chat_key()).into();
+        let mut h = Sha256::new();
+        h.update(self.owner);
+        h.update(key.chat_key());
+        let id = h.finalize().into();
         self.slots.push(Slot { epoch: key.epoch, cipher: cipher(key), id });
         if self.slots.len() > KEPT_EPOCHS {
             // Ages relative to the newest epoch, in wrapping u16 order.
@@ -198,6 +206,15 @@ impl ChatOpener {
     }
 }
 
+#[cfg(test)]
+impl ChatSealer {
+    /// Starts at `counter`, as a hostile sender could.
+    pub(crate) fn with_counter(mut self, counter: u32) -> Self {
+        self.counter = Some(counter);
+        self
+    }
+}
+
 /// Epoch a blob claims, for tests that check which key sealed it.
 #[cfg(test)]
 pub(crate) fn blob_epoch(blob: &[u8]) -> Option<u16> {
@@ -221,7 +238,6 @@ mod tests {
     }
 
     /// An opener with its own replay log.
-    #[derive(Default)]
     struct Rx {
         o: ChatOpener,
         r: ChatReplay,
@@ -238,7 +254,7 @@ mod tests {
     }
 
     fn opener(keys: &[&SenderKey]) -> Rx {
-        let mut rx = Rx::default();
+        let mut rx = Rx { o: ChatOpener::new(&[1; 32]), r: ChatReplay::default() };
         for k in keys {
             rx.add_key(k);
         }
@@ -341,19 +357,33 @@ mod tests {
         let k = SenderKey::generate(1);
         let blob = ChatSealer::new(&k).seal(1, S, "x").unwrap();
         let mut r = ChatReplay::default();
-        let mut first = ChatOpener::new();
+        let mut first = ChatOpener::new(&[1; 32]);
         first.add_key(&k);
         assert!(first.open(1, S, &blob, &mut r).is_ok());
         // A fresh opener holding the same key still sees the replay.
-        let mut second = ChatOpener::new();
+        let mut second = ChatOpener::new(&[1; 32]);
         second.add_key(&k);
         assert_eq!(second.open(1, S, &blob, &mut r), Err(ChatError::Replay));
         for _ in 0..2 * REPLAY_KEYS {
             let other = SenderKey::generate(1);
-            let mut o = ChatOpener::new();
+            let mut o = ChatOpener::new(&[1; 32]);
             o.add_key(&other);
             assert!(o.open(1, S, &ChatSealer::new(&other).seal(1, S, "y").unwrap(), &mut r).is_ok());
         }
+        assert_eq!(r.seen.len(), REPLAY_KEYS);
+    }
+
+    #[test]
+    fn replay_log_evicts_least_recently_used() {
+        let mut r = ChatReplay::default();
+        let a = [0xaa; 32];
+        r.mark(a, 0);
+        for i in 0..REPLAY_KEYS - 1 {
+            r.mark([i as u8; 32], 0);
+        }
+        r.mark(a, 1);
+        r.mark([0xbb; 32], 0);
+        assert_eq!(r.last(&a), Some(1), "an actively used key is not evicted");
         assert_eq!(r.seen.len(), REPLAY_KEYS);
     }
 }

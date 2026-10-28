@@ -10,8 +10,9 @@
 //! - every join/leave rotates my key; the sealer switches 500 ms later so peers have the new
 //!   key before frames use it;
 //! - chat uses the same keys: it is sealed with exactly the key audio is sealed with, and a
-//!   member's chat opener receives exactly the keys its link's audio opener does, so the rules
-//!   above hold for chat too; chat replay state is kept per key for the whole session, so
+//!   member's chat opener receives exactly the keys its link's audio opener receives (it may
+//!   hold up to two older keys of the same identity across link rebuilds), so the rules above
+//!   hold for chat too; chat replay state is kept per key for the whole session, so
 //!   rebuilt links, recreated members and swapped identities cannot reset it;
 //! - announces are signed for, and accepted only for, this room.
 
@@ -74,13 +75,11 @@ struct Peer {
     identity: Option<IdentityPublic>,
     /// Present only while the member is eligible (verified, not `KeyChanged`).
     link: Option<Link>,
-    /// Chat keys of `chat_identity`, fed only from this member's own channel, beside
-    /// `Link::opener`. Replay state lives in `E2e::chat_replay`, so neither a rebuilt link nor
-    /// a recreated peer resets it.
-    chat: ChatOpener,
-    /// Identity whose keys `chat` holds; a different identity starts from an empty opener, so
-    /// its keys are not shadowed by another device's key of the same epoch.
-    chat_identity: Option<IdentityPublic>,
+    /// Chat keys of the verified identity (its `owner`), fed only from this member's own
+    /// channel, beside `Link::opener`. A different identity starts from a new opener, so its
+    /// keys are not shadowed by another device's key of the same epoch. Replay state lives in
+    /// `E2e::chat_replay`, so neither a rebuilt link nor a recreated peer resets it.
+    chat: Option<ChatOpener>,
 }
 
 struct Link {
@@ -161,7 +160,7 @@ fn hello(out: &mut Output, to: MemberId, link: &mut Link, now: Instant) {
 
 impl Peer {
     fn new(name: String, min_epoch: u16) -> Self {
-        Self { name, min_epoch, identity: None, link: None, chat: ChatOpener::new(), chat_identity: None }
+        Self { name, min_epoch, identity: None, link: None, chat: None }
     }
 }
 
@@ -363,9 +362,8 @@ impl E2e {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.identity = Some(identity);
             peer.link = None;
-            if peer.chat_identity != Some(identity) {
-                peer.chat = ChatOpener::new();
-                peer.chat_identity = Some(identity);
+            if peer.chat.as_ref().map(ChatOpener::owner) != Some(&identity.sign) {
+                peer.chat = Some(ChatOpener::new(&identity.sign));
             }
         }
         if changed {
@@ -392,7 +390,9 @@ impl E2e {
                     relay(&mut out, from, r);
                 }
                 let key = SenderKey::from_parts(epoch, key);
-                chat.add_key(&key);
+                if let Some(chat) = chat {
+                    chat.add_key(&key);
+                }
                 link.opener.add_key(key);
             }
             Ok((reply, None)) => {
@@ -487,7 +487,9 @@ impl E2e {
 
     pub fn open_chat(&mut self, from: MemberId, blob: &[u8]) -> Result<String, ChatError> {
         match self.peers.get_mut(&from) {
-            Some(peer) if peer.link.is_some() => peer.chat.open(self.room, from, blob, &mut self.chat_replay),
+            Some(Peer { link: Some(_), chat: Some(chat), .. }) => {
+                chat.open(self.room, from, blob, &mut self.chat_replay)
+            }
             _ => Err(ChatError::NoKey),
         }
     }
@@ -1504,5 +1506,29 @@ mod tests {
         let new = chat(&mut net, b2, "po restarcie");
         assert_eq!(super::super::chat::blob_epoch(&new), super::super::chat::blob_epoch(&old));
         assert_eq!(read(&mut net, a, b2, &new).as_deref(), Ok("po restarcie"));
+    }
+
+    #[test]
+    fn member_cannot_burn_anothers_replay_state() {
+        let (mut net, ids) = room(&["a", "b", "m"]);
+        let (a, b, m) = (ids[0], ids[1], ids[2]);
+        let first = chat(&mut net, b, "pierwsza");
+        assert!(read(&mut net, a, b, &first).is_ok());
+        // m re-shares b's key with a over m's own channel, under an epoch new to m's opener,
+        // and seals with the highest counter as itself.
+        let b_key = net.client(b).e2e.current_key().clone();
+        let epoch = net.client(m).e2e.next_epoch().wrapping_add(5);
+        let stolen = SenderKey::from_parts(epoch, *b_key.secret());
+        let blob = {
+            let link = net.client(m).e2e.peers.get_mut(&a).unwrap().link.as_mut().unwrap();
+            link.channel.send(&Inner::SenderKey { epoch, key: *stolen.secret() }).unwrap()
+        };
+        net.route(m, Output { send: vec![ClientMsg::Relay { to: a, blob }], ..Output::default() });
+        net.deliver();
+        let room_id = net.room;
+        let forged = ChatSealer::new(&stolen).with_counter(u32::MAX).seal(room_id, m, "cisza").unwrap();
+        let _ = read(&mut net, a, m, &forged);
+        let next = chat(&mut net, b, "druga");
+        assert_eq!(read(&mut net, a, b, &next).as_deref(), Ok("druga"));
     }
 }
