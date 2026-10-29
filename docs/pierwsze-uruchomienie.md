@@ -21,19 +21,16 @@ Klucz pozwala później rozsyłać aktualizacje automatycznie. Bez niego workflo
 
 ```
 cargo build --release -p release
-target
-elease\komunikator-release keygen --out release.key
+target\release\komunikator-release keygen --out release.key
 ```
 
-1. Wypisany klucz publiczny wpisz do `crates/client-win/release-key.pub` w miejsce zer, zrób commit i wypchnij.
+1. W repozytorium na GitHubie: `Settings → Secrets and variables → Actions → New repository secret`. Nazwa `RELEASE_SIGNING_KEY`, wartość to zawartość pliku `release.key`. Workflow sam wyliczy z niego klucz publiczny i wbuduje go w program, a w repozytorium nic nie trzeba zmieniać.
 2. Plik `release.key` przenieś w bezpieczne miejsce, np. na pendrive i do menedżera haseł. Nigdy nie wrzucaj go do repozytorium.
-3. Zdecyduj, czy GitHub ma podpisywać aktualizacje sam (sekret `RELEASE_SIGNING_KEY`), czy podpisujesz je u siebie. Różnice: `docs/wydanie.md`, sekcja „Klucz wydań klienta”.
+3. Jeśli wolisz, żeby GitHub nie miał klucza tajnego, zamiast sekretu dodaj zmienną `RELEASE_PUBLIC_KEY` z kluczem publicznym (zakładka `Variables`) i podpisuj aktualizacje u siebie. Różnice: `docs/wydanie.md`, sekcja „Klucz wydań klienta”.
 
 ### 3. Pierwsze wydania (GitHub Actions)
 
-W repozytorium na GitHubie: `Actions`, potem po kolei:
-- **Wydanie serwera → Run workflow**, wersja `0.1.0`: publikuje obraz `ghcr.io/pcpl2/komunikator-server`;
-- **Wydanie klienta → Run workflow**, wersja `0.1.0`: tworzy release z `komunikator.exe` dla graczy.
+W repozytorium na GitHubie: `Actions → Wydanie serwera → Run workflow`, wersja `0.1.0`. Workflow publikuje obraz `ghcr.io/pcpl2/komunikator-server`. Klienta wydasz w kroku 5, gdy serwer już działa i znasz jego odcisk.
 
 Każde kolejne wydanie dostaje wyższą wersję wpisaną w tym samym polu.
 
@@ -54,11 +51,18 @@ docker compose logs komunikator
 
 W logu powinna pojawić się linia `fingerprint: …`. Oznacza ona, że serwer działa.
 
-### 5. Otwórz port UDP 7700
+### 5. Wydanie klienta z wbudowanym serwerem
+
+1. W repozytorium na GitHubie (`Settings → Secrets and variables → Actions`) dodaj dwa sekrety:
+   - `SERVER_ADDRESS`: adres z portem, np. `gra.example.pl:7700`;
+   - `SERVER_FINGERPRINT`: 64 znaki z linii `fingerprint:`.
+2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`. Powstanie release z `komunikator.exe` dla graczy, z wbudowanym adresem serwera i kluczem wydań.
+
+### 6. Otwórz port UDP 7700
 
 Otwórz go w firewallu dostawcy serwera, a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. Port **UDP** jest wymagany, TCP nie wystarczy. Docker otwiera opublikowany port w systemie sam, z pominięciem `ufw`.
 
-### 6. Twoje konto administratora
+### 7. Twoje konto administratora
 
 ```
 docker exec komunikator komunikator-server invite --config /etc/komunikator/komunikator.toml
@@ -72,7 +76,7 @@ docker exec komunikator komunikator-server invite --config /etc/komunikator/komu
 docker exec komunikator komunikator-server make-admin --config /etc/komunikator/komunikator.toml <twoja-nazwa>
 ```
 
-### 7. Zaproszenia dla znajomych
+### 8. Zaproszenia dla znajomych
 
 Wygeneruj osobny kod dla każdej osoby tym samym poleceniem `invite`. Kod jest jednorazowy i domyślnie ważny 7 dni.
 

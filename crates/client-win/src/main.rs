@@ -24,10 +24,11 @@ use protocol::{MemberId, RoomId};
 #[derive(Parser)]
 #[command(name = "komunikator-cli", version, about = "Lekki komunikator głosowy")]
 struct Cli {
-    /// Server address, host:port
+    /// Server address, host:port (with --user alone: the one built into the program, if any)
     #[arg(long)]
     server: Option<String>,
-    /// Server certificate fingerprint (64 hex chars, printed by the server at start)
+    /// Server certificate fingerprint (64 hex chars, printed by the server at start; with --user
+    /// alone: the one built into the program, if any)
     #[arg(long)]
     fingerprint: Option<String>,
     #[arg(long)]
@@ -82,7 +83,14 @@ fn main() -> anyhow::Result<()> {
     use client_win::vault::{Secret, Vault};
 
     let password = std::env::var("KOMUNIKATOR_PASSWORD").ok();
-    let login = choose_login(cli.invite.as_deref(), cli.server, cli.fingerprint, cli.user, password)
+    // A name alone logs in to the server built into the program, if there is one.
+    let (server, fingerprint) = match (&cli.invite, &cli.user) {
+        (None, Some(_)) => {
+            (cli.server.or_else(client_win::defaults::server), cli.fingerprint.or_else(client_win::defaults::fingerprint))
+        }
+        _ => (cli.server, cli.fingerprint),
+    };
+    let login = choose_login(cli.invite.as_deref(), server, fingerprint, cli.user, password)
         .map_err(anyhow::Error::msg)?;
     let given_data_dir = cli.data_dir.clone();
     let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);

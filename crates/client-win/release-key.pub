@@ -1,4 +1,5 @@
 # Klucz publiczny wydań (Ed25519): 64 znaki szesnastkowe w pierwszym wierszu, który nie jest komentarzem.
-# Przed zbudowaniem klientów wpisz tu klucz wypisany przez `komunikator-release keygen`.
-# Same zera wyłączają samoaktualizację.
+# Wydania: workflow „Wydanie klienta” wpisuje tu klucz z sekretu RELEASE_SIGNING_KEY albo ze
+# zmiennej RELEASE_PUBLIC_KEY, tylko na czas budowania. Same zera (budowanie lokalne) wyłączają
+# samoaktualizację.
 0000000000000000000000000000000000000000000000000000000000000000

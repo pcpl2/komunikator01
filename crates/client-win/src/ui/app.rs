@@ -372,9 +372,14 @@ fn account_form(s: &Settings, vault: &Vault) -> AccountForm {
     AccountForm {
         // Nothing set up yet most likely means a friend's invite.
         mode: if s.server.is_empty() { AccountMode::Invite } else { AccountMode::Login },
+        // Nothing saved yet: the server built into the program, if there is one.
         login: AccountInput {
-            server: s.server.clone(),
-            fingerprint: s.fingerprint.clone(),
+            server: if s.server.is_empty() { crate::defaults::server().unwrap_or_default() } else { s.server.clone() },
+            fingerprint: if s.fingerprint.is_empty() {
+                crate::defaults::fingerprint().unwrap_or_default()
+            } else {
+                s.fingerprint.clone()
+            },
             username: s.username.clone(),
             password: vault.password().unwrap_or_default(),
         },

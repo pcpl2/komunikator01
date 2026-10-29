@@ -40,17 +40,75 @@ jobs:
           VERSION: ${{ inputs.version }}
         shell: bash
         run: |
-          if tr -d '\r' < crates/client-win/release-key.pub | grep -v '^#' | grep -qE '^0{64}$'; then
-            echo "::error::crates/client-win/release-key.pub to same zera: wygeneruj klucz (komunikator-release keygen) i wpisz klucz publiczny."
+          bash .github/scripts/set-version.sh client "$VERSION"
+
+      # Klucz publiczny wbudowywany w program (include_str! z release-key.pub), w kolejności:
+      # wyliczony z sekretu RELEASE_SIGNING_KEY, ze zmiennej repozytorium RELEASE_PUBLIC_KEY
+      # (klucz tajny offline), albo plik z repozytorium. Same zera wyłączają aktualizacje: stop.
+      - name: Klucz wydań
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          pub=crates/client-win/release-key.pub
+          if [ -n "$RELEASE_SIGNING_KEY" ]; then
+            cargo build --locked --release -p release
+            key="$RUNNER_TEMP/release.key"
+            trap 'rm -f "$key"' EXIT
+            printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+            public=$(target/release/komunikator-release.exe public --key "$key")
+            source="sekret RELEASE_SIGNING_KEY"
+          elif [ -n "$RELEASE_PUBLIC_KEY" ]; then
+            public=$(printf '%s' "$RELEASE_PUBLIC_KEY" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+            source="zmienna RELEASE_PUBLIC_KEY"
+          else
+            public=$(tr -d '\r' < "$pub" | grep -v '^#' | grep -m1 -E '^[0-9a-fA-F]{64}$' || true)
+            source="plik $pub"
+          fi
+          if ! printf '%s' "$public" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Klucz publiczny z: $source nie ma postaci 64 znaków szesnastkowych."
             exit 1
           fi
-          bash .github/scripts/set-version.sh client "$VERSION"
+          if [ "$public" = "$(printf '0%.0s' {1..64})" ]; then
+            echo "::error::Brak klucza wydań: dodaj sekret RELEASE_SIGNING_KEY (albo zmienną RELEASE_PUBLIC_KEY). Klucz z samych zer wyłącza aktualizacje."
+            exit 1
+          fi
+          printf '# Klucz publiczny wydań, wpisany przez workflow (%s).\n%s\n' "$source" "$public" > "$pub"
+          echo "Klucz publiczny wydań: $public ($source)"
 
       - uses: Swatinem/rust-cache@v2
 
       # Bez testów client-win: otwierają okno, ikonę w zasobniku i urządzenia audio.
       - name: Testy
         run: cargo test --locked -p protocol -p client-core -p release
+
+      # Serwer wbudowany w program (src/defaults.rs): podpowiedź w oknie „Mam już konto” i domyślny
+      # serwer wiersza poleceń. Sekret albo zmienna repozytorium; bez nich program działa tylko
+      # z zaproszeniami i wpisanym adresem.
+      - name: Serwer w programie
+        shell: bash
+        env:
+          SERVER_ADDRESS: ${{ secrets.SERVER_ADDRESS || vars.SERVER_ADDRESS }}
+          SERVER_FINGERPRINT: ${{ secrets.SERVER_FINGERPRINT || vars.SERVER_FINGERPRINT }}
+        run: |
+          server=$(printf '%s' "$SERVER_ADDRESS" | tr -d '[:space:]')
+          fingerprint=$(printf '%s' "$SERVER_FINGERPRINT" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+          if [ -z "$server" ] && [ -z "$fingerprint" ]; then
+            echo "::warning::Bez wbudowanego serwera: brak SERVER_ADDRESS i SERVER_FINGERPRINT."
+            exit 0
+          fi
+          if ! printf '%s' "$server" | grep -qE '^[^:[:space:]]+:[0-9]{1,5}$'; then
+            echo "::error::SERVER_ADDRESS musi mieć postać host:port (np. gra.example.pl:7700)."
+            exit 1
+          fi
+          if ! printf '%s' "$fingerprint" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::SERVER_FINGERPRINT musi mieć 64 znaki szesnastkowe (linia fingerprint: z logu serwera)."
+            exit 1
+          fi
+          echo "KOMUNIKATOR_SERVER=$server" >> "$GITHUB_ENV"
+          echo "KOMUNIKATOR_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
+          echo "Wbudowany serwer: $server"
 
       - name: Budowanie
         run: cargo build --locked --release -p client-win -p release

@@ -1,5 +1,6 @@
 //! Windows client: WASAPI audio and the capture/render pipeline.
 
+pub mod defaults;
 #[cfg(windows)]
 pub mod dpapi;
 #[cfg(windows)]
