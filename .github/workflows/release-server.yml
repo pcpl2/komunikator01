@@ -1,11 +1,18 @@
 # Wydanie serwera: uruchamiane tylko ręcznie (Actions → Wydanie serwera → Run workflow).
-# Wersja pochodzi z crates/server/Cargo.toml; przed uruchomieniem ją podnieś i wypchnij.
+# Wersję podaje się w formularzu; trafia do Cargo.toml tylko na czas budowania (bez commita),
+# a tag stawiany jest na commicie, z którego uruchomiono workflow.
 # Buduje obraz Dockera, publikuje go w prywatnym ghcr.io jako :X.Y.Z i :latest
 # i tworzy release z tagiem server-vX.Y.Z.
 name: Wydanie serwera
+run-name: Wydanie serwera ${{ inputs.version }}
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Wersja serwera (X.Y.Z, wyższa od ostatniego server-v…)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -25,21 +32,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Wersja i tag
-        id: version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "server") | .version')
-          tag="server-v$version"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
-            echo "::error::Tag $tag już istnieje. Podnieś wersję w crates/server/Cargo.toml."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/komunikator-server" >> "$GITHUB_OUTPUT"
-
       - name: Rust
         run: rustup toolchain install stable --profile minimal
+
+      - name: Wersja i tag
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          bash .github/scripts/set-version.sh server "$VERSION"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/komunikator-server" >> "$GITHUB_OUTPUT"
 
       - uses: Swatinem/rust-cache@v2
 

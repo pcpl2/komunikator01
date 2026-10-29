@@ -32,8 +32,10 @@ elease\komunikator-release keygen --out release.key
 ### 3. Pierwsze wydania (GitHub Actions)
 
 W repozytorium na GitHubie: `Actions`, potem po kolei:
-- **Wydanie serwera → Run workflow**: publikuje obraz `ghcr.io/pcpl2/komunikator-server`;
-- **Wydanie klienta → Run workflow**: tworzy release z `komunikator.exe` dla graczy.
+- **Wydanie serwera → Run workflow**, wersja `0.1.0`: publikuje obraz `ghcr.io/pcpl2/komunikator-server`;
+- **Wydanie klienta → Run workflow**, wersja `0.1.0`: tworzy release z `komunikator.exe` dla graczy.
+
+Każde kolejne wydanie dostaje wyższą wersję wpisaną w tym samym polu.
 
 ### 4. Postaw serwer (Debian z Dockerem)
 

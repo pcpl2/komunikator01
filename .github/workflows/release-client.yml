@@ -1,11 +1,18 @@
 # Wydanie klienta: uruchamiane tylko ręcznie (Actions → Wydanie klienta → Run workflow).
-# Wersja pochodzi z [workspace.package] w Cargo.toml; przed uruchomieniem ją podnieś i wypchnij.
+# Wersję podaje się w formularzu; trafia do Cargo.toml tylko na czas budowania (bez commita),
+# a tag stawiany jest na commicie, z którego uruchomiono workflow.
 # Tworzy release z tagiem client-vX.Y.Z: komunikator.exe dla graczy oraz, gdy jest klucz,
 # podpisaną aktualizację (manifest.bin + komunikator-X.Y.Z.exe) do wgrania na serwer.
 name: Wydanie klienta
+run-name: Wydanie klienta ${{ inputs.version }}
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Wersja klienta (X.Y.Z, wyższa od ostatniego client-v…)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,25 +31,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal
+
       - name: Wersja i tag
         id: version
+        env:
+          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "client-win") | .version')
-          tag="client-v$version"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
-            echo "::error::Tag $tag już istnieje. Podnieś wersję w Cargo.toml ([workspace.package])."
-            exit 1
-          fi
           if tr -d '\r' < crates/client-win/release-key.pub | grep -v '^#' | grep -qE '^0{64}$'; then
             echo "::error::crates/client-win/release-key.pub to same zera: wygeneruj klucz (komunikator-release keygen) i wpisz klucz publiczny."
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Rust
-        run: rustup toolchain install stable --profile minimal
+          bash .github/scripts/set-version.sh client "$VERSION"
 
       - uses: Swatinem/rust-cache@v2
 

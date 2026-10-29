@@ -1,7 +1,8 @@
 [package]
 name = "server"
 edition.workspace = true
-# Wersja serwera, niezależna od klienta: wydanie `server-vX.Y.Z`.
+# Wersja serwera przy budowaniu lokalnym, niezależna od klienta. Wydanie dostaje wersję
+# z formularza workflow „Wydanie serwera” (tag `server-vX.Y.Z`), bez commita.
 version = "0.1.0"
 license.workspace = true
 

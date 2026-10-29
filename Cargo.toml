@@ -4,8 +4,9 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-# Wersja klienta (komunikator.exe, komunikator-cli.exe): wydanie `client-vX.Y.Z`.
-# Serwer ma własną wersję w crates/server/Cargo.toml (wydanie `server-vX.Y.Z`).
+# Wersja klienta przy budowaniu lokalnym. Wydanie dostaje wersję z formularza workflow
+# „Wydanie klienta” (tag `client-vX.Y.Z`), wpisywaną tu tylko na czas budowania, bez commita.
+# Serwer ma osobną wersję w crates/server/Cargo.toml.
 version = "0.1.0"
 license = "MIT"
 

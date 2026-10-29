@@ -90,19 +90,20 @@ Porównaj średnią i największy czas oraz utratę pakietów. Wybierz lokalizac
 
 ## Wydania przez GitHub Actions
 
-Oba workflow uruchamia się tylko ręcznie: `Actions → Wydanie serwera / Wydanie klienta → Run workflow`. Push niczego nie buduje. Każde uruchomienie:
-1. czyta wersję z `Cargo.toml` i przerywa, jeśli tag już istnieje;
-2. uruchamia testy i buduje;
-3. tworzy release na GitHubie z tagiem.
+Oba workflow uruchamia się tylko ręcznie: `Actions → Wydanie serwera / Wydanie klienta → Run workflow`, z wersją wpisaną w polu `version` (np. `0.2.0`). Push niczego nie buduje. Każde uruchomienie:
+1. sprawdza, czy wersja ma postać `X.Y.Z` i jest wyższa od ostatniego wydania tej części; tytuł uruchomienia to np. „Wydanie serwera 0.2.0”;
+2. wpisuje ją do `Cargo.toml` (i `Cargo.lock`) tylko w kopii roboczej na czas budowania, bez commita;
+3. uruchamia testy i buduje;
+4. tworzy release na GitHubie z tagiem na commicie, z którego uruchomiono workflow.
 
 Serwer i klient mają osobne wersje:
 
-| Część | Wersja w | Tag | Wynik |
-|---|---|---|---|
-| Serwer | `crates/server/Cargo.toml` (`version`) | `server-vX.Y.Z` | obraz `ghcr.io/pcpl2/komunikator-server:X.Y.Z` i `:latest`; release z digestem obrazu |
-| Klient | `Cargo.toml` (`[workspace.package] version`) | `client-vX.Y.Z` | release: `komunikator.exe`, `komunikator-cli.exe`, `SHA256SUMS`, a z kluczem także `manifest.bin` i `komunikator-X.Y.Z.exe` |
+| Część | Tag | Wynik |
+|---|---|---|
+| Serwer | `server-vX.Y.Z` | obraz `ghcr.io/pcpl2/komunikator-server:X.Y.Z` i `:latest`; release z digestem obrazu |
+| Klient | `client-vX.Y.Z` | release: `komunikator.exe`, `komunikator-cli.exe`, `SHA256SUMS`, a z kluczem także `manifest.bin` i `komunikator-X.Y.Z.exe` |
 
-Nowe wydanie: podnieś wersję, zrób commit, wypchnij i uruchom workflow. Wersja ma zawsze postać `x.y.z`, same cyfry. Klient przyjmuje tylko wersję ściśle nowszą od własnej.
+Wersje w `Cargo.toml` w repozytorium dotyczą tylko budowania lokalnego i nie trzeba ich zmieniać. Wersja ma zawsze postać `x.y.z`, same cyfry. Klient przyjmuje tylko wersję ściśle nowszą od własnej, a workflow pilnuje tego samego.
 
 Obraz serwera dostaje etykietę `org.opencontainers.image.source` z adresem repozytorium. Dzięki temu pakiet w ghcr.io jest prywatny tak jak repozytorium i dziedziczy jego uprawnienia. Workflow loguje się do ghcr.io wbudowanym tokenem, więc nie potrzebuje żadnych sekretów.
 
