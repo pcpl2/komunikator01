@@ -15,17 +15,30 @@ Wymagania: Rust (stable) i CMake (do zbudowania libopus).
 
 ## Serwer
 
-1. Wygeneruj hash hasła dla każdej osoby:
+Konta zakłada się z zaproszeń; hasła nie trafiają do pliku konfiguracji.
+
+1. Przygotuj konfigurację na podstawie `server.example.toml`: `bind`, `data_dir` i `public_address` (adres, który trafi do zaproszeń).
+2. Załóż użytkownika systemowego dla serwera i katalog danych dostępny tylko dla niego (baza `komunikator.db` zawiera hashe haseł Argon2, a `key.der` to klucz prywatny serwera):
    ```
-   echo 'haslo' | komunikator-server hash-password
+   sudo useradd --system --home-dir /var/lib/komunikator komunikator
+   sudo install -d -m 700 -o komunikator -g komunikator /var/lib/komunikator
    ```
-2. Przygotuj konfigurację na podstawie `server.example.toml`: adres, katalog danych i listę `[[users]]` z hashami.
-3. Uruchom serwer (w `[[users]]` flaga `admin = true` pozwala usuwać pokoje założone przez innych; domyślnie `false`):
+3. Uruchom serwer jako ten użytkownik (np. usługą systemd z `User=komunikator`):
    ```
-   komunikator-server run --config server.toml
+   sudo -u komunikator komunikator-server run --config /etc/komunikator/server.toml
    ```
-   Przy starcie serwer wypisuje `fingerprint: <64 znaki hex>`. To odcisk certyfikatu, który trzeba przekazać znajomym. Certyfikat powstaje przy pierwszym uruchomieniu w `data_dir` (`cert.der`, `key.der`) i potem się nie zmienia.
+   Przy pierwszym uruchomieniu powstają w `data_dir` certyfikat (`cert.der`, `key.der`, potem się nie zmienia) i baza `komunikator.db`. Serwer wypisuje `fingerprint: <64 znaki hex>` — odcisk certyfikatu; zaproszenia zawierają go same, więc przepisuje się go tylko przy logowaniu przez `Mam już konto`.
 4. Otwórz w firewallu port **UDP 7700** (albo ten ustawiony w `bind`).
+5. Pierwsze konto (Twoje): utwórz zaproszenie, zarejestruj się nim w programie (`Mam zaproszenie`), a potem nadaj sobie uprawnienia administratora:
+   ```
+   sudo -u komunikator komunikator-server invite --config /etc/komunikator/server.toml
+   sudo -u komunikator komunikator-server make-admin --config /etc/komunikator/server.toml ala
+   ```
+   Znajomych zapraszasz tak samo (bez `make-admin`), patrz niżej.
+
+Polecenia administracyjne uruchamiaj jako ten sam użytkownik co serwer (`sudo -u komunikator …`): pliki, które utworzyłby ktoś inny, nie byłyby dla serwera dostępne. Polecenia odmawiają pracy, gdy w `data_dir` nie ma `cert.der` i `komunikator.db` (zwykle zły `--config`) — oba tworzy dopiero `run`.
+
+**Aktualizacja z wersji z listą `[[users]]`:** wpisy `[[users]]` są przy starcie importowane do bazy tylko wtedy, gdy takiego konta jeszcze w niej nie ma; potem liczy się wyłącznie baza. Jeśli wpis różni się od konta w bazie (hash hasła albo `admin`) lub koliduje z kontem różniącym się tylko wielkością liter, serwer ostrzega o tym w logu przy starcie i wpis pomija. Zmieniaj takie konta poleceniami `reset-password`, `make-admin` / `revoke-admin` i `block`, a wpisy `[[users]]` po pierwszym starcie usuń z konfiguracji.
 
 ## Administracja
 
@@ -41,7 +54,7 @@ Administratorem jest każdy, kto ma dostęp do powłoki serwera. Wszystkie polec
 | `reset-password <nazwa>` | nowe hasło czytane ze standardowego wejścia (minimum 8 znaków); zapamiętane sesje konta wygasają |
 | `rooms` | pokoje z numerami |
 | `create-room <nazwa>` / `delete-room <nr>` | zakłada pokój / usuwa pokój, także zajęty (osoby w nim trafiają do „bez pokoju”) |
-| `hash-password` | hash hasła do `[[users]]` w konfiguracji (te konta są importowane przy starcie) |
+| `hash-password` | hash hasła do `[[users]]` w konfiguracji (tylko starsze instalacje; konta z listy są importowane przy starcie, jeśli jeszcze ich nie ma w bazie) |
 
 Przykład zaproszenia znajomego (ustaw `public_address = "gra.example.pl:7700"` w konfiguracji):
 
@@ -60,7 +73,7 @@ Przy pierwszym uruchomieniu program pyta o konto (`Anuluj` kończy program):
 - `Mam zaproszenie`: wklej cały `Kod zaproszenia` (`kom1-…`) od administratora, wybierz `Nazwę użytkownika` (1–32 znaki: litery, cyfry, `_ - .`) i `Hasło` (co najmniej 8 znaków, wpisane dwa razy). Zaproszenie zawiera adres serwera i odcisk certyfikatu.
 - `Mam już konto`: `Adres serwera` (host:port), `Odcisk certyfikatu` (64 znaki z wydruku serwera), `Nazwa użytkownika` i `Hasło`.
 
-Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym logowaniu) i zapomina hasło: kolejne uruchomienia łączą się bez pytania. Gdy sesja wygaśnie (np. administrator zresetował hasło), okno `Mam już konto` otwiera się samo z wpisanym serwerem i nazwą. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (token i hasło chronione DPAPI, tylko dla tego konta Windows).
+Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym logowaniu) i zapomina hasło: kolejne uruchomienia łączą się bez pytania. Nazwę zapisuje tak, jak zna ją serwer (wielkość liter przy logowaniu nie ma znaczenia). Gdy sesja wygaśnie (np. administrator zresetował hasło), okno `Mam już konto` otwiera się samo z wpisanym serwerem i nazwą. Gdy to samo konto zalogowało się gdzie indziej, wystarczy otworzyć `Konto…` i nacisnąć `OK` z pustym hasłem — puste hasło przy zapamiętanej sesji oznacza „użyj zapamiętanej sesji”. Wybranie `Mam zaproszenie` przy zalogowanym koncie nie usuwa jego sesji, dopóki nowe konto nie zostanie założone. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (token i hasło chronione DPAPI, tylko dla tego konta Windows).
 
 - U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…` (po utworzeniu wchodzisz do niego), `Ustawienia…`.
 - Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200%, `Wycisz u mnie` i `Kod bezpieczeństwa…` (osoby z Twojego pokoju: porównajcie kod głosowo i wpisz jego pierwszą grupę, żeby oznaczyć urządzenie jako zweryfikowane albo zaakceptować zmieniony klucz).
@@ -77,7 +90,7 @@ komunikator-cli --invite kom1-… --user ala
 komunikator-cli
 ```
 
-`--invite` zakłada konto (hasło ze zmiennej `KOMUNIKATOR_PASSWORD`, co najmniej 8 znaków) i zapisuje serwer, odcisk, nazwę i sesję w `settings.toml` w katalogu danych; kolejne uruchomienia bez opcji używają zapamiętanej sesji. Można też zalogować się hasłem bez zapisywania czegokolwiek: `komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala`.
+`--invite` zakłada konto (hasło ze zmiennej `KOMUNIKATOR_PASSWORD`, co najmniej 8 znaków) i zapisuje serwer, odcisk, nazwę i sesję w `settings.toml` w katalogu danych; kolejne uruchomienia bez opcji używają zapamiętanej sesji. Istniejące konto loguje się hasłem (z tej samej zmiennej) i jest zapamiętywane tak samo: `komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala`. Gdy zapamiętana sesja wygaśnie, program wypisuje dokładnie to polecenie. Zapis następuje dopiero po udanym logowaniu, więc odrzucona próba nie zmienia zapamiętanego konta.
 
 Polecenia (wpisz i naciśnij Enter):
 

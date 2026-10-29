@@ -259,7 +259,8 @@ fn admin_commands_refuse_a_data_dir_the_server_never_used() {
     let missing = tempfile::TempDir::new().unwrap();
     let mut cfg = config(&missing, Some("gra.example.pl:7700"));
     cfg.data_dir = missing.path().join("pomyłka");
-    let calls: [(&str, Box<dyn Fn(&ServerConfig) -> anyhow::Result<String>>); 4] = [
+    type AdminCall = Box<dyn Fn(&ServerConfig) -> anyhow::Result<String>>;
+    let calls: [(&str, AdminCall); 4] = [
         ("users", Box::new(admin::users)),
         ("invite", Box::new(|c| admin::invite(c, 7, None))),
         ("block", Box::new(|c| admin::block(c, "ala"))),

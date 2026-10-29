@@ -49,6 +49,16 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../server.example.toml");
         let c = ServerConfig::load(Path::new(path)).unwrap();
         assert_eq!(c.bind, "0.0.0.0:7700".parse().unwrap());
+        assert!(c.users.is_empty(), "accounts come from invites");
+        // The commented-out legacy entry is still valid once uncommented.
+        let text = std::fs::read_to_string(path).unwrap();
+        let entry = &text[text.find("# [[users]]").expect("legacy example present")..];
+        let mut legacy = String::from("data_dir = \"/tmp\"\n");
+        for line in entry.lines() {
+            legacy.push_str(line.strip_prefix("# ").unwrap_or(line));
+            legacy.push('\n');
+        }
+        let c: ServerConfig = toml::from_str(&legacy).unwrap();
         assert_eq!(c.users.len(), 1);
         assert_eq!(c.users[0].name, "ala");
         assert!(c.users[0].admin);

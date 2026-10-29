@@ -1,16 +1,18 @@
 # Adres i port UDP, na którym serwer nasłuchuje.
 bind = "0.0.0.0:7700"
-# Katalog na certyfikat serwera (cert.der, key.der) i bazę pokoi (komunikator.db).
+# Katalog na certyfikat serwera (cert.der, key.der) i bazę kont i pokoi (komunikator.db).
+# Tylko dla użytkownika serwera: chmod 700 (baza zawiera hashe haseł).
 data_dir = "/var/lib/komunikator"
 
-# Adres, który trafia do zaproszeń (opcjonalnie).
+# Adres, który trafia do zaproszeń: `komunikator-server invite`.
 # public_address = "serwer.example.pl:7700"
 
-# Nowe konta powstają z kodów zaproszeń wygenerowanych przez administratora.
-# Poniższa lista jest opcjonalna: wpisy są jednorazowo importowane do bazy
-# przy starcie (istniejące konta są pomijane). Hash: `komunikator-server hash-password`.
-[[users]]
-name = "ala"
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$REPLACE"
-# Administrator może usuwać pokoje założone przez innych.
-admin = true
+# Konta powstają z zaproszeń (`komunikator-server invite`), a administratora
+# nadaje `komunikator-server make-admin`. Lista [[users]] służy tylko starszym
+# instalacjom: wpis jest importowany przy starcie, gdy konta nie ma jeszcze
+# w bazie; późniejsze zmiany wpisu są ignorowane (serwer o nich ostrzega),
+# więc konta zmieniaj poleceniami reset-password, make-admin i block.
+# [[users]]
+# name = "ala"
+# password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$REPLACE"
+# admin = true
