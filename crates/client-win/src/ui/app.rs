@@ -11,7 +11,7 @@ use client_core::net::session::{Credentials, FatalReason, SessionCommand, Sessio
 use client_core::settings::{Settings, SettingsStore};
 use client_core::update::{self, current_version, may_apply, CheckError, Decision};
 use protocol::invite::encode_invite;
-use protocol::update::Version;
+use protocol::update::{Manifest, Version};
 use protocol::MemberId;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -205,6 +205,8 @@ const UPDATED_TO: &str = "zaktualizowano do wersji ";
 
 /// What a background update check reports back to the window.
 enum UpdateMsg {
+    /// A verified, newer release; it is downloaded once I am not in a conversation.
+    Found(Manifest),
     Downloading,
     UpToDate,
     Ready(Version),
@@ -224,10 +226,15 @@ enum UpdateFailure {
 /// about updates (`shown`).
 fn failure_notice(f: &UpdateFailure, shown: Option<&str>) -> Option<String> {
     let UpdateFailure::Failed(why) = f else { return None };
+    update_notice(&format!("{UPDATE_FAILED}{why}"), shown)
+}
+
+/// `text`, unless the status bar shows (`shown`) something that is not about updates.
+fn update_notice(text: &str, shown: Option<&str>) -> Option<String> {
     let about_updates = |n: &str| {
         n == UPDATE_DOWNLOADING || n == UPDATE_READY || n.starts_with(UPDATE_FAILED) || n.starts_with(UPDATED_TO)
     };
-    shown.is_none_or(about_updates).then(|| format!("{UPDATE_FAILED}{why}"))
+    shown.is_none_or(about_updates).then(|| text.to_owned())
 }
 
 /// Hands update reports to the window thread and wakes it.
@@ -254,6 +261,8 @@ struct Updates {
     rx: mpsc::Receiver<UpdateMsg>,
     /// A check or download is running.
     busy: bool,
+    /// Verified manifest of a newer release, waiting to be downloaded.
+    found: Option<Manifest>,
     /// Staged beside the exe, waiting until I am not in a conversation.
     ready: Option<Version>,
     /// Swapped in: the new exe starts once this one has closed.
@@ -280,23 +289,45 @@ impl Updates {
             return None;
         };
         let (tx, rx) = mpsc::channel();
-        Some(Updates { key, exe, tx, rx, busy: false, ready: None, installed: false, restart_minimized: false })
+        Some(Updates { key, exe, tx, rx, busy: false, found: None, ready: None, installed: false, restart_minimized: false })
+    }
+
+    /// The found release to download now, unless one is being fetched or I am in a
+    /// conversation: a download competes with the call for bandwidth, so it waits too.
+    fn take_download(&mut self, in_conversation: bool) -> Option<Manifest> {
+        if self.busy || !may_apply(in_conversation) {
+            return None;
+        }
+        let m = self.found.take()?;
+        self.busy = true;
+        Some(m)
     }
 }
 
-/// Checks the server for a newer signed release and stages it; the version staged, if any.
+/// Asks the server for a newer signed release.
+async fn find_update(server: &str, fingerprint: [u8; 32], key: &[u8; 32]) -> UpdateMsg {
+    match update::check(server, fingerprint, key, current_version()).await {
+        Ok(Decision::Available(m)) => UpdateMsg::Found(m),
+        Ok(Decision::UpToDate) => UpdateMsg::UpToDate,
+        Err(CheckError::Unreachable(e)) => UpdateMsg::Failed(UpdateFailure::Unreachable(format!("{e:#}"))),
+        Err(CheckError::Rejected(why)) => UpdateMsg::Failed(UpdateFailure::Failed(why.into())),
+    }
+}
+
+/// Downloads and stages the release `m`; the version staged, or `None` when the exe already is
+/// that release (a build that misreports its version must not reinstall itself forever).
 async fn fetch_update(
     server: &str,
     fingerprint: [u8; 32],
-    key: &[u8; 32],
+    m: Manifest,
     exe: &Path,
     post: &UpdatePost,
 ) -> Result<Option<Version>, UpdateFailure> {
-    let decision = update::check(server, fingerprint, key, current_version()).await.map_err(|e| match e {
-        CheckError::Unreachable(e) => UpdateFailure::Unreachable(format!("{e:#}")),
-        CheckError::Rejected(why) => UpdateFailure::Failed(why.into()),
-    })?;
-    let Decision::Available(m) = decision else { return Ok(None) };
+    let (path, manifest) = (exe.to_owned(), m.clone());
+    if tokio::task::spawn_blocking(move || updater::release_in_place(&path, &manifest)).await.unwrap_or(false) {
+        tracing::warn!("release {} is the running exe; not installed again", m.version);
+        return Ok(None);
+    }
     post.send(UpdateMsg::Downloading);
     let bytes = update::download(server, fingerprint, &m).await.map_err(|e| UpdateFailure::Failed(format!("{e}")))?;
     let exe = exe.to_owned();
@@ -636,23 +667,41 @@ impl App {
     }
 
     /// Looks for a newer release in the background, unless one is already being fetched or
-    /// waits to be installed.
+    /// waits to be downloaded or installed.
     pub fn check_update(&mut self, hwnd: HWND) {
+        let Some((server, fingerprint)) = self.update_server() else { return };
         let Some(u) = &mut self.updates else { return };
-        if u.busy || u.ready.is_some() || u.installed {
+        if u.busy || u.found.is_some() || u.ready.is_some() || u.installed {
             return;
         }
+        u.busy = true;
+        let post = UpdatePost { tx: u.tx.clone(), hwnd: hwnd.0 as usize };
+        let key = u.key;
+        self.rt.spawn(async move {
+            post.send(find_update(&server, fingerprint, &key).await);
+        });
+    }
+
+    /// The server the account (or a registration in progress) uses.
+    fn update_server(&self) -> Option<(String, [u8; 32])> {
         let s = self.state.settings();
         let target = match &self.register {
             Some(r) => Some((r.invite.server.clone(), r.invite.fingerprint)),
             None => protocol::parse_fingerprint(&s.fingerprint).map(|fp| (s.server.clone(), fp)),
         };
-        let Some((server, fingerprint)) = target.filter(|(server, _)| !server.is_empty()) else { return };
-        u.busy = true;
+        target.filter(|(server, _)| !server.is_empty())
+    }
+
+    /// Downloads a found release in the background once I am not in a conversation.
+    pub fn download_update_if_free(&mut self, hwnd: HWND) {
+        let in_conversation = self.state.in_room_with_others();
+        let Some((server, fingerprint)) = self.update_server() else { return };
+        let Some(u) = &mut self.updates else { return };
+        let Some(m) = u.take_download(in_conversation) else { return };
         let post = UpdatePost { tx: u.tx.clone(), hwnd: hwnd.0 as usize };
-        let (key, exe) = (u.key, u.exe.clone());
+        let exe = u.exe.clone();
         self.rt.spawn(async move {
-            let msg = match fetch_update(&server, fingerprint, &key, &exe, &post).await {
+            let msg = match fetch_update(&server, fingerprint, m, &exe, &post).await {
                 Ok(None) => UpdateMsg::UpToDate,
                 Ok(Some(v)) => UpdateMsg::Ready(v),
                 Err(f) => UpdateMsg::Failed(f),
@@ -666,7 +715,15 @@ impl App {
         let Some(u) = &mut self.updates else { return };
         while let Ok(m) = u.rx.try_recv() {
             match m {
-                UpdateMsg::Downloading => self.local_notice = Some(UPDATE_DOWNLOADING.into()),
+                UpdateMsg::Found(m) => {
+                    u.busy = false;
+                    u.found = Some(m);
+                }
+                UpdateMsg::Downloading => {
+                    if let Some(n) = update_notice(UPDATE_DOWNLOADING, self.local_notice.as_deref().or(shown)) {
+                        self.local_notice = Some(n);
+                    }
+                }
                 UpdateMsg::UpToDate => u.busy = false,
                 UpdateMsg::Ready(v) => {
                     u.busy = false;
@@ -691,10 +748,10 @@ impl App {
     /// the program should now close (`run` then starts the new exe, minimised when the window
     /// is `out_of_sight` now).
     pub fn install_update_if_due(&mut self, shown: Option<&str>, out_of_sight: bool) -> bool {
-        let Some(u) = &mut self.updates else { return false };
-        if u.ready.is_none() || !may_apply(self.state.in_room_with_others()) {
+        if !self.update_due() {
             return false;
         }
+        let Some(u) = &mut self.updates else { return false };
         u.ready = None;
         match updater::swap(&u.exe) {
             Ok(()) => {
@@ -711,6 +768,11 @@ impl App {
                 false
             }
         }
+    }
+
+    /// A staged release may be installed now: I am not in a conversation.
+    pub fn update_due(&self) -> bool {
+        self.updates.as_ref().is_some_and(|u| u.ready.is_some()) && may_apply(self.state.in_room_with_others())
     }
 
     /// The exe to start after closing, when an update was installed, and whether minimised.
@@ -925,6 +987,45 @@ mod tests {
             assert_eq!(failure_notice(&bad, Some(ours)), text, "{ours}");
         }
         assert_eq!(failure_notice(&bad, Some("skrót: Wycisz mikrofon (Ctrl+M): zajęty")), None);
+    }
+
+    #[test]
+    fn downloading_never_covers_other_notices() {
+        let downloading = Some(UPDATE_DOWNLOADING.to_owned());
+        assert_eq!(update_notice(UPDATE_DOWNLOADING, None), downloading);
+        assert_eq!(update_notice(UPDATE_DOWNLOADING, Some("zaktualizowano do wersji 1.2.3")), downloading);
+        assert_eq!(update_notice(UPDATE_DOWNLOADING, Some("aktualizacja nieudana: x")), downloading);
+        assert_eq!(update_notice(UPDATE_DOWNLOADING, Some("nie udało się zapisać ustawień: dysk pełny")), None);
+    }
+
+    #[test]
+    fn a_found_release_downloads_only_outside_a_conversation() {
+        let m = protocol::update::Manifest {
+            version: Version { major: 2, minor: 0, patch: 0 },
+            file: "komunikator-2.0.0.exe".into(),
+            size: 1,
+            sha256: [0; 32],
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut u = Updates {
+            key: [0; 32],
+            exe: PathBuf::new(),
+            tx,
+            rx,
+            busy: false,
+            found: Some(m.clone()),
+            ready: None,
+            installed: false,
+            restart_minimized: false,
+        };
+        // In a call: nothing is fetched, the release keeps waiting.
+        assert_eq!(u.take_download(true), None);
+        assert_eq!(u.found.as_ref(), Some(&m));
+        assert!(!u.busy);
+        // Free: it starts once.
+        assert_eq!(u.take_download(false), Some(m));
+        assert!(u.busy);
+        assert_eq!(u.take_download(false), None);
     }
 
     #[test]

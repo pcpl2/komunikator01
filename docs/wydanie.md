@@ -95,4 +95,4 @@ Klucz podpisujący leży tylko na Twoim komputerze, nigdy na serwerze.
    ```
    Dokładną nazwę pliku wydania podaje `komunikator-release sign` i pole `file` manifestu. Restart serwera nie jest potrzebny.
 
-Klienci pobiorą wydanie przy następnym sprawdzeniu i zainstalują je, gdy nie będą w rozmowie.
+Klienci znajdą wydanie przy następnym sprawdzeniu, a pobiorą je i zainstalują, gdy nie będą w rozmowie.

@@ -591,13 +591,20 @@ impl Window {
         self.login_prompt();
     }
 
-    /// Installs a waiting update when I am not in a conversation, then closes the program
-    /// (`run` starts the new exe). Never while a dialog is open: its own loop would end.
+    /// Moves a found update along when I am not in a conversation: downloads it, or installs
+    /// it and closes the program (`run` starts the new exe). Never installs while a dialog is
+    /// open: its own loop would end.
     fn install_update(&self) {
-        if !unsafe { IsWindowEnabled(self.hwnd()) }.as_bool() {
+        let hwnd = self.hwnd();
+        self.with_app(|app| app.download_update_if_free(hwnd));
+        if !unsafe { IsWindowEnabled(hwnd) }.as_bool() {
             return;
         }
-        let hwnd = self.hwnd();
+        if !self.inner.try_borrow().is_ok_and(|i| i.app.update_due()) {
+            return;
+        }
+        // Like `Wyjdź`: the settings are on disk before the exe is replaced.
+        self.save_settings();
         // Hidden in the tray or minimised (over a game): the new copy starts the same way.
         let out_of_sight = unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() };
         let Ok(mut inner) = self.inner.try_borrow_mut() else { return };
