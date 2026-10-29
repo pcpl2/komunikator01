@@ -9,13 +9,7 @@ Serwer działa jako kontener Dockera. Obraz `ghcr.io/pcpl2/komunikator-server` j
 
 ## Pierwsze uruchomienie serwera
 
-Na serwerze z Debianem zainstaluj Dockera i plugin compose ([instrukcja Dockera dla Debiana](https://docs.docker.com/engine/install/debian/)).
-
-Zaloguj się do ghcr.io. Potrzebny jest token GitHub (classic) z uprawnieniem `read:packages`: `Settings → Developer settings → Personal access tokens`. Wpisz go jako hasło:
-
-```
-docker login ghcr.io -u pcpl2
-```
+Docker z pluginem compose i dostęp do prywatnego ghcr.io (logowanie, pobranie obrazu) zapewnia administrator serwera.
 
 Skopiuj z repozytorium `deploy/docker-compose.yml` i `deploy/komunikator.toml` do jednego katalogu, np. `/opt/komunikator`, i utwórz w nim pusty podkatalog `updates`. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera (domena albo IP i port 7700). Ten adres trafia do zaproszeń. Potem uruchom:
 

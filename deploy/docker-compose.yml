@@ -1,6 +1,6 @@
 # Serwer komunikatora: `docker compose up -d` w katalogu z tym plikiem, komunikator.toml
 # i podkatalogiem updates/ (może być pusty).
-# Obraz jest prywatny: najpierw `docker login ghcr.io` (token z uprawnieniem read:packages).
+# Obraz jest prywatny: Docker musi mieć dostęp do ghcr.io (zapewnia administrator serwera).
 services:
   komunikator:
     image: ghcr.io/pcpl2/komunikator-server:latest

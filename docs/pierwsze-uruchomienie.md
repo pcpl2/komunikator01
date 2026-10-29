@@ -42,19 +42,16 @@ Każde kolejne wydanie serwera dostaje wyższą wersję wpisaną w tym samym pol
 
 ### 4. Postaw serwer (Debian z Dockerem)
 
-1. Zainstaluj Dockera z pluginem compose ([instrukcja Dockera dla Debiana](https://docs.docker.com/engine/install/debian/)).
-2. Utwórz token GitHub do pobierania obrazu: `Settings → Developer settings → Personal access tokens → Tokens (classic)` z jedynym uprawnieniem `read:packages`. Tokeny fine-grained nie działają z ghcr.io. Na serwerze zaloguj się nim, wpisując token jako hasło:
-   ```
-   docker login ghcr.io -u pcpl2
-   ```
-3. Repozytorium jest prywatne, więc pliki konfiguracji skopiuj ze swojego komputera:
+Docker i dostęp do prywatnego ghcr.io (logowanie, `docker pull` obrazu `ghcr.io/pcpl2/komunikator-server`) zapewnia administrator serwera.
+
+1. Repozytorium jest prywatne, więc pliki konfiguracji skopiuj ze swojego komputera:
    ```
    ssh serwer 'sudo install -d -o $USER /opt/komunikator'
    scp deploy/docker-compose.yml deploy/komunikator.toml serwer:/opt/komunikator/
    ```
-4. W `/opt/komunikator/komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`. Ten adres trafia do zaproszeń.
-5. Otwórz port **UDP** 7700 w firewallu dostawcy serwera (panel VPS), a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. TCP nie wystarczy. W samym systemie Docker otwiera ten port sam, z pominięciem `ufw`.
-6. Uruchom serwer:
+2. W `/opt/komunikator/komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`. Ten adres trafia do zaproszeń.
+3. Otwórz port **UDP** 7700 w firewallu dostawcy serwera (panel VPS), a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. TCP nie wystarczy. W samym systemie Docker otwiera ten port sam, z pominięciem `ufw`.
+4. Uruchom serwer:
    ```
    cd /opt/komunikator
    mkdir -p updates
