@@ -83,9 +83,8 @@ jobs:
       - name: Testy
         run: cargo test --locked -p protocol -p client-core -p release
 
-      # Serwer wbudowany w program (src/defaults.rs): podpowiedź w oknie „Mam już konto” i domyślny
-      # serwer wiersza poleceń. Sekret albo zmienna repozytorium; bez nich program działa tylko
-      # z zaproszeniami i wpisanym adresem.
+      # Serwer wbudowany w program (src/defaults.rs): okno „Mam już konto” pyta tylko o nazwę
+      # i hasło, a wiersz poleceń łączy się z nim z samym --user. Sekret albo zmienna repozytorium.
       - name: Serwer w programie
         shell: bash
         env:
@@ -94,16 +93,12 @@ jobs:
         run: |
           server=$(printf '%s' "$SERVER_ADDRESS" | tr -d '[:space:]')
           fingerprint=$(printf '%s' "$SERVER_FINGERPRINT" | tr -d '[:space:]' | tr 'A-F' 'a-f')
-          if [ -z "$server" ] && [ -z "$fingerprint" ]; then
-            echo "::warning::Bez wbudowanego serwera: brak SERVER_ADDRESS i SERVER_FINGERPRINT."
-            exit 0
-          fi
           if ! printf '%s' "$server" | grep -qE '^[^:[:space:]]+:[0-9]{1,5}$'; then
-            echo "::error::SERVER_ADDRESS musi mieć postać host:port (np. gra.example.pl:7700)."
+            echo "::error::SERVER_ADDRESS (sekret albo zmienna) musi mieć postać host:port, np. gra.example.pl:7700."
             exit 1
           fi
           if ! printf '%s' "$fingerprint" | grep -qE '^[0-9a-f]{64}$'; then
-            echo "::error::SERVER_FINGERPRINT musi mieć 64 znaki szesnastkowe (linia fingerprint: z logu serwera)."
+            echo "::error::SERVER_FINGERPRINT (sekret albo zmienna) musi mieć 64 znaki szesnastkowe z linii fingerprint: w logu serwera."
             exit 1
           fi
           echo "KOMUNIKATOR_SERVER=$server" >> "$GITHUB_ENV"

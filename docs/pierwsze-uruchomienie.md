@@ -56,7 +56,7 @@ W logu powinna pojawić się linia `fingerprint: …`. Oznacza ona, że serwer d
 1. W repozytorium na GitHubie (`Settings → Secrets and variables → Actions`) dodaj dwa sekrety:
    - `SERVER_ADDRESS`: adres z portem, np. `gra.example.pl:7700`;
    - `SERVER_FINGERPRINT`: 64 znaki z linii `fingerprint:`.
-2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`. Powstanie release z `komunikator.exe` dla graczy, z wbudowanym adresem serwera i kluczem wydań.
+2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`. Powstanie release z `komunikator.exe` dla graczy, z wbudowanym adresem serwera i kluczem wydań. Bez tych sekretów workflow się zatrzyma.
 
 ### 6. Otwórz port UDP 7700
 
@@ -91,7 +91,7 @@ Później przydadzą się polecenia (każde z `docker exec komunikator komunikat
 
 1. Utwórz folder, np. `C:\Gry\Komunikator`, i wrzuć do niego `komunikator.exe`. Program musi móc zapisywać w tym folderze, więc nie wybieraj `Program Files`.
 2. Uruchom program. Jeśli Windows pokaże „System Windows ochronił ten komputer”, kliknij **Więcej informacji → Uruchom mimo to**. Program nie ma płatnego podpisu wydawcy, dlatego to ostrzeżenie pojawia się tylko za pierwszym razem.
-3. Wybierz **Mam zaproszenie** i wklej cały kod `kom1-…`.
+3. Wybierz **Mam zaproszenie** i wklej cały kod `kom1-…`. Kto ma już konto, wybiera **Mam już konto** i wpisuje tylko nazwę i hasło.
 4. Wpisz nazwę użytkownika (1–32 znaki: litery, cyfry, `_ - .`) oraz hasło (co najmniej 8 znaków, dwa razy). Hasło wpisujesz tylko raz, bo program zapamiętuje sesję.
 5. Otwórz **Ustawienia…** i ustaw:
    - mikrofon i głośniki/słuchawki;

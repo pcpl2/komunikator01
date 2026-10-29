@@ -242,6 +242,9 @@ pub struct AccountForm {
     pub notice: Option<String>,
     /// A session token is stored for `login`'s account, so its password may be left empty.
     pub remembered: bool,
+    /// The server is built into the program: `login`'s server and fingerprint are used as they
+    /// are and the login mode asks only for the name and password.
+    pub server_fixed: bool,
 }
 
 /// Leaves the invite code out (the password is hidden by `AccountInput`).
@@ -254,6 +257,7 @@ impl std::fmt::Debug for AccountForm {
             .field("invite_user", &self.invite_user)
             .field("notice", &self.notice)
             .field("remembered", &self.remembered)
+            .field("server_fixed", &self.server_fixed)
             .finish()
     }
 }
@@ -779,9 +783,9 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
     let invite_radio = radio(ID_MODE_INVITE, "Mam zaproszenie", m, WS_GROUP.0);
     let login_radio = radio(ID_MODE_LOGIN, "Mam już konto", m + 200, 0);
     y += 30;
-    let fields = |first_id: u16, first_error: u16, rows: [(&str, &str, u32, usize); 4]| {
+    let fields = |first_id: u16, first_error: u16, rows: &[(&str, &str, u32, usize)]| {
         let mut set = FieldSet { labels: Vec::new(), edits: Vec::new(), errors: Vec::new() };
-        for (i, (label, value, style, limit)) in rows.into_iter().enumerate() {
+        for (i, &(label, value, style, limit)) in rows.iter().enumerate() {
             let fy = y + 64 * i as i32;
             // Ends the radio buttons' group, so arrow keys stay with them.
             let group = if i == 0 { WS_GROUP.0 } else { 0 };
@@ -794,7 +798,7 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
     let invite = fields(
         ID_INVITE,
         ID_INVITE_ERROR,
-        [
+        &[
             ("Kod zaproszenia", form.invite.as_str(), 0, 1024),
             ("Nazwa użytkownika", form.invite_user.as_str(), 0, 64),
             ("Hasło (co najmniej 8 znaków)", "", ES_PASSWORD as u32, 256),
@@ -802,16 +806,15 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
         ],
     );
     let password_label = if form.remembered { "Hasło (zostaw puste, aby użyć zapamiętanej sesji)" } else { "Hasło" };
-    let login = fields(
-        ID_SERVER,
-        ID_ERROR,
-        [
-            ("Adres serwera (host:port)", form.login.server.as_str(), 0, 255),
-            ("Odcisk certyfikatu (64 znaki)", form.login.fingerprint.as_str(), 0, 128),
-            ("Nazwa użytkownika", form.login.username.as_str(), 0, 64),
-            (password_label, form.login.password.as_str(), ES_PASSWORD as u32, 256),
-        ],
-    );
+    let login_rows = [
+        ("Adres serwera (host:port)", form.login.server.as_str(), 0, 255),
+        ("Odcisk certyfikatu (64 znaki)", form.login.fingerprint.as_str(), 0, 128),
+        ("Nazwa użytkownika", form.login.username.as_str(), 0, 64),
+        (password_label, form.login.password.as_str(), ES_PASSWORD as u32, 256),
+    ];
+    // With the server built in, only the name and password rows exist (ids keep their meaning).
+    let skip: u16 = if form.server_fixed { 2 } else { 0 };
+    let login = fields(ID_SERVER + skip, ID_ERROR + skip, &login_rows[usize::from(skip)..]);
     y += 4 * 64 + 4;
     d.button(ID_OK, "OK", true, w - m - 2 * 88 - 8, y, 88);
     d.button(ID_CANCEL, "Anuluj", false, w - m - 88, y, 88);
@@ -826,11 +829,14 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
     };
     let mut mode = form.mode;
     let first = switch(mode).edits.iter().find(|e| get_text(**e).is_empty()).copied();
-    d.show(w, y + 26 + m, first.unwrap_or(login.edits[3]));
+    d.show(w, y + 26 + m, first.unwrap_or(*login.edits.last().expect("password row")));
     loop {
         match d.next() {
             Ev::Command { id: ID_OK, .. } if mode == AccountMode::Login => {
-                let v = login.values();
+                let mut v = login.values();
+                if form.server_fixed {
+                    v.splice(0..0, [form.login.server.clone(), form.login.fingerprint.clone()]);
+                }
                 match validate_account(&v[0], &v[1], &v[2], &v[3], form.remembered.then_some(&form.login)) {
                     Ok(()) => {
                         return Some(AccountChoice::Login(AccountInput {
@@ -840,7 +846,8 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
                             password: v[3].clone(),
                         }))
                     }
-                    Err((field, text)) => login.error(field as usize, text),
+                    // A bad built-in server cannot be fixed here; it shows on the first row.
+                    Err((field, text)) => login.error((field as usize).saturating_sub(usize::from(skip)), text),
                 }
             }
             Ev::Command { id: ID_OK, .. } => {
@@ -860,8 +867,10 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
                     let _ = unsafe { SetFocus(Some(switch(mode).edits[0])) };
                 }
             }
-            Ev::Command { id, code } if u32::from(code) == EN_CHANGE && (ID_SERVER..ID_SERVER + 4).contains(&id) => {
-                set_text(login.errors[usize::from(id - ID_SERVER)], "");
+            Ev::Command { id, code }
+                if u32::from(code) == EN_CHANGE && (ID_SERVER + skip..ID_SERVER + 4).contains(&id) =>
+            {
+                set_text(login.errors[usize::from(id - ID_SERVER - skip)], "");
             }
             Ev::Command { id, code } if u32::from(code) == EN_CHANGE && (ID_INVITE..ID_INVITE + 4).contains(&id) => {
                 set_text(invite.errors[usize::from(id - ID_INVITE)], "");
@@ -1366,6 +1375,7 @@ mod tests {
             invite_user: String::new(),
             notice: None,
             remembered: false,
+            server_fixed: false,
         }
     }
 
@@ -1410,6 +1420,44 @@ mod tests {
         let esc = |d, _| scripted::key(scripted::item(d, ID_SERVER), 0x1B);
         let cancelled = scripted::run(esc, || account_dialog(None, &initial, false));
         assert_eq!(cancelled, None);
+    }
+
+    #[test]
+    fn built_in_server_leaves_only_name_and_password() {
+        let initial = AccountForm {
+            server_fixed: true,
+            ..login_form(AccountInput { server: "gra.pl:7700".into(), fingerprint: FP.into(), ..AccountInput::default() })
+        };
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let result = scripted::run(
+            move |d, step| match step {
+                0 => {
+                    let exists = |id: u16| unsafe { GetDlgItem(Some(d), i32::from(id)) }.is_ok();
+                    log.borrow_mut().push(format!("{} {}", exists(ID_SERVER), exists(ID_SERVER + 1)));
+                    set_text(scripted::item(d, ID_SERVER + 2), "ola");
+                    scripted::press(d, ID_OK);
+                }
+                1 => {
+                    // No password: the message is next to the password row.
+                    log.borrow_mut().push(get_text(scripted::item(d, ID_ERROR + 3)));
+                    set_text(scripted::item(d, ID_SERVER + 3), "tajne hasło");
+                    scripted::press(d, ID_OK);
+                }
+                _ => {}
+            },
+            || account_dialog(None, &initial, false),
+        );
+        assert_eq!(*seen.borrow(), vec!["false false".to_owned(), "podaj hasło".to_owned()]);
+        assert_eq!(
+            result,
+            Some(AccountChoice::Login(AccountInput {
+                server: "gra.pl:7700".into(),
+                fingerprint: FP.into(),
+                username: "ola".into(),
+                password: "tajne hasło".into(),
+            }))
+        );
     }
 
     #[test]

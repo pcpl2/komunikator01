@@ -140,11 +140,11 @@ Workflow klienta wkompilowuje w program adres i odcisk certyfikatu serwera z sek
 - `SERVER_ADDRESS`, np. `gra.example.pl:7700`;
 - `SERVER_FINGERPRINT`, czyli 64 znaki z linii `fingerprint:` w logu serwera.
 
-Program używa ich wtedy, gdy nic nie ma zapisane:
-- okno „Mam już konto” ma od razu wypełniony serwer i odcisk, więc wystarczy nazwa i hasło;
+W efekcie:
+- okno „Mam już konto” pyta tylko o nazwę i hasło;
 - `komunikator-cli --user ola` łączy się z tym serwerem bez `--server` i `--fingerprint`.
 
-Zaproszenia działają jak dotąd, bo same zawierają adres i odcisk. Bez tych sekretów workflow buduje program bez wbudowanego serwera i tylko o tym ostrzega. Podanie tylko jednego z nich albo zła postać zatrzymuje workflow.
+Oba sekrety są wymagane: bez nich albo przy złej postaci workflow się zatrzymuje. Zaproszenia działają jak dotąd. Konto założone zaproszeniem do innego serwera zostaje przy swoim adresie. Program zbudowany lokalnie, bez wbudowanego serwera, pokazuje pola adresu i odcisku jak dawniej.
 
 Odcisk zmienia się wyłącznie po utracie wolumenu `/data`. Wtedy trzeba zaktualizować sekret i wydać nowego klienta.
 

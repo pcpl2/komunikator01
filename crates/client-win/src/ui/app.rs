@@ -387,6 +387,7 @@ fn account_form(s: &Settings, vault: &Vault) -> AccountForm {
         invite_user: String::new(),
         notice: None,
         remembered: vault.token().is_some(),
+        server_fixed: crate::defaults::server().is_some() && crate::defaults::fingerprint().is_some(),
     }
 }
 
