@@ -10,9 +10,24 @@ use crate::{tls, unix_now, ServerConfig};
 
 const DAY_S: u64 = 24 * 60 * 60;
 
+/// Refuses a data directory the server has never run in (most likely a wrong `--config`):
+/// opening it would silently create an empty database or a new server identity there.
+fn check_data_dir(config: &ServerConfig) -> anyhow::Result<()> {
+    for file in ["cert.der", "komunikator.db"] {
+        let path = config.data_dir.join(file);
+        if !path.is_file() {
+            bail!(
+                "nie ma pliku {} — czy --config wskazuje plik konfiguracji działającego serwera? \
+                 Katalog danych (data_dir) tworzy dopiero `komunikator-server run`.",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn open(config: &ServerConfig) -> anyhow::Result<Store> {
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("tworzenie katalogu {}", config.data_dir.display()))?;
+    check_data_dir(config)?;
     Store::open(&config.data_dir.join("komunikator.db")).context("otwieranie bazy danych")
 }
 
@@ -31,9 +46,10 @@ pub fn invite(config: &ServerConfig, days: u64, server: Option<&str>) -> anyhow:
     if days == 0 {
         bail!("zaproszenie musi być ważne co najmniej 1 dzień");
     }
+    let store = open(config)?;
     let fingerprint = tls::load_or_create_identity(&config.data_dir)?.fingerprint;
     let code = random_invite_code();
-    open(config)?.create_invite(&code, unix_now(), days.saturating_mul(DAY_S))?;
+    store.create_invite(&code, unix_now(), days.saturating_mul(DAY_S))?;
     let text = encode_invite(&Invite { server: server.to_string(), fingerprint, code });
     Ok(format!(
         "Zaproszenie (ważne {days} dni, jednorazowe):\n\n{text}\n\n\

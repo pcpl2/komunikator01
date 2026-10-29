@@ -63,8 +63,8 @@ pub(crate) struct Shared {
     /// Checked for unknown users so timing does not reveal which accounts exist.
     pub(crate) dummy_hash: String,
     pub(crate) verify_slots: tokio::sync::Semaphore,
-    /// Username → client runs that were replaced by a login elsewhere. They may not
-    /// come back, or a client that missed its notice would kick out the newer one.
+    /// Account key (lowercase name) → client runs that were replaced by a login elsewhere.
+    /// They may not come back, or a client that missed its notice would kick out the newer one.
     pub(crate) retired: Mutex<HashMap<String, VecDeque<u64>>>,
 }
 
@@ -133,10 +133,17 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
 
     let ip = conn.remote_address().ip();
     let kind = auth_kind(&auth);
+    // Before the credentials are checked, so a returning replaced run does not spend its token
+    // (the user's next start needs it).
+    if is_retired(&shared, &claimed, session) {
+        tracing::info!(%ip, user = ?logged_name(&claimed), "replaced client tried to come back");
+        send_and_close(send, &conn, ServerMsg::SessionReplaced, CLOSE_REPLACED).await;
+        return Ok(());
+    }
     let username = match check_login(&shared, ip, version, &claimed, auth).await {
         Ok(name) => name,
         Err(reason) => {
-            tracing::info!(%ip, user = %claimed, kind, ?reason, "login rejected");
+            tracing::info!(%ip, user = ?logged_name(&claimed), kind, ?reason, "login rejected");
             send_and_close(send, &conn, ServerMsg::Rejected { reason }, 0).await;
             return Ok(());
         }
@@ -168,6 +175,11 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     log_out(&shared, id);
     tracing::info!(user = %username, id, "left");
     Ok(())
+}
+
+/// A name from the network, as logged: escaped by `?` at the call site and cut short.
+fn logged_name(name: &str) -> String {
+    name.chars().take(64).collect()
 }
 
 fn auth_kind(auth: &Auth) -> &'static str {
@@ -213,7 +225,7 @@ async fn password_login(
     let name = username.to_owned();
     let account = match with_store(shared, move |s| s.account(&name)).await {
         Some(Ok(account)) => account,
-        _ => return Err(store_failed("account lookup")),
+        other => return Err(store_failed("account lookup", other.map(|r| r.map(drop)))),
     };
     // Unknown users are checked against a dummy hash so timing does not reveal account names.
     let hash = account.as_ref().map_or_else(|| shared.dummy_hash.clone(), |a| a.hash.clone());
@@ -234,17 +246,18 @@ async fn token_login(
 ) -> Result<String, RejectReason> {
     let claimed = username.to_lowercase();
     let account = with_store(shared, move |s| -> anyhow::Result<Option<Account>> {
-        // Redeemed even when it is someone else's: a leaked token dies on first use.
         match s.redeem_token(&token, unix_now())? {
             Some(key) if key == claimed => s.account(&key),
-            _ => Ok(None),
+            // Someone else's: a leaked token dies on first use, without a grace period.
+            Some(_) => s.forget_token(&token).map(|()| None),
+            None => Ok(None),
         }
     })
     .await;
     match account {
         Some(Ok(Some(a))) if !a.blocked => Ok(a.name),
         Some(Ok(_)) => Err(RejectReason::TokenInvalid),
-        _ => Err(store_failed("token redeem")),
+        other => Err(store_failed("token redeem", other.map(|r| r.map(drop)))),
     }
 }
 
@@ -259,7 +272,7 @@ async fn register(
         return Err(RejectReason::PasswordTooShort);
     }
     let Some(hash) = argon2(shared, move || hash_password(&password)).await else {
-        return Err(store_failed("password hashing"));
+        return Err(store_failed("password hashing", None));
     };
     match with_store(shared, move |s| s.register(&invite, &name, &hash, unix_now())).await {
         Some(Ok(account)) => {
@@ -268,7 +281,8 @@ async fn register(
         }
         Some(Err(RegisterError::InviteInvalid)) => Err(RejectReason::InviteInvalid),
         Some(Err(RegisterError::NameTaken)) => Err(RejectReason::NameTaken),
-        _ => Err(store_failed("registration")),
+        Some(Err(RegisterError::Db(e))) => Err(store_failed("registration", Some(Err(e)))),
+        None => Err(store_failed("registration", None)),
     }
 }
 
@@ -278,16 +292,22 @@ async fn issue_token(shared: &Arc<Shared>, name: &str) -> Option<[u8; 32]> {
     let name = name.to_owned();
     match with_store(shared, move |s| s.issue_token(&name, &token, unix_now(), TOKEN_TTL_S)).await {
         Some(Ok(())) => Some(token),
-        _ => {
-            store_failed("token issue");
+        other => {
+            store_failed("token issue", other);
             None
         }
     }
 }
 
 /// A server-side failure: the client is told to retry later rather than that it was wrong.
-fn store_failed(what: &str) -> RejectReason {
-    tracing::warn!("account store failed during {what}");
+/// `outcome` is what the store call returned (`None`: it panicked); its error is logged with
+/// its whole chain of causes.
+fn store_failed(what: &str, outcome: Option<anyhow::Result<()>>) -> RejectReason {
+    match outcome {
+        Some(Err(e)) => tracing::warn!("account store failed during {what}: {e:#}"),
+        None => tracing::warn!("account store failed during {what}: the store call panicked"),
+        Some(Ok(())) => tracing::warn!("account store failed during {what}"),
+    }
     RejectReason::RateLimited
 }
 
@@ -324,8 +344,8 @@ pub(crate) async fn watch_store(shared: Arc<Shared>) {
 async fn kick_blocked(shared: &Arc<Shared>) {
     let blocked = match with_store(shared, |s| s.blocked_accounts()).await {
         Some(Ok(names)) => names.iter().map(|n| n.to_lowercase()).collect::<HashSet<_>>(),
-        _ => {
-            store_failed("blocked accounts check");
+        other => {
+            store_failed("blocked accounts check", other.map(|r| r.map(drop)));
             return;
         }
     };
@@ -352,8 +372,8 @@ async fn sync_rooms(shared: &Arc<Shared>) {
         let stored = shared.store.lock().unwrap().rooms();
         match stored {
             Ok(stored) => apply_room_changes(&mut reg, &stored),
-            Err(_) => {
-                store_failed("room refresh");
+            Err(e) => {
+                store_failed("room refresh", Some(Err(e)));
             }
         }
     })
@@ -391,6 +411,11 @@ fn broadcast(reg: &Registry<Peer>, msg: ServerMsg) {
     }
 }
 
+/// Whether client run `session` of `username`'s account was replaced by a login elsewhere.
+fn is_retired(shared: &Shared, username: &str, session: u64) -> bool {
+    shared.retired.lock().unwrap().get(&username.to_lowercase()).is_some_and(|r| r.contains(&session))
+}
+
 /// `None` when this client run was already replaced by a login elsewhere.
 fn log_in(
     shared: &Shared,
@@ -403,7 +428,9 @@ fn log_in(
     let session = peer.session;
     let mut reg = shared.registry.lock().unwrap();
     let mut retired = shared.retired.lock().unwrap();
-    if retired.get(username).is_some_and(|r| r.contains(&session)) {
+    let account_key = username.to_lowercase();
+    // Checked again under the registry lock: the run may have been replaced since.
+    if retired.get(&account_key).is_some_and(|r| r.contains(&session)) {
         return None;
     }
     let outcome = reg.login(username, peer, choice);
@@ -411,7 +438,7 @@ fn log_in(
     if let Some((old_id, old)) = &outcome.replaced {
         // The same run reconnecting over its own stale connection is not a replacement.
         if old.session != session {
-            let r = retired.entry(username.to_owned()).or_default();
+            let r = retired.entry(account_key).or_default();
             if r.len() == RETIRED_PER_USER {
                 r.pop_front();
             }
@@ -658,5 +685,13 @@ mod tests {
         assert_eq!((0..21).filter(|_| b.try_take(t0)).count(), 20);
         let t1 = t0 + Duration::from_millis(100);
         assert_eq!((0..20).filter(|_| b.try_take(t1)).count(), 10);
+    }
+
+    #[test]
+    fn claimed_names_are_logged_short_and_escaped() {
+        let long = "ż".repeat(100);
+        assert_eq!(format!("{:?}", logged_name(&long)), format!("{:?}", "ż".repeat(64)));
+        // A newline cannot fake a second log line.
+        assert_eq!(format!("{:?}", logged_name("ala\n[fake] joined")), r#""ala\n[fake] joined""#);
     }
 }

@@ -252,3 +252,29 @@ async fn room_deleted_by_cli_is_broadcast() {
     }
     srv.shutdown().await;
 }
+
+#[test]
+fn admin_commands_refuse_a_data_dir_the_server_never_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = tempfile::TempDir::new().unwrap();
+    let mut cfg = config(&missing, Some("gra.example.pl:7700"));
+    cfg.data_dir = missing.path().join("pomyłka");
+    let calls: [(&str, Box<dyn Fn(&ServerConfig) -> anyhow::Result<String>>); 4] = [
+        ("users", Box::new(admin::users)),
+        ("invite", Box::new(|c| admin::invite(c, 7, None))),
+        ("block", Box::new(|c| admin::block(c, "ala"))),
+        ("create-room", Box::new(|c| admin::create_room(c, "Gra"))),
+    ];
+    for (what, call) in &calls {
+        let err = call(&cfg).unwrap_err().to_string();
+        assert!(err.contains(&cfg.data_dir.display().to_string()) && err.contains("cert.der"), "{what}: {err}");
+    }
+    assert!(!cfg.data_dir.exists(), "an admin command created the data directory");
+
+    // The certificate alone is not enough either: the database is missing.
+    cfg.data_dir = dir.path().to_owned();
+    server::tls::load_or_create_identity(&cfg.data_dir).unwrap();
+    let err = admin::users(&cfg).unwrap_err().to_string();
+    assert!(err.contains("komunikator.db"), "{err}");
+    assert!(!dir.path().join("komunikator.db").exists());
+}

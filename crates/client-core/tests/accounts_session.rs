@@ -56,9 +56,14 @@ async fn register_then_token_login() {
     connected(&mut b).await;
     b.shutdown();
 
-    // Tokens are single use: the first one is spent.
-    let mut c = start(&srv, "Zenek", Credentials::Token(first), &dev);
-    assert_eq!(fatal(&mut c, Duration::from_secs(10)).await, Some(FatalReason::LoginRequired));
+    // Tokens are single use: once a newer one was used, the first one is dead (before that, a
+    // retry within a minute would be let in, in case the Welcome was lost).
+    let mut c = start(&srv, "Zenek", Credentials::Token(second), &dev);
+    token_issued(&mut c).await;
+    connected(&mut c).await;
+    c.shutdown();
+    let mut d = start(&srv, "Zenek", Credentials::Token(first), &dev);
+    assert_eq!(fatal(&mut d, Duration::from_secs(10)).await, Some(FatalReason::LoginRequired));
 }
 
 #[tokio::test]

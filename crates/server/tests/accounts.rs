@@ -76,13 +76,12 @@ impl Client {
 
     async fn hello(&mut self, name: &str, auth: Auth) {
         static NEXT: AtomicU64 = AtomicU64::new(1_000);
-        let msg = ClientMsg::Hello {
-            version: PROTOCOL_VERSION,
-            username: name.into(),
-            auth,
-            session: NEXT.fetch_add(1, Ordering::Relaxed),
-            room: RoomChoice::Default,
-        };
+        self.hello_as(name, auth, NEXT.fetch_add(1, Ordering::Relaxed)).await;
+    }
+
+    /// Hello from client run `session`.
+    async fn hello_as(&mut self, name: &str, auth: Auth, session: u64) {
+        let msg = ClientMsg::Hello { version: PROTOCOL_VERSION, username: name.into(), auth, session, room: RoomChoice::Default };
         self.send.write_all(&encode_frame(&msg)).await.unwrap();
     }
 
@@ -147,9 +146,46 @@ async fn token_login_works_once_and_rotates() {
         (_, other) => panic!("expected Welcome, got {other:?}"),
     };
     assert_ne!(rotated, token);
+    // A client whose Welcome got lost retries with the same token within the grace period.
+    let (_b2, retried) = login(&srv, "ala", Auth::Token(token)).await;
+    // Once a newer token is used, the old one is dead.
+    let (_c, _) = login(&srv, "ala", Auth::Token(retried)).await;
     let (_, reply) = attempt(&srv, "ala", Auth::Token(token)).await;
     assert_eq!(reply, rejected(RejectReason::TokenInvalid));
-    let (_c, _) = login(&srv, "ala", Auth::Token(rotated)).await;
+}
+
+#[tokio::test]
+async fn replaced_client_run_does_not_burn_its_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let mut first = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+    first.hello_as("ala", pw("x"), 1).await;
+    let Some(ServerMsg::Welcome { token, .. }) = first.next_msg().await else { panic!("no welcome") };
+    // Another run logs in; the first is replaced and retired.
+    let (_second, second_token) = login(&srv, "ala", pw("x")).await;
+    assert_eq!(first.next_msg().await, Some(ServerMsg::SessionReplaced));
+    // The retired run reconnects with its token (it missed the notice): refused...
+    let mut back = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+    back.hello_as("ALA", Auth::Token(token), 1).await;
+    assert_eq!(back.next_msg().await, Some(ServerMsg::SessionReplaced));
+    // ...and its token is untouched (not even spent: using a newer token would end a spent
+    // one's grace period), so the user can still restart without the password.
+    let (_third, _) = login(&srv, "ala", Auth::Token(second_token)).await;
+    let mut fresh = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+    fresh.hello_as("ala", Auth::Token(token), 3).await;
+    assert!(matches!(fresh.next_msg().await, Some(ServerMsg::Welcome { .. })));
+}
+
+#[tokio::test]
+async fn token_of_another_user_dies_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (_a, token) = login(&srv, "ala", pw("x")).await;
+    let (_, reply) = attempt(&srv, "ola", Auth::Token(token)).await;
+    assert_eq!(reply, rejected(RejectReason::TokenInvalid));
+    // No grace period for a token shown under the wrong name.
+    let (_, reply) = attempt(&srv, "ala", Auth::Token(token)).await;
+    assert_eq!(reply, rejected(RejectReason::TokenInvalid));
 }
 
 #[tokio::test]

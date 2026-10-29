@@ -57,9 +57,25 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let dummy_hash =
         tokio::task::spawn_blocking(|| auth::hash_password("dummy-password-for-timing")).await?;
     let store = store::Store::open(&config.data_dir.join("komunikator.db"))?;
-    let imported = store.import_config_users(&config.users, unix_now())?;
-    if imported > 0 {
-        tracing::info!(imported, "accounts imported from the config");
+    let report = store.import_config_users(&config.users, unix_now())?;
+    if report.imported > 0 {
+        tracing::info!(imported = report.imported, "accounts imported from the config");
+    }
+    // The database is the source of truth once an account exists; config edits are ignored.
+    for name in &report.differing {
+        tracing::warn!(
+            user = ?name,
+            "[[users]] entry differs from the account database (password hash or admin flag) and is \
+             ignored; change the account with `komunikator-server reset-password`, `make-admin`, \
+             `revoke-admin` or `block`, then remove the entry from the config"
+        );
+    }
+    for name in &report.collisions {
+        tracing::warn!(
+            user = ?name,
+            "[[users]] entry skipped: an account with the same name in other letter case exists \
+             (names are case-insensitive); remove the entry from the config"
+        );
     }
     let rooms = store.rooms()?;
     let shared = Arc::new(conn::Shared {
