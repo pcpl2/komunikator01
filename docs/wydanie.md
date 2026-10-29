@@ -5,7 +5,7 @@ Szczegóły administrowania kontami i pokojami są w [README, sekcje „Serwer�
 Serwer działa jako kontener Dockera. Obraz `ghcr.io/pcpl2/komunikator-server` jest prywatny i powstaje w GitHub Actions (sekcja „Wydania przez GitHub Actions”). Obraz waży kilka MB: statyczny plik na distroless, bez powłoki, uruchamiany jako użytkownik bez uprawnień (uid 65532). Wszystkie dane trzyma wolumen `/data`:
 - certyfikat i klucz serwera (`cert.der`, `key.der`);
 - bazę kont i pokoi (`komunikator.db`);
-- aktualizacje klienta (`updates/`).
+- aktualizacje klienta (`updates/`). Ten katalog jest zamontowany z hosta (`./updates` obok `docker-compose.yml`) tylko do odczytu.
 
 ## Pierwsze uruchomienie serwera
 
@@ -17,10 +17,11 @@ Zaloguj się do ghcr.io. Potrzebny jest token GitHub (classic) z uprawnieniem `r
 docker login ghcr.io -u pcpl2
 ```
 
-Skopiuj z repozytorium `deploy/docker-compose.yml` i `deploy/komunikator.toml` do jednego katalogu, np. `/opt/komunikator`. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera (domena albo IP i port 7700). Ten adres trafia do zaproszeń. Potem uruchom:
+Skopiuj z repozytorium `deploy/docker-compose.yml` i `deploy/komunikator.toml` do jednego katalogu, np. `/opt/komunikator`, i utwórz w nim pusty podkatalog `updates`. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera (domena albo IP i port 7700). Ten adres trafia do zaproszeń. Potem uruchom:
 
 ```
 cd /opt/komunikator
+mkdir -p updates
 docker compose up -d
 docker compose logs komunikator
 ```
@@ -127,13 +128,18 @@ Masz dwie możliwości:
 
 ### Publikowanie aktualizacji klienta
 
-Wgraj oba pliki do wolumenu serwera: najpierw plik wydania, na końcu manifest. Restart nie jest potrzebny.
+Skopiuj oba pliki do katalogu `updates` obok `docker-compose.yml` na serwerze. Restart nie jest potrzebny.
 
 ```
-scp komunikator-0.2.0.exe manifest.bin serwer:/tmp/
-ssh serwer 'docker cp /tmp/komunikator-0.2.0.exe komunikator:/data/updates/ &&
-            docker cp /tmp/manifest.bin komunikator:/data/updates/manifest.bin &&
-            rm /tmp/komunikator-0.2.0.exe /tmp/manifest.bin'
+scp komunikator-0.2.0.exe serwer:/opt/komunikator/updates/
+scp manifest.bin serwer:/opt/komunikator/updates/manifest.bin.tmp
+ssh serwer 'mv /opt/komunikator/updates/manifest.bin.tmp /opt/komunikator/updates/manifest.bin'
 ```
 
-Klienci znajdą wydanie przy następnym sprawdzeniu (przy starcie i co 6 godzin), a pobiorą je i zainstalują, gdy nie będą w rozmowie. Dokładną nazwę pliku wydania podaje `komunikator-release sign` i pole `file` manifestu. Stare pliki `komunikator-*.exe` w `/data/updates` można później usunąć tym samym `docker run … alpine`, co przy kopii zapasowej.
+Kolejność ma znaczenie: najpierw plik wydania, a manifest na końcu, pod tymczasową nazwą zamienianą jednym `mv`. Dzięki temu klient nigdy nie zobaczy manifestu wskazującego na brakujący albo niepełny plik.
+
+Wymagania dla plików:
+- muszą być zwykłymi plikami, nie dowiązaniami, bo serwer pomija dowiązania;
+- muszą być czytelne dla wszystkich (tryb 644, domyślny), bo kontener działa jako uid 65532.
+
+Klienci znajdą wydanie przy następnym sprawdzeniu (przy starcie i co 6 godzin), a pobiorą je i zainstalują, gdy nie będą w rozmowie. Dokładną nazwę pliku wydania podaje `komunikator-release sign` i pole `file` manifestu. Stare pliki `komunikator-*.exe` z `updates` można po prostu usunąć.

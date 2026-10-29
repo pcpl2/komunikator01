@@ -1,4 +1,5 @@
-# Serwer komunikatora: `docker compose up -d` w katalogu z tym plikiem i komunikator.toml.
+# Serwer komunikatora: `docker compose up -d` w katalogu z tym plikiem, komunikator.toml
+# i podkatalogiem updates/ (może być pusty).
 # Obraz jest prywatny: najpierw `docker login ghcr.io` (token z uprawnieniem read:packages).
 services:
   komunikator:
@@ -9,6 +10,9 @@ services:
       - "7700:7700/udp"
     volumes:
       - komunikator-data:/data
+      # Aktualizacje klienta (manifest.bin + komunikator-X.Y.Z.exe): zwykłe pliki na hoście,
+      # serwer tylko je czyta. Wgranie nowej wersji = skopiowanie plików do ./updates.
+      - ./updates:/data/updates:ro
       - ./komunikator.toml:/etc/komunikator/komunikator.toml:ro
     logging:
       driver: json-file

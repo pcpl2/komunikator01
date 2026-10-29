@@ -21,7 +21,8 @@ Klucz pozwala później rozsyłać aktualizacje automatycznie. Bez niego workflo
 
 ```
 cargo build --release -p release
-targetelease\komunikator-release keygen --out release.key
+target
+elease\komunikator-release keygen --out release.key
 ```
 
 1. Wypisany klucz publiczny wpisz do `crates/client-win/release-key.pub` w miejsce zer, zrób commit i wypchnij.
@@ -38,12 +39,13 @@ W repozytorium na GitHubie: `Actions`, potem po kolei:
 
 1. Zainstaluj Dockera.
 2. Zaloguj się do ghcr.io tokenem z uprawnieniem `read:packages`: `docker login ghcr.io -u pcpl2`.
-3. Skopiuj `deploy/docker-compose.yml` i `deploy/komunikator.toml` do katalogu, np. `/opt/komunikator`.
+3. Skopiuj `deploy/docker-compose.yml` i `deploy/komunikator.toml` do katalogu, np. `/opt/komunikator`, i utwórz w nim pusty podkatalog `updates` (tu później trafiają aktualizacje klienta).
 4. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`.
 5. Uruchom:
 
 ```
 cd /opt/komunikator
+mkdir -p updates
 docker compose up -d
 docker compose logs komunikator
 ```

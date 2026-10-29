@@ -82,4 +82,4 @@ jobs:
           gh release create "${{ steps.version.outputs.tag }}" dist/* \
             --target "$GITHUB_SHA" \
             --title "Komunikator ${{ steps.version.outputs.version }}" \
-            --notes "Dla graczy: komunikator.exe (pierwsze uruchomienie: docs/pierwsze-uruchomienie.md). Aktualizacja dla zainstalowanych programów: manifest.bin i komunikator-X.Y.Z.exe wgraj do /data/updates kontenera serwera (docs/wydanie.md)."
+            --notes "Dla graczy: komunikator.exe (pierwsze uruchomienie: docs/pierwsze-uruchomienie.md). Aktualizacja dla zainstalowanych programów: manifest.bin i komunikator-X.Y.Z.exe skopiuj do katalogu updates obok docker-compose.yml na serwerze (docs/wydanie.md)."
