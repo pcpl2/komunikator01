@@ -13,7 +13,7 @@ cargo build --release -p server            # Debian: tylko serwer
 
 Wymagania: Rust (stable) i CMake (do zbudowania libopus). Klient jest linkowany ze statycznym CRT (`.cargo/config.toml`), więc `komunikator.exe` działa bez VC++ Redistributable.
 
-Wdrożenie serwera na Debianie (usługa systemd, firewall) i publikowanie wydań: [docs/wydanie.md](docs/wydanie.md); gotowe pliki w `deploy/`.
+Od zera do pierwszej rozmowy krok po kroku: [docs/pierwsze-uruchomienie.md](docs/pierwsze-uruchomienie.md). Wdrożenie serwera na Debianie (usługa systemd, firewall) i publikowanie wydań: [docs/wydanie.md](docs/wydanie.md); gotowe pliki w `deploy/`.
 
 ## Serwer
 
@@ -75,7 +75,7 @@ Przy pierwszym uruchomieniu program pyta o konto (`Anuluj` kończy program):
 - `Mam zaproszenie`: wklej cały `Kod zaproszenia` (`kom1-…`) od administratora, wybierz `Nazwę użytkownika` (1–32 znaki: litery, cyfry, `_ - .`) i `Hasło` (co najmniej 8 znaków, wpisane dwa razy). Zaproszenie zawiera adres serwera i odcisk certyfikatu.
 - `Mam już konto`: `Adres serwera` (host:port), `Odcisk certyfikatu` (64 znaki z wydruku serwera), `Nazwa użytkownika` i `Hasło`.
 
-Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym logowaniu) i zapomina hasło: kolejne uruchomienia łączą się bez pytania. Nazwę zapisuje tak, jak zna ją serwer (wielkość liter przy logowaniu nie ma znaczenia). Gdy sesja wygaśnie (np. administrator zresetował hasło), okno `Mam już konto` otwiera się samo z wpisanym serwerem i nazwą. Gdy to samo konto zalogowało się gdzie indziej, wystarczy otworzyć `Konto…` i nacisnąć `OK` z pustym hasłem — puste hasło przy zapamiętanej sesji oznacza „użyj zapamiętanej sesji”. Wybranie `Mam zaproszenie` przy zalogowanym koncie nie usuwa jego sesji, dopóki nowe konto nie zostanie założone. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (token i hasło chronione DPAPI, tylko dla tego konta Windows).
+Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym logowaniu) i zapomina hasło: kolejne uruchomienia łączą się bez pytania. Nazwę zapisuje tak, jak zna ją serwer (wielkość liter przy logowaniu nie ma znaczenia). Gdy sesja wygaśnie (np. administrator zresetował hasło), okno `Mam już konto` otwiera się samo z wpisanym serwerem i nazwą. Gdy to samo konto zalogowało się gdzie indziej, wystarczy otworzyć `Konto…` i nacisnąć `OK` z pustym hasłem — puste hasło przy zapamiętanej sesji oznacza „użyj zapamiętanej sesji”. Wybranie `Mam zaproszenie` przy zalogowanym koncie nie usuwa jego sesji, dopóki nowe konto nie zostanie założone. Ustawienia są w `%APPDATA%\komunikator\settings.toml`; logowanie (sesja albo hasło) nie trafia do tego pliku, tylko do Menedżera poświadczeń Windows jako wpis `komunikator` (dla innego `--data-dir`: `komunikator (<katalog>)`), dostępny tylko dla tego konta Windows. Usunięcie tego wpisu w `Panel sterowania → Menedżer poświadczeń → Poświadczenia systemu Windows` wylogowuje program: przy następnym uruchomieniu zapyta o hasło.
 
 - U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…` (po utworzeniu wchodzisz do niego), `Ustawienia…`.
 - Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200%, `Wycisz u mnie` i `Kod bezpieczeństwa…` (osoby z Twojego pokoju: porównajcie kod głosowo i wpisz jego pierwszą grupę, żeby oznaczyć urządzenie jako zweryfikowane albo zaakceptować zmieniony klucz).
@@ -96,7 +96,7 @@ komunikator-cli --invite kom1-… --user ala
 komunikator-cli
 ```
 
-`--invite` zakłada konto (hasło ze zmiennej `KOMUNIKATOR_PASSWORD`, co najmniej 8 znaków) i zapisuje serwer, odcisk, nazwę i sesję w `settings.toml` w katalogu danych; kolejne uruchomienia bez opcji używają zapamiętanej sesji. Istniejące konto loguje się hasłem (z tej samej zmiennej) i jest zapamiętywane tak samo: `komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala`. Gdy zapamiętana sesja wygaśnie, program wypisuje dokładnie to polecenie. Zapis następuje dopiero po udanym logowaniu, więc odrzucona próba nie zmienia zapamiętanego konta.
+`--invite` zakłada konto (hasło ze zmiennej `KOMUNIKATOR_PASSWORD`, co najmniej 8 znaków) i zapisuje serwer, odcisk i nazwę w `settings.toml` w katalogu danych, a sesję w Menedżerze poświadczeń (ten sam wpis co okno); kolejne uruchomienia bez opcji używają zapamiętanej sesji. Istniejące konto loguje się hasłem (z tej samej zmiennej) i jest zapamiętywane tak samo: `komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala`. Gdy zapamiętana sesja wygaśnie, program wypisuje dokładnie to polecenie. Zapis następuje dopiero po udanym logowaniu, więc odrzucona próba nie zmienia zapamiętanego konta.
 
 Polecenia (wpisz i naciśnij Enter):
 

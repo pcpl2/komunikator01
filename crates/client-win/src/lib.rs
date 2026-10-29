@@ -3,6 +3,8 @@
 #[cfg(windows)]
 pub mod dpapi;
 #[cfg(windows)]
+pub mod vault;
+#[cfg(windows)]
 pub mod identity_store;
 pub mod engine;
 pub mod pipeline;

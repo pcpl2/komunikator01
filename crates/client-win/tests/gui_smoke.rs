@@ -6,20 +6,29 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use client_core::settings::{Settings, SettingsStore};
-use client_win::dpapi::store_password;
+use client_win::vault::{Secret, Vault};
 
 #[test]
 fn gui_smoke_starts_saves_and_exits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.toml");
-    let mut s = Settings {
+    let s = Settings {
         // Nothing listens there: the session keeps reconnecting, which must not block exit.
         server: "127.0.0.1:1".into(),
         fingerprint: "ab".repeat(32),
         username: "smoke".into(),
         ..Settings::default()
     };
-    store_password(&mut s, "haslo").unwrap();
+    // The exe finds the login under the same name; removed again when the test ends.
+    struct Forget(Vault);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            let _ = self.0.clear();
+        }
+    }
+    let vault = Forget(Vault::for_data_dir(dir.path()));
+    assert_ne!(vault.0.target(), "komunikator", "the test must not touch the real login");
+    vault.0.store(&Secret::Password("haslo".into()), "smoke@127.0.0.1:1").unwrap();
     let (store, _, _) = SettingsStore::load(&path);
     store.save(&s).unwrap();
 

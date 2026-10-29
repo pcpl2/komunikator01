@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     }
     use client_core::net::session::Credentials;
     use client_core::settings::SettingsStore;
-    use client_win::dpapi::{load_password, load_token};
+    use client_win::vault::{Secret, Vault};
 
     let password = std::env::var("KOMUNIKATOR_PASSWORD").ok();
     let login = choose_login(cli.invite.as_deref(), cli.server, cli.fingerprint, cli.user, password)
@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
     let given_data_dir = cli.data_dir.clone();
     let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);
     let settings_path = data_dir.join("settings.toml");
+    let vault = Vault::for_data_dir(&data_dir);
     // The settings the account is saved to: the new token (and the account given on the
     // command line) are written with every token issued.
     let (account, mut saved) = match login {
@@ -111,12 +112,12 @@ fn main() -> anyhow::Result<()> {
             if let Some(Ok(p)) = broken {
                 println!("UWAGA: plik ustawień był uszkodzony i został odłożony jako {}", p.display());
             }
-            let credentials = match load_token(&s) {
-                Some(t) => Some(Credentials::Token(t)),
-                None => load_password(&s).map(Credentials::Password),
-            };
+            let credentials = vault.load().map(|secret| match secret {
+                Secret::Token(t) => Credentials::Token(t),
+                Secret::Password(p) => Credentials::Password(p),
+            });
             let fingerprint = protocol::parse_fingerprint(&s.fingerprint);
-            let (true, Some(fingerprint), Some(credentials)) = (s.is_configured(), fingerprint, credentials) else {
+            let (true, Some(fingerprint), Some(credentials)) = (s.has_account(), fingerprint, credentials) else {
                 anyhow::bail!(
                     "brak zapisanego konta w {}: użyj --invite <kod> --user <nazwa> \
                      albo --server, --fingerprint i --user",
@@ -169,7 +170,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         return 1;
                     }
-                    Some(SessionEvent::TokenIssued(token)) => remember_token(store, saved, &token.0),
+                    Some(SessionEvent::TokenIssued(token)) => remember_token(&vault, store, saved, &token.0),
                     Some(SessionEvent::SignedInAs(name)) => {
                         // The server's spelling; peers know me by it.
                         if saved.username != name {
@@ -318,17 +319,19 @@ fn choose_login(
     }
 }
 
-/// Keeps the new token in settings.toml in place of the password; a failure is only reported
-/// (the session goes on, the next start will ask for a password).
+/// Keeps the new token in Windows Credential Manager and the account in settings.toml; a
+/// failure is only reported (the session goes on, the next start will ask for a password).
 #[cfg(windows)]
 fn remember_token(
+    vault: &client_win::vault::Vault,
     store: &client_core::settings::SettingsStore,
-    s: &mut client_core::settings::Settings,
+    s: &client_core::settings::Settings,
     token: &[u8; 32],
 ) {
-    let saved = client_win::dpapi::store_token(s, token).and_then(|()| Ok(store.save(s)?));
+    let label = client_win::vault::account_label(&s.username, &s.server);
+    let saved = vault.store(&client_win::vault::Secret::Token(*token), &label).and_then(|()| Ok(store.save(s)?));
     if let Err(e) = saved {
-        println!("UWAGA: nie udało się zapamiętać logowania w settings.toml: {e:#}");
+        println!("UWAGA: nie udało się zapamiętać logowania: {e:#}");
     }
 }
 

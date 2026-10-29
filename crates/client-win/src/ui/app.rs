@@ -29,7 +29,7 @@ use super::instance;
 use super::sound::Sounds;
 use super::wide::wide;
 use super::window::{Start, Window, WM_APP_SESSION, WM_APP_UPDATE};
-use crate::dpapi::{load_password, load_token, store_password, store_token};
+use crate::vault::{account_label, Secret, Vault};
 use crate::startup::{default_data_dir, start_client, Account, Audio, Client, Notice};
 use crate::updater;
 
@@ -48,6 +48,7 @@ pub fn run(opts: Options) -> i32 {
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     let settings_path = data_dir.join("settings.toml");
     let (store, settings, broken) = SettingsStore::load(&settings_path);
+    let vault = Vault::for_data_dir(&data_dir);
     // The self-test runs beside a real copy; a second real start shows the first one instead.
     let claim = || if opts.smoke { Some(None) } else { instance::claim(&data_dir).map(Some) };
     let Some(mut _guard) = claim() else { return 0 };
@@ -76,12 +77,12 @@ pub fn run(opts: Options) -> i32 {
         message_box(None, &text, MB_ICONWARNING);
     }
     let mut register = None;
-    if account(&settings, None).is_none() {
+    if account(&settings, &vault, None).is_none() {
         // The self-test never waits for a person.
         if opts.smoke {
             return 1;
         }
-        let choice = match try_account_dialog(None, &account_form(&settings), true) {
+        let choice = match try_account_dialog(None, &account_form(&settings, &vault), true) {
             Ok(Some(c)) => c,
             Ok(None) => return 0,
             Err(DialogUnavailable) => {
@@ -89,7 +90,7 @@ pub fn run(opts: Options) -> i32 {
                 return 1;
             }
         };
-        register = match set_account(&mut settings, choice) {
+        register = match set_account(&mut settings, &vault, choice) {
             Ok(r) => r,
             Err(e) => {
                 message_box(None, &format!("Nie udało się zapisać hasła: {e:#}"), MB_ICONERROR);
@@ -119,6 +120,7 @@ pub fn run(opts: Options) -> i32 {
     let app = App {
         state: AppState::with_clock(settings, Box::new(local_hm)),
         store,
+        vault,
         client: None,
         events,
         events_tx,
@@ -340,7 +342,7 @@ async fn fetch_update(
 
 /// What to log in with: a registration in progress, else the saved token, else the saved
 /// password.
-fn account(s: &Settings, register: Option<&Registration>) -> Option<Account> {
+fn account(s: &Settings, vault: &Vault, register: Option<&Registration>) -> Option<Account> {
     if let Some(r) = register {
         return Some(Account {
             server: r.invite.server.clone(),
@@ -349,12 +351,12 @@ fn account(s: &Settings, register: Option<&Registration>) -> Option<Account> {
             credentials: Credentials::Register { invite: r.invite.code, password: r.password.clone() },
         });
     }
-    if !s.is_configured() {
+    if !s.has_account() {
         return None;
     }
-    let credentials = match load_token(s) {
-        Some(t) => Credentials::Token(t),
-        None => Credentials::Password(load_password(s)?),
+    let credentials = match vault.load()? {
+        Secret::Token(t) => Credentials::Token(t),
+        Secret::Password(p) => Credentials::Password(p),
     };
     Some(Account {
         server: s.server.clone(),
@@ -366,7 +368,7 @@ fn account(s: &Settings, register: Option<&Registration>) -> Option<Account> {
 
 /// The account form's starting values; the password only if it can still be decrypted (with
 /// a stored session there is none, and it may be left empty).
-pub fn account_form(s: &Settings) -> AccountForm {
+fn account_form(s: &Settings, vault: &Vault) -> AccountForm {
     AccountForm {
         // Nothing set up yet most likely means a friend's invite.
         mode: if s.server.is_empty() { AccountMode::Invite } else { AccountMode::Login },
@@ -374,29 +376,38 @@ pub fn account_form(s: &Settings) -> AccountForm {
             server: s.server.clone(),
             fingerprint: s.fingerprint.clone(),
             username: s.username.clone(),
-            password: load_password(s).unwrap_or_default(),
+            password: vault.password().unwrap_or_default(),
         },
         invite: String::new(),
         invite_user: String::new(),
         notice: None,
-        remembered: load_token(s).is_some(),
+        remembered: vault.token().is_some(),
     }
 }
 
 /// Whether the account dialog returned the saved account as it is: same server, fingerprint
 /// and name, and the saved password or none (meaning the stored session).
-fn unchanged_login(s: &Settings, a: &AccountInput) -> bool {
+fn unchanged_login(s: &Settings, vault: &Vault, a: &AccountInput) -> bool {
     s.server == a.server
         && s.fingerprint == a.fingerprint
         && s.username == a.username
-        && (a.password.is_empty() || load_password(s).as_deref() == Some(a.password.as_str()))
+        && (a.password.is_empty() || vault.password().as_deref() == Some(a.password.as_str()))
 }
 
 /// Keeps a freshly issued token for the next start. The first one of a registration also makes
 /// the new account the saved one, replacing the old account's credentials only now that the
 /// registration has succeeded.
-fn adopt_token(s: &mut Settings, token: &[u8; 32], register: Option<Registration>) -> anyhow::Result<()> {
-    store_token(s, token)?;
+fn adopt_token(
+    s: &mut Settings,
+    vault: &Vault,
+    token: &[u8; 32],
+    register: Option<Registration>,
+) -> anyhow::Result<()> {
+    let label = match &register {
+        Some(r) => account_label(&r.username, &r.invite.server),
+        None => account_label(&s.username, &s.server),
+    };
+    vault.store(&Secret::Token(*token), &label)?;
     if let Some(r) = register {
         s.server = r.invite.server;
         s.fingerprint = protocol::fingerprint_hex(&r.invite.fingerprint);
@@ -416,8 +427,13 @@ fn signed_in_as(s: &mut Settings, name: &str) -> bool {
 
 /// The form to reopen after a login failed for good, or `None` when the account is not the
 /// problem. Registration errors reopen the invite form only while registering.
-fn login_prompt(s: &Settings, reason: FatalReason, register: Option<&Registration>) -> Option<AccountForm> {
-    let mut form = account_form(s);
+fn login_prompt(
+    s: &Settings,
+    vault: &Vault,
+    reason: FatalReason,
+    register: Option<&Registration>,
+) -> Option<AccountForm> {
+    let mut form = account_form(s, vault);
     form.notice = Some(describe_fatal(reason));
     match reason {
         FatalReason::LoginRequired | FatalReason::BadCredentials => form.mode = AccountMode::Login,
@@ -439,15 +455,15 @@ fn login_prompt(s: &Settings, reason: FatalReason, register: Option<&Registratio
     Some(form)
 }
 
-/// Saves the dialog's account to the settings. A login's password is stored protected (an
-/// empty one, allowed only for the saved account, keeps its stored session). A registration
+/// Saves the dialog's account to the settings, and a login's password to the vault (an empty
+/// one, allowed only for the saved account, keeps its stored session). A registration
 /// changes nothing yet: it is returned, used once, and saved with its first token
 /// (`adopt_token`), so a refused one leaves the old account working.
-fn set_account(s: &mut Settings, choice: AccountChoice) -> anyhow::Result<Option<Registration>> {
+fn set_account(s: &mut Settings, vault: &Vault, choice: AccountChoice) -> anyhow::Result<Option<Registration>> {
     match choice {
         AccountChoice::Login(a) => {
             if !a.password.is_empty() {
-                store_password(s, &a.password)?;
+                vault.store(&Secret::Password(a.password.clone()), &account_label(&a.username, &a.server))?;
             }
             s.server = a.server;
             s.fingerprint = a.fingerprint;
@@ -480,6 +496,8 @@ fn needs_reconnect(same_account: bool, status: &Status) -> bool {
 pub struct App {
     state: AppState,
     store: SettingsStore,
+    /// The saved login (Windows Credential Manager).
+    vault: Vault,
     /// `None` after shutdown.
     client: Option<Client>,
     /// Session events tagged with the session generation they came from.
@@ -520,6 +538,11 @@ impl App {
         self.state.settings_mut()
     }
 
+    /// The account form for the saved account.
+    pub fn account_form(&self) -> AccountForm {
+        account_form(self.state.settings(), &self.vault)
+    }
+
     pub fn set_local_notice(&mut self, n: String) {
         self.local_notice = Some(n);
     }
@@ -541,7 +564,7 @@ impl App {
         }
         self.generation += 1;
         let s = self.state.settings();
-        let account = account(s, self.register.as_ref())
+        let account = account(s, &self.vault, self.register.as_ref())
             .ok_or_else(|| "brak konta albo nie da się odczytać zapisanego hasła".to_owned())?;
         let audio =
             Audio { capture: s.capture_device.clone(), render: s.render_device.clone(), sensitivity: s.vad_sensitivity };
@@ -571,13 +594,13 @@ impl App {
     /// the session has failed for good: then OK is the way to try again.
     pub fn change_account(&mut self, hwnd: HWND, choice: AccountChoice) {
         let same = match &choice {
-            AccountChoice::Login(a) => unchanged_login(self.state.settings(), a),
+            AccountChoice::Login(a) => unchanged_login(self.state.settings(), &self.vault, a),
             AccountChoice::Register(_) => false,
         };
         if !needs_reconnect(same, &self.state.view().status) {
             return;
         }
-        match set_account(self.state.settings_mut(), choice) {
+        match set_account(self.state.settings_mut(), &self.vault, choice) {
             Ok(r) => self.register = r,
             Err(e) => {
                 self.local_notice = Some(format!("nie udało się zapisać hasła: {e:#}"));
@@ -657,7 +680,7 @@ impl App {
                     }
                 }
                 SessionEvent::Fatal(reason) => {
-                    self.login_prompt = login_prompt(self.state.settings(), *reason, self.register.as_ref());
+                    self.login_prompt = login_prompt(self.state.settings(), &self.vault, *reason, self.register.as_ref());
                 }
                 _ => {}
             }
@@ -796,7 +819,7 @@ impl App {
     /// Keeps the token for the next start in place of the password (and of the invite).
     fn token_issued(&mut self, token: &[u8; 32]) {
         let register = self.register.take();
-        match adopt_token(self.state.settings_mut(), token, register) {
+        match adopt_token(self.state.settings_mut(), &self.vault, token, register) {
             Ok(()) => self.save_settings(),
             Err(e) => self.local_notice = Some(format!("nie udało się zapamiętać logowania: {e:#}")),
         }
@@ -886,45 +909,47 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::ScratchVault;
 
     fn registration() -> Registration {
         let invite = protocol::invite::Invite { server: "serwer.pl:7700".into(), fingerprint: [0xAB; 32], code: [5; 16] };
         Registration { invite, username: "Ola2".into(), password: "długie hasło".into() }
     }
 
-    fn logged_in() -> Settings {
-        let mut s = Settings { server: "stary.pl:7700".into(), fingerprint: "cd".repeat(32), username: "Ola".into(), ..Settings::default() };
-        store_token(&mut s, &[3; 32]).unwrap();
-        s
+    fn logged_in() -> (Settings, ScratchVault) {
+        let s = Settings { server: "stary.pl:7700".into(), fingerprint: "cd".repeat(32), username: "Ola".into(), ..Settings::default() };
+        let v = ScratchVault::new();
+        v.store(&Secret::Token([3; 32]), "Ola@stary.pl:7700").unwrap();
+        (s, v)
     }
 
     #[test]
     fn registration_keeps_the_old_account_until_its_first_token() {
-        let mut s = logged_in();
+        let (mut s, v) = logged_in();
         let before = s.clone();
-        let r = set_account(&mut s, AccountChoice::Register(registration())).unwrap().unwrap();
+        let r = set_account(&mut s, &v, AccountChoice::Register(registration())).unwrap().unwrap();
         assert_eq!(s, before, "a registration that may still fail must not touch the saved account");
-        let a = account(&s, Some(&r)).unwrap();
+        assert_eq!(v.token(), Some([3; 32]));
+        let a = account(&s, &v, Some(&r)).unwrap();
         assert_eq!(a.credentials, Credentials::Register { invite: [5; 16], password: "długie hasło".into() });
         assert_eq!((a.server.as_str(), a.username.as_str()), ("serwer.pl:7700", "Ola2"));
 
         // Refused: the old account still logs in.
-        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([3; 32]));
+        assert_eq!(account(&s, &v, None).unwrap().credentials, Credentials::Token([3; 32]));
 
         // The first token makes the new account the saved one.
-        adopt_token(&mut s, &[7; 32], Some(r)).unwrap();
+        adopt_token(&mut s, &v, &[7; 32], Some(r)).unwrap();
         assert_eq!((s.server.as_str(), s.username.as_str()), ("serwer.pl:7700", "Ola2"));
         assert_eq!(s.fingerprint, "ab".repeat(32));
-        assert!(s.password_protected.is_empty());
-        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([7; 32]));
-        adopt_token(&mut s, &[8; 32], None).unwrap();
-        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([8; 32]));
+        assert_eq!(account(&s, &v, None).unwrap().credentials, Credentials::Token([7; 32]));
+        adopt_token(&mut s, &v, &[8; 32], None).unwrap();
+        assert_eq!(account(&s, &v, None).unwrap().credentials, Credentials::Token([8; 32]));
         assert_eq!(s.username, "Ola2");
     }
 
     #[test]
     fn the_servers_spelling_of_the_name_is_saved() {
-        let mut s = logged_in();
+        let (mut s, _v) = logged_in();
         assert!(!signed_in_as(&mut s, "Ola"));
         assert!(signed_in_as(&mut s, "OLA"));
         assert_eq!(s.username, "OLA");
@@ -932,8 +957,8 @@ mod tests {
 
     #[test]
     fn empty_password_reconnects_with_the_remembered_session() {
-        let s = logged_in();
-        let form = account_form(&s);
+        let (s, v) = logged_in();
+        let form = account_form(&s, &v);
         assert!(form.remembered && form.login.password.is_empty());
         let same = AccountInput {
             server: s.server.clone(),
@@ -941,38 +966,43 @@ mod tests {
             username: s.username.clone(),
             password: String::new(),
         };
-        assert!(unchanged_login(&s, &same));
-        assert!(!unchanged_login(&s, &AccountInput { password: "nowe hasło".into(), ..same.clone() }));
-        assert!(!unchanged_login(&s, &AccountInput { username: "Ewa".into(), ..same.clone() }));
+        assert!(unchanged_login(&s, &v, &same));
+        assert!(!unchanged_login(&s, &v, &AccountInput { password: "nowe hasło".into(), ..same.clone() }));
+        assert!(!unchanged_login(&s, &v, &AccountInput { username: "Ewa".into(), ..same.clone() }));
         // Saving it keeps the token instead of storing an empty password.
         let mut saved = s.clone();
-        assert_eq!(set_account(&mut saved, AccountChoice::Login(same)).unwrap(), None);
-        assert_eq!(account(&saved, None).unwrap().credentials, Credentials::Token([3; 32]));
-        // Password-only settings have no session to remember.
-        let mut pw = Settings { token_protected: String::new(), ..s };
-        store_password(&mut pw, "hasło").unwrap();
-        assert!(!account_form(&pw).remembered);
+        assert_eq!(set_account(&mut saved, &v, AccountChoice::Login(same.clone())).unwrap(), None);
+        assert_eq!(account(&saved, &v, None).unwrap().credentials, Credentials::Token([3; 32]));
+        // A typed password replaces the session; a saved password is no session to remember.
+        let typed = AccountInput { password: "hasło123".into(), ..same };
+        set_account(&mut saved, &v, AccountChoice::Login(typed)).unwrap();
+        assert_eq!(account(&saved, &v, None).unwrap().credentials, Credentials::Password("hasło123".into()));
+        assert!(!account_form(&saved, &v).remembered);
+        // Nothing in the vault (e.g. deleted in Credential Manager): the form asks again.
+        v.clear().unwrap();
+        assert!(account(&saved, &v, None).is_none());
     }
 
     #[test]
     fn account_errors_reopen_the_right_form() {
-        let mut s = Settings { server: "serwer.pl:7700".into(), username: "ola".into(), ..Settings::default() };
-        store_token(&mut s, &[7; 32]).unwrap();
+        let s = Settings { server: "serwer.pl:7700".into(), username: "ola".into(), ..Settings::default() };
+        let v = ScratchVault::new();
+        v.store(&Secret::Token([7; 32]), "ola@serwer.pl:7700").unwrap();
         for reason in [FatalReason::LoginRequired, FatalReason::BadCredentials] {
-            let form = login_prompt(&s, reason, None).unwrap();
+            let form = login_prompt(&s, &v, reason, None).unwrap();
             assert_eq!(form.mode, AccountMode::Login);
             assert_eq!((form.login.server.as_str(), form.login.username.as_str()), ("serwer.pl:7700", "ola"));
             assert_eq!(form.notice, Some(describe_fatal(reason)));
         }
         let r = registration();
-        let form = login_prompt(&s, FatalReason::NameTaken, Some(&r)).unwrap();
+        let form = login_prompt(&s, &v, FatalReason::NameTaken, Some(&r)).unwrap();
         assert_eq!(form.mode, AccountMode::Invite);
         assert_eq!(form.invite, encode_invite(&r.invite));
         assert_eq!(form.invite_user, "Ola2");
-        assert_eq!(login_prompt(&s, FatalReason::InviteInvalid, Some(&r)).unwrap().invite, "");
-        assert_eq!(login_prompt(&s, FatalReason::NameTaken, None), None);
+        assert_eq!(login_prompt(&s, &v, FatalReason::InviteInvalid, Some(&r)).unwrap().invite, "");
+        assert_eq!(login_prompt(&s, &v, FatalReason::NameTaken, None), None);
         for reason in [FatalReason::AccountBlocked, FatalReason::SessionReplaced, FatalReason::VersionMismatch { server: 9 }] {
-            assert_eq!(login_prompt(&s, reason, Some(&r)), None);
+            assert_eq!(login_prompt(&s, &v, reason, Some(&r)), None);
         }
     }
 

@@ -1,6 +1,5 @@
-//! Per-user (CurrentUser scope) DPAPI helpers and the protected settings password and token.
+//! Per-user (CurrentUser scope) DPAPI helpers.
 
-use client_core::settings::Settings;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
@@ -38,91 +37,4 @@ pub fn unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
     with_blob(blob, |inb, out| unsafe {
         CryptUnprotectData(inb, None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, out)
     })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.is_ascii() || !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
-}
-
-/// Stores the password in `s` as hex of its DPAPI blob (only this Windows user can read it
-/// back), dropping any stored token.
-pub fn store_password(s: &mut Settings, pw: &str) -> anyhow::Result<()> {
-    s.remember_password(hex(&protect(pw.as_bytes())?));
-    Ok(())
-}
-
-/// The stored password, or `None` when unset, undecryptable (other user/machine) or not UTF-8.
-pub fn load_password(s: &Settings) -> Option<String> {
-    let blob = unhex(&s.password_protected).filter(|b| !b.is_empty())?;
-    String::from_utf8(unprotect(&blob).ok()?).ok()
-}
-
-/// Stores a session token like the password, and forgets the password.
-pub fn store_token(s: &mut Settings, token: &[u8; 32]) -> anyhow::Result<()> {
-    s.remember_token(hex(&protect(token)?));
-    Ok(())
-}
-
-/// The stored token, or `None` when unset, undecryptable or not 32 bytes.
-pub fn load_token(s: &Settings) -> Option<[u8; 32]> {
-    let blob = unhex(&s.token_protected).filter(|b| !b.is_empty())?;
-    unprotect(&blob).ok()?.try_into().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn password_is_stored_protected() {
-        let mut s = Settings::default();
-        store_password(&mut s, "tajne hasło 123").unwrap();
-        let pw = "tajne hasło 123";
-        assert!(!s.password_protected.is_empty());
-        assert!(!s.password_protected.contains(pw));
-        assert!(!s.password_protected.contains(&hex(pw.as_bytes())));
-        assert_eq!(load_password(&s).as_deref(), Some(pw));
-    }
-
-    #[test]
-    fn token_is_stored_protected_and_replaces_the_password() {
-        let mut s = Settings::default();
-        store_password(&mut s, "tajne hasło 123").unwrap();
-        let token = [0x5A; 32];
-        store_token(&mut s, &token).unwrap();
-        assert!(!s.token_protected.contains(&hex(&token)));
-        assert_eq!(load_token(&s), Some(token));
-        assert_eq!(load_password(&s), None);
-        store_password(&mut s, "nowe hasło").unwrap();
-        assert_eq!(load_token(&s), None);
-        assert_eq!(load_password(&s).as_deref(), Some("nowe hasło"));
-        // A blob of the wrong length is no token.
-        s.token_protected = hex(&protect(&[1, 2, 3]).unwrap());
-        assert_eq!(load_token(&s), None);
-    }
-
-    #[test]
-    fn unset_or_garbage_password_loads_as_none() {
-        let mut s = Settings::default();
-        assert_eq!(load_password(&s), None);
-        s.password_protected = "zz".into();
-        assert_eq!(load_password(&s), None);
-        s.password_protected = "00ff".into();
-        assert_eq!(load_password(&s), None);
-    }
-
-    #[test]
-    fn hex_roundtrip() {
-        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
-        assert_eq!(unhex("00ABff"), Some(vec![0x00, 0xab, 0xff]));
-        assert_eq!(unhex("abc"), None);
-        assert_eq!(unhex("zz"), None);
-    }
 }

@@ -26,7 +26,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::app::{account_form, App};
+use super::app::App;
 use super::dialogs::{self, AccountForm, SafetyChoice, SafetyInfo, SettingsEnv, SettingsInput};
 use super::hotkey;
 use super::icons::{make_icon, tray_pixels, TrayState};
@@ -620,7 +620,7 @@ impl Window {
     /// The account dialog over `owner`; a changed account restarts the session.
     fn account_dialog(&self, owner: HWND) {
         let Ok(inner) = self.inner.try_borrow() else { return };
-        let form = account_form(inner.app.settings());
+        let form = inner.app.account_form();
         drop(inner);
         self.run_account_dialog(owner, &form);
     }
