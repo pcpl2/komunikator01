@@ -9,7 +9,7 @@ pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::crypto::ring;
 use rustls::pki_types::PrivateKeyDer;
@@ -27,6 +27,7 @@ pub struct RunningServer {
     endpoint: quinn::Endpoint,
     fingerprint: [u8; 32],
     accept: tokio::task::JoinHandle<()>,
+    kick_blocked: tokio::task::JoinHandle<()>,
 }
 
 impl RunningServer {
@@ -41,7 +42,9 @@ impl RunningServer {
     pub async fn shutdown(self) {
         self.endpoint.close(0u32.into(), b"shutdown");
         self.accept.abort();
+        self.kick_blocked.abort();
         let _ = self.accept.await;
+        let _ = self.kick_blocked.await;
         self.endpoint.wait_idle().await;
     }
 }
@@ -53,25 +56,31 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let dummy_hash =
         tokio::task::spawn_blocking(|| auth::hash_password("dummy-password-for-timing")).await?;
     let store = store::Store::open(&config.data_dir.join("komunikator.db"))?;
+    let imported = store.import_config_users(&config.users, unix_now())?;
+    if imported > 0 {
+        tracing::info!(imported, "accounts imported from the config");
+    }
     let rooms = store.rooms()?;
-    let admins = config.users.iter().filter(|u| u.admin).map(|u| u.name.clone()).collect();
     let shared = Arc::new(conn::Shared {
         registry: Mutex::new(room::Registry::new(rooms)),
         store: Mutex::new(store),
-        admins,
         limiter: Mutex::new(auth::LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
-        users: config.users.into_iter().map(|u| (u.name, u.password_hash)).collect(),
         dummy_hash,
         verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
         retired: Mutex::new(Default::default()),
     });
+    let kick_blocked = tokio::spawn(conn::kick_blocked(shared.clone()));
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
             tokio::spawn(conn::handle(incoming, shared.clone()));
         }
     });
-    Ok(RunningServer { endpoint, fingerprint: identity.fingerprint, accept })
+    Ok(RunningServer { endpoint, fingerprint: identity.fingerprint, accept, kick_blocked })
+}
+
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Retries briefly while a previous instance's socket is still being released.

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 
 /// Argon2id with the crate's default parameters, PHC string format.
@@ -20,6 +21,13 @@ pub fn verify_password(hash: &str, pw: &str) -> bool {
     PasswordHash::new(hash)
         .map(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
         .unwrap_or(false)
+}
+
+/// A session token from the OS random generator.
+pub fn random_token() -> [u8; 32] {
+    let mut token = [0u8; 32];
+    OsRng.fill_bytes(&mut token);
+    token
 }
 
 /// Blocks an IP after `max_failures` failed logins within `window`.

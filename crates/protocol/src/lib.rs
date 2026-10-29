@@ -5,14 +5,14 @@ pub mod control;
 pub mod framing;
 
 pub use control::{
-    hello_version, normalize_room_name, normalize_username, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
-    RoomErrorReason, RoomId, RoomInfo, ServerMsg, DEFAULT_ROOM_NAME, MAX_CHAT_BLOB, MAX_ROOMS,
-    MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS, MAX_USERNAME_CHARS,
+    hello_version, normalize_room_name, normalize_username, Auth, ClientMsg, MemberId, MemberInfo, RejectReason,
+    RoomChoice, RoomErrorReason, RoomId, RoomInfo, ServerMsg, CLOSE_BLOCKED, DEFAULT_ROOM_NAME, MAX_CHAT_BLOB,
+    MAX_ROOMS, MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS, MAX_USERNAME_CHARS, MIN_PASSWORD_CHARS, TOKEN_TTL_S,
 };
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Largest key-exchange blob accepted in Announce/Relay.
 pub const MAX_BLOB: usize = 1024;
 pub const ALPN: &[u8] = b"komunikator/1";
@@ -46,11 +46,12 @@ mod tests {
         let hello = ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             username: "ala".into(),
-            password: "x".into(),
+            auth: Auth::Password("x".into()),
             session: 1,
             room: RoomChoice::Default,
         };
         assert_eq!(encode_frame(&hello)[4], 0);
+        assert_eq!(hello_version(&encode_frame(&hello)[4..]), Some(PROTOCOL_VERSION));
         let rejected = ServerMsg::Rejected { reason: RejectReason::BadCredentials };
         assert_eq!(encode_frame(&rejected)[4], 3);
     }
@@ -70,6 +71,33 @@ mod tests {
         dec.push(&frame);
         assert!(dec.next::<ClientMsg>().is_err());
         assert_eq!(dec.front_body(), Some(&frame[4..]));
+    }
+
+    #[test]
+    fn debug_hides_secrets() {
+        let secrets = [
+            format!("{:?}", Auth::Password("tajne-haslo".into())),
+            format!("{:?}", Auth::Token([0xAB; 32])),
+            format!("{:?}", Auth::Register { invite: [0xCD; 16], password: "tajne-haslo".into() }),
+            format!(
+                "{:?}",
+                ClientMsg::Hello {
+                    version: PROTOCOL_VERSION,
+                    username: "ala".into(),
+                    auth: Auth::Token([0xAB; 32]),
+                    session: 1,
+                    room: RoomChoice::Default,
+                }
+            ),
+            format!(
+                "{:?}",
+                ServerMsg::Welcome { you: 1, room: None, rooms: vec![], members: vec![], token: [0xAB; 32] }
+            ),
+        ];
+        for s in secrets {
+            assert!(!s.contains("tajne") && !s.contains("171") && !s.contains("205"), "{s}");
+        }
+        assert!(format!("{:?}", ServerMsg::MemberLeft { id: 7 }).contains('7'));
     }
 
     #[test]

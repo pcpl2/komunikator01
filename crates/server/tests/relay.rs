@@ -5,12 +5,16 @@ use std::time::Duration;
 
 use protocol::audio::{encode_upstream, parse_downstream};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    encode_frame, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
     ServerMsg, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use server::{RunningServer, ServerConfig, UserEntry};
 use tokio::time::timeout;
+
+fn pw(password: &str) -> Auth {
+    Auth::Password(password.into())
+}
 
 fn hash_x() -> String {
     static H: OnceLock<String> = OnceLock::new();
@@ -49,16 +53,16 @@ impl Client {
     }
 
     /// Hello as a fresh client run.
-    async fn hello(&mut self, name: &str, pw: &str, version: u16) {
+    async fn hello(&mut self, name: &str, auth: Auth, version: u16) {
         static NEXT: AtomicU64 = AtomicU64::new(1_000);
-        self.hello_session(name, pw, version, NEXT.fetch_add(1, Ordering::Relaxed)).await;
+        self.hello_session(name, auth, version, NEXT.fetch_add(1, Ordering::Relaxed)).await;
     }
 
-    async fn hello_session(&mut self, name: &str, pw: &str, version: u16, session: u64) {
+    async fn hello_session(&mut self, name: &str, auth: Auth, version: u16, session: u64) {
         let msg = ClientMsg::Hello {
             version,
             username: name.into(),
-            password: pw.into(),
+            auth,
             session,
             room: RoomChoice::Default,
         };
@@ -92,8 +96,8 @@ impl Client {
     ) -> (Client, MemberId, Vec<MemberInfo>) {
         let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
         match session {
-            Some(s) => c.hello_session(name, "x", PROTOCOL_VERSION, s).await,
-            None => c.hello(name, "x", PROTOCOL_VERSION).await,
+            Some(s) => c.hello_session(name, pw("x"), PROTOCOL_VERSION, s).await,
+            None => c.hello(name, pw("x"), PROTOCOL_VERSION).await,
         }
         match c.next_msg().await {
             // Everyone lands in the default room; return the others, as before rooms existed.
@@ -164,7 +168,7 @@ async fn bad_password_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;
     let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-    c.hello("ala", "zle", PROTOCOL_VERSION).await;
+    c.hello("ala", pw("zle"), PROTOCOL_VERSION).await;
     assert_eq!(c.next_msg().await, Some(ServerMsg::Rejected { reason: RejectReason::BadCredentials }));
 }
 
@@ -173,7 +177,7 @@ async fn unknown_user_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;
     let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-    c.hello("obcy", "x", PROTOCOL_VERSION).await;
+    c.hello("obcy", pw("x"), PROTOCOL_VERSION).await;
     assert_eq!(c.next_msg().await, Some(ServerMsg::Rejected { reason: RejectReason::BadCredentials }));
 }
 
@@ -182,7 +186,7 @@ async fn version_mismatch_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;
     let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-    c.hello("ala", "x", 99).await;
+    c.hello("ala", pw("x"), 99).await;
     assert_eq!(
         c.next_msg().await,
         Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: PROTOCOL_VERSION } })
@@ -203,8 +207,34 @@ async fn v2_hello_gets_version_mismatch() {
     c.send.write_all(&encode_frame(&hello)).await.unwrap();
     assert_eq!(
         c.next_msg().await,
-        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: 3 } })
+        Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: PROTOCOL_VERSION } })
     );
+}
+
+#[tokio::test]
+async fn v3_hello_gets_version_mismatch() {
+    /// The v3 `ClientMsg::Hello`, with a plain password where v4 has `auth`.
+    #[derive(serde::Serialize)]
+    enum V3ClientMsg {
+        Hello { version: u16, username: String, password: String, session: u64, room: RoomChoice },
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    for password in ["x", &"y".repeat(40)] {
+        let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
+        let hello = V3ClientMsg::Hello {
+            version: 3,
+            username: "ala".into(),
+            password: password.into(),
+            session: 1,
+            room: RoomChoice::Default,
+        };
+        c.send.write_all(&encode_frame(&hello)).await.unwrap();
+        assert_eq!(
+            c.next_msg().await,
+            Some(ServerMsg::Rejected { reason: RejectReason::VersionMismatch { server: PROTOCOL_VERSION } })
+        );
+    }
 }
 
 #[tokio::test]
@@ -213,11 +243,11 @@ async fn sixth_attempt_is_rate_limited() {
     let srv = start_server(&dir).await;
     for _ in 0..5 {
         let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-        c.hello("ala", "zle", PROTOCOL_VERSION).await;
+        c.hello("ala", pw("zle"), PROTOCOL_VERSION).await;
         assert_eq!(c.next_msg().await, Some(ServerMsg::Rejected { reason: RejectReason::BadCredentials }));
     }
     let mut c = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-    c.hello("ala", "x", PROTOCOL_VERSION).await;
+    c.hello("ala", pw("x"), PROTOCOL_VERSION).await;
     assert_eq!(c.next_msg().await, Some(ServerMsg::Rejected { reason: RejectReason::RateLimited }));
 }
 
@@ -230,7 +260,7 @@ async fn parallel_guesses_are_rate_limited() {
         clients.push(Client::connect(srv.local_addr(), srv.fingerprint()).await);
     }
     for c in clients.iter_mut() {
-        c.hello("ala", "zle", PROTOCOL_VERSION).await;
+        c.hello("ala", pw("zle"), PROTOCOL_VERSION).await;
     }
     let mut bad_credentials = 0;
     for c in clients.iter_mut() {
@@ -315,7 +345,7 @@ async fn replaced_client_cannot_take_the_account_back() {
     let (mut pc, _, _) = Client::login_session(&srv, "ala", Some(2)).await;
     // The laptop missed its SessionReplaced (network drop) and now reconnects.
     let mut back = Client::connect(srv.local_addr(), srv.fingerprint()).await;
-    back.hello_session("ala", "x", PROTOCOL_VERSION, 1).await;
+    back.hello_session("ala", pw("x"), PROTOCOL_VERSION, 1).await;
     assert_eq!(back.next_msg().await, Some(ServerMsg::SessionReplaced));
     assert_eq!(timeout(Duration::from_millis(300), pc.next_msg()).await.ok().flatten(), None);
     assert!(pc.conn.close_reason().is_none(), "the newer session was kicked");
@@ -392,7 +422,7 @@ async fn hello_after_login_is_a_violation() {
     let dir = tempfile::tempdir().unwrap();
     let srv = start_server(&dir).await;
     let (mut ala, _, _) = Client::login(&srv, "ala").await;
-    ala.hello("ala", "x", PROTOCOL_VERSION).await;
+    ala.hello("ala", pw("x"), PROTOCOL_VERSION).await;
     let err = timeout(Duration::from_secs(5), ala.conn.closed()).await.unwrap();
     assert!(closed_with(&err, 2), "got {err:?}");
 }

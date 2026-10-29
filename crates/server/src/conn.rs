@@ -8,17 +8,19 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use protocol::audio::{upstream_to_downstream, MAX_DATAGRAM};
 use protocol::{
-    encode_frame, hello_version, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
-    RoomErrorReason, RoomId, ServerMsg, MAX_BLOB, MAX_CHAT_BLOB, PROTOCOL_VERSION,
+    encode_frame, hello_version, normalize_username, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo,
+    RejectReason, RoomChoice, RoomErrorReason, RoomId, ServerMsg, CLOSE_BLOCKED, MAX_BLOB, MAX_CHAT_BLOB,
+    MIN_PASSWORD_CHARS, PROTOCOL_VERSION, TOKEN_TTL_S,
 };
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::auth::{verify_password, LoginLimiter};
+use crate::auth::{hash_password, random_token, verify_password, LoginLimiter};
 use crate::room::Registry;
-use crate::store::{Store, StoreError};
+use crate::store::{Account, RegisterError, Store, StoreError};
+use crate::unix_now;
 
 /// Application close code: the account logged in elsewhere.
 pub const CLOSE_REPLACED: u32 = 1;
@@ -26,6 +28,8 @@ pub const CLOSE_REPLACED: u32 = 1;
 pub const CLOSE_PROTOCOL: u32 = 2;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the store is checked for accounts the admin blocked from the shell.
+const BLOCKED_POLL: Duration = Duration::from_secs(5);
 /// How long to wait for the peer to read a final message before closing.
 const LINGER: Duration = Duration::from_secs(2);
 const AUDIO_RATE_PER_S: u32 = 100;
@@ -52,13 +56,10 @@ pub(crate) struct Peer {
 
 pub(crate) struct Shared {
     pub(crate) registry: Mutex<Registry<Peer>>,
-    /// Locked only while holding `registry`, so room changes cannot race.
+    /// Room changes lock it only while holding `registry`, so they cannot race; account
+    /// calls lock it alone, off the async threads (`with_store`).
     pub(crate) store: Mutex<Store>,
-    /// Users who may delete anyone's room.
-    pub(crate) admins: HashSet<String>,
     pub(crate) limiter: Mutex<LoginLimiter>,
-    /// Username → Argon2id hash.
-    pub(crate) users: HashMap<String, String>,
     /// Checked for unknown users so timing does not reveal which accounts exist.
     pub(crate) dummy_hash: String,
     pub(crate) verify_slots: tokio::sync::Semaphore,
@@ -125,26 +126,35 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
         }
         _ => return Ok(()),
     };
-    let ClientMsg::Hello { version, username, password, session, room } = hello else {
+    let ClientMsg::Hello { version, username: claimed, auth, session, room } = hello else {
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
         return Ok(());
     };
 
     let ip = conn.remote_address().ip();
-    if let Some(reason) = check_login(&shared, ip, version, &username, password).await {
-        tracing::info!(%ip, user = %username, ?reason, "login rejected");
-        send_and_close(send, &conn, ServerMsg::Rejected { reason }, 0).await;
+    let kind = auth_kind(&auth);
+    let username = match check_login(&shared, ip, version, &claimed, auth).await {
+        Ok(name) => name,
+        Err(reason) => {
+            tracing::info!(%ip, user = %claimed, kind, ?reason, "login rejected");
+            send_and_close(send, &conn, ServerMsg::Rejected { reason }, 0).await;
+            return Ok(());
+        }
+    };
+    let Some(token) = issue_token(&shared, &username).await else {
+        send_and_close(send, &conn, ServerMsg::Rejected { reason: RejectReason::RateLimited }, 0).await;
         return Ok(());
-    }
+    };
+    shared.limiter.lock().unwrap().forgive(ip);
 
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     let peer = Peer { conn: conn.clone(), ctrl: ctrl_tx, session, announce: None };
-    let Some(id) = log_in(&shared, &username, peer, room) else {
+    let Some(id) = log_in(&shared, &username, peer, room, token) else {
         tracing::info!(%ip, user = %username, "replaced client tried to come back");
         send_and_close(send, &conn, ServerMsg::SessionReplaced, CLOSE_REPLACED).await;
         return Ok(());
     };
-    tracing::info!(%ip, user = %username, id, "joined");
+    tracing::info!(%ip, user = %username, kind, id, "joined");
     let writer = tokio::spawn(write_ctrl(send, ctrl_rx, conn.clone()));
 
     let end = tokio::select! {
@@ -160,46 +170,179 @@ async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn auth_kind(auth: &Auth) -> &'static str {
+    match auth {
+        Auth::Password(_) => "password",
+        Auth::Token(_) => "token",
+        Auth::Register { .. } => "register",
+    }
+}
+
+/// Returns the account's name as stored. Every kind of attempt counts against the IP until
+/// the caller forgives it, so tokens and invites cannot be guessed faster than passwords.
 async fn check_login(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     ip: IpAddr,
     version: u16,
     username: &str,
-    password: String,
-) -> Option<RejectReason> {
+    auth: Auth,
+) -> Result<String, RejectReason> {
     if version != PROTOCOL_VERSION {
-        return Some(RejectReason::VersionMismatch { server: PROTOCOL_VERSION });
+        return Err(RejectReason::VersionMismatch { server: PROTOCOL_VERSION });
     }
     {
         // Count the attempt before verifying, so parallel guesses cannot all slip through.
         let mut limiter = shared.limiter.lock().unwrap();
         if limiter.is_blocked(ip, Instant::now()) {
-            return Some(RejectReason::RateLimited);
+            return Err(RejectReason::RateLimited);
         }
         limiter.record_failure(ip, Instant::now());
     }
+    match auth {
+        Auth::Password(password) => password_login(shared, username, password).await,
+        Auth::Token(token) => token_login(shared, username, token).await,
+        Auth::Register { invite, password } => register(shared, username, invite, password).await,
+    }
+}
+
+async fn password_login(
+    shared: &Arc<Shared>,
+    username: &str,
+    password: String,
+) -> Result<String, RejectReason> {
+    let name = username.to_owned();
+    let account = match with_store(shared, move |s| s.account(&name)).await {
+        Some(Ok(account)) => account,
+        _ => return Err(store_failed("account lookup")),
+    };
     // Unknown users are checked against a dummy hash so timing does not reveal account names.
-    let (hash, known) = match shared.users.get(username) {
-        Some(h) => (h.clone(), true),
-        None => (shared.dummy_hash.clone(), false),
+    let hash = account.as_ref().map_or_else(|| shared.dummy_hash.clone(), |a| a.hash.clone());
+    if argon2(shared, move || verify_password(&hash, &password)).await != Some(true) {
+        return Err(RejectReason::BadCredentials);
+    }
+    match account {
+        None => Err(RejectReason::BadCredentials),
+        Some(a) if a.blocked => Err(RejectReason::AccountBlocked),
+        Some(a) => Ok(a.name),
+    }
+}
+
+async fn token_login(
+    shared: &Arc<Shared>,
+    username: &str,
+    token: [u8; 32],
+) -> Result<String, RejectReason> {
+    let claimed = username.to_lowercase();
+    let account = with_store(shared, move |s| -> anyhow::Result<Option<Account>> {
+        // Redeemed even when it is someone else's: a leaked token dies on first use.
+        match s.redeem_token(&token, unix_now())? {
+            Some(key) if key == claimed => s.account(&key),
+            _ => Ok(None),
+        }
+    })
+    .await;
+    match account {
+        Some(Ok(Some(a))) if !a.blocked => Ok(a.name),
+        Some(Ok(_)) => Err(RejectReason::TokenInvalid),
+        _ => Err(store_failed("token redeem")),
+    }
+}
+
+async fn register(
+    shared: &Arc<Shared>,
+    username: &str,
+    invite: [u8; 16],
+    password: String,
+) -> Result<String, RejectReason> {
+    let Some(name) = normalize_username(username) else { return Err(RejectReason::NameInvalid) };
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(RejectReason::PasswordTooShort);
+    }
+    let Some(hash) = argon2(shared, move || hash_password(&password)).await else {
+        return Err(store_failed("password hashing"));
     };
-    // Each Argon2 check takes ~19 MiB; bound how many run at once.
-    let ok = match shared.verify_slots.acquire().await {
-        Ok(_permit) => tokio::task::spawn_blocking(move || verify_password(&hash, &password))
-            .await
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-    if ok && known {
-        shared.limiter.lock().unwrap().forgive(ip);
-        None
-    } else {
-        Some(RejectReason::BadCredentials)
+    match with_store(shared, move |s| s.register(&invite, &name, &hash, unix_now())).await {
+        Some(Ok(account)) => {
+            tracing::info!(user = %account.name, "account registered");
+            Ok(account.name)
+        }
+        Some(Err(RegisterError::InviteInvalid)) => Err(RejectReason::InviteInvalid),
+        Some(Err(RegisterError::NameTaken)) => Err(RejectReason::NameTaken),
+        _ => Err(store_failed("registration")),
+    }
+}
+
+/// A fresh session token for the next login, or `None` if the store failed.
+async fn issue_token(shared: &Arc<Shared>, name: &str) -> Option<[u8; 32]> {
+    let token = random_token();
+    let name = name.to_owned();
+    match with_store(shared, move |s| s.issue_token(&name, &token, unix_now(), TOKEN_TTL_S)).await {
+        Some(Ok(())) => Some(token),
+        _ => {
+            store_failed("token issue");
+            None
+        }
+    }
+}
+
+/// A server-side failure: the client is told to retry later rather than that it was wrong.
+fn store_failed(what: &str) -> RejectReason {
+    tracing::warn!("account store failed during {what}");
+    RejectReason::RateLimited
+}
+
+/// Runs `f` on the store off the async threads; `None` if it panicked.
+async fn with_store<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    f: impl FnOnce(&Store) -> R + Send + 'static,
+) -> Option<R> {
+    let shared = shared.clone();
+    tokio::task::spawn_blocking(move || f(&shared.store.lock().unwrap())).await.ok()
+}
+
+/// Each Argon2 run takes ~19 MiB; bound how many run at once.
+async fn argon2<R: Send + 'static>(
+    shared: &Shared,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    let _permit = shared.verify_slots.acquire().await.ok()?;
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// Closes the connections of accounts blocked since they logged in.
+pub(crate) async fn kick_blocked(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(BLOCKED_POLL);
+    loop {
+        tick.tick().await;
+        let blocked = match with_store(&shared, |s| s.blocked_accounts()).await {
+            Some(Ok(names)) => names.iter().map(|n| n.to_lowercase()).collect::<HashSet<_>>(),
+            _ => {
+                store_failed("blocked accounts check");
+                continue;
+            }
+        };
+        if blocked.is_empty() {
+            continue;
+        }
+        let reg = shared.registry.lock().unwrap();
+        let (_, members) = reg.snapshot();
+        for m in members.iter().filter(|m| blocked.contains(&m.name.to_lowercase())) {
+            if let Some(p) = reg.get(m.id) {
+                tracing::info!(user = %m.name, id = m.id, "blocked account disconnected");
+                p.conn.close(VarInt::from_u32(CLOSE_BLOCKED), b"blocked");
+            }
+        }
     }
 }
 
 /// `None` when this client run was already replaced by a login elsewhere.
-fn log_in(shared: &Shared, username: &str, peer: Peer, choice: RoomChoice) -> Option<MemberId> {
+fn log_in(
+    shared: &Shared,
+    username: &str,
+    peer: Peer,
+    choice: RoomChoice,
+    token: [u8; 32],
+) -> Option<MemberId> {
     let welcome_tx = peer.ctrl.clone();
     let session = peer.session;
     let mut reg = shared.registry.lock().unwrap();
@@ -228,7 +371,7 @@ fn log_in(shared: &Shared, username: &str, peer: Peer, choice: RoomChoice) -> Op
         let _ = p.ctrl.send(ServerMsg::MemberJoined(me.clone()));
     }
     let (rooms, members) = reg.snapshot();
-    let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, room: outcome.room, rooms, members });
+    let _ = welcome_tx.send(ServerMsg::Welcome { you: outcome.id, room: outcome.room, rooms, members, token });
     // Same lock as Welcome, so these always follow it and precede any later Announce.
     replay_announces(&reg, outcome.id, &welcome_tx);
     Some(outcome.id)
@@ -390,7 +533,9 @@ fn delete_room(shared: &Shared, id: MemberId, username: &str, room: RoomId) {
     if !reg.contains(id) {
         return;
     }
-    if let Err(reason) = reg.check_delete(room, username, shared.admins.contains(username)) {
+    // Read on every delete, so an admin made or unmade from the shell counts at once.
+    let admin = matches!(shared.store.lock().unwrap().account(username), Ok(Some(a)) if a.admin);
+    if let Err(reason) = reg.check_delete(room, username, admin) {
         return send_to(&reg, id, ServerMsg::RoomError { reason });
     }
     let deleted = shared.store.lock().unwrap().delete_room(room);

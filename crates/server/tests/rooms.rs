@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use protocol::audio::{encode_upstream, parse_downstream};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RoomChoice, RoomErrorReason,
+    encode_frame, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo, RoomChoice, RoomErrorReason,
     RoomId, RoomInfo, ServerMsg, MAX_CHAT_BLOB, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
@@ -78,13 +78,13 @@ impl Client {
         c.send_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             username: name.into(),
-            password: "x".into(),
+            auth: Auth::Password("x".into()),
             session: NEXT.fetch_add(1, Ordering::Relaxed),
             room,
         })
         .await;
         match c.next_msg().await {
-            Some(ServerMsg::Welcome { you, room, rooms, members }) => {
+            Some(ServerMsg::Welcome { you, room, rooms, members, .. }) => {
                 (c, Welcome { you, room, rooms, members })
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -328,4 +328,26 @@ async fn chat_flood_is_limited() {
     }
     assert!(received > 0 && received <= server::conn::CHAT_BURST + 5, "received {received}");
     assert!(ala.conn.close_reason().is_none());
+}
+
+#[tokio::test]
+async fn config_admin_can_delete_rooms() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (mut ala, _) = Client::login(&srv, "ala", RoomChoice::Nowhere).await;
+    let (mut ewa, _) = Client::login(&srv, "ewa", RoomChoice::Nowhere).await;
+    let (mut ola, _) = Client::login(&srv, "ola", RoomChoice::Nowhere).await;
+    let gra = create_gra(&mut ala).await;
+    ewa.send_msg(&ClientMsg::DeleteRoom { room: gra }).await;
+    ala.expect(|m| *m == ServerMsg::RoomDeleted { room: gra }).await;
+
+    // The flag is read from the account, so an admin made from the shell counts at once.
+    let gra = create_gra(&mut ala).await;
+    ola.send_msg(&ClientMsg::DeleteRoom { room: gra }).await;
+    let not_allowed = ServerMsg::RoomError { reason: RoomErrorReason::NotAllowed };
+    assert_eq!(ola.expect(|m| matches!(m, ServerMsg::RoomError { .. })).await, not_allowed);
+    let store = server::store::Store::open(&dir.path().join("komunikator.db")).unwrap();
+    assert!(store.set_admin("ola", true).unwrap());
+    ola.send_msg(&ClientMsg::DeleteRoom { room: gra }).await;
+    ola.expect(|m| *m == ServerMsg::RoomDeleted { room: gra }).await;
 }

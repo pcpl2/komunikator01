@@ -71,7 +71,7 @@ mod tests {
         ClientMsg::Hello {
             version: 1,
             username: "ala".into(),
-            password: "x".into(),
+            auth: crate::Auth::Password("x".into()),
             session: 7,
             room: crate::RoomChoice::Room(3),
         }

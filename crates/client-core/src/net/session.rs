@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use protocol::audio::{encode_upstream, parse_downstream, MAX_AUDIO_PAYLOAD, MAX_DATAGRAM};
 use protocol::{
-    encode_frame, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
+    encode_frame, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
     RoomErrorReason, RoomId, RoomInfo, ServerMsg, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
@@ -266,7 +266,7 @@ impl Task {
         let hello = ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             username: self.params.username.clone(),
-            password: self.params.password.clone(),
+            auth: Auth::Password(self.params.password.clone()),
             session: self.session,
             room: self.room_choice,
         };
@@ -288,7 +288,7 @@ impl Task {
             return Outcome::Retry;
         };
         let (lobby, entered, queued) = match reply {
-            Some(ServerMsg::Welcome { you, room, rooms, members }) => {
+            Some(ServerMsg::Welcome { you, room, rooms, members, .. }) => {
                 backoff.reset();
                 self.welcomed(you, room, rooms, members)
             }
@@ -299,6 +299,13 @@ impl Task {
                         Outcome::Fatal(FatalReason::VersionMismatch { server })
                     }
                     RejectReason::RateLimited => Outcome::Retry,
+                    // Only a password is sent for now; none of these can be fixed by retrying.
+                    RejectReason::InviteInvalid
+                    | RejectReason::NameTaken
+                    | RejectReason::NameInvalid
+                    | RejectReason::AccountBlocked
+                    | RejectReason::TokenInvalid
+                    | RejectReason::PasswordTooShort => Outcome::Fatal(FatalReason::BadCredentials),
                 }
             }
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),

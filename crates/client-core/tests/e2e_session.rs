@@ -38,7 +38,7 @@ async fn server_side_sees_only_ciphertext() {
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         username: "ewa".into(),
-        password: "x".into(),
+        auth: protocol::Auth::Password("x".into()),
         session: 7,
         room: protocol::RoomChoice::Default,
     };
