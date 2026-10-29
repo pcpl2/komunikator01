@@ -1,5 +1,6 @@
 //! Voice relay server: authenticates clients and forwards their audio datagrams.
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod conn;
@@ -27,7 +28,7 @@ pub struct RunningServer {
     endpoint: quinn::Endpoint,
     fingerprint: [u8; 32],
     accept: tokio::task::JoinHandle<()>,
-    kick_blocked: tokio::task::JoinHandle<()>,
+    watcher: tokio::task::JoinHandle<()>,
 }
 
 impl RunningServer {
@@ -42,9 +43,9 @@ impl RunningServer {
     pub async fn shutdown(self) {
         self.endpoint.close(0u32.into(), b"shutdown");
         self.accept.abort();
-        self.kick_blocked.abort();
+        self.watcher.abort();
         let _ = self.accept.await;
-        let _ = self.kick_blocked.await;
+        let _ = self.watcher.await;
         self.endpoint.wait_idle().await;
     }
 }
@@ -69,14 +70,14 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
         verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
         retired: Mutex::new(Default::default()),
     });
-    let kick_blocked = tokio::spawn(conn::kick_blocked(shared.clone()));
+    let watcher = tokio::spawn(conn::watch_store(shared.clone()));
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
             tokio::spawn(conn::handle(incoming, shared.clone()));
         }
     });
-    Ok(RunningServer { endpoint, fingerprint: identity.fingerprint, accept, kick_blocked })
+    Ok(RunningServer { endpoint, fingerprint: identity.fingerprint, accept, watcher })
 }
 
 pub(crate) fn unix_now() -> u64 {

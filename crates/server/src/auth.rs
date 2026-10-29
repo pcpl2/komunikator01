@@ -30,6 +30,13 @@ pub fn random_token() -> [u8; 32] {
     token
 }
 
+/// An invite code from the OS random generator.
+pub fn random_invite_code() -> [u8; 16] {
+    let mut code = [0u8; 16];
+    OsRng.fill_bytes(&mut code);
+    code
+}
+
 /// Blocks an IP after `max_failures` failed logins within `window`.
 pub struct LoginLimiter {
     max_failures: u32,

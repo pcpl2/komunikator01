@@ -140,6 +140,23 @@ impl<C: Clone> Registry<C> {
         self.rooms.remove(&room);
     }
 
+    pub fn room_ids(&self) -> Vec<RoomId> {
+        self.rooms.keys().copied().collect()
+    }
+
+    pub fn has_room(&self, room: RoomId) -> bool {
+        self.rooms.contains_key(&room)
+    }
+
+    pub fn members_in(&self, room: RoomId) -> Vec<MemberId> {
+        self.members.iter().filter(|(_, m)| m.room == Some(room)).map(|(id, _)| *id).collect()
+    }
+
+    /// Everyone online.
+    pub fn everyone(&self) -> Vec<C> {
+        self.members.values().map(|m| m.conn.clone()).collect()
+    }
+
     pub fn get_mut(&mut self, id: MemberId) -> Option<&mut C> {
         self.members.get_mut(&id).map(|m| &mut m.conn)
     }

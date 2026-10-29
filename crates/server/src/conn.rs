@@ -9,7 +9,7 @@ use bytes::Bytes;
 use protocol::audio::{upstream_to_downstream, MAX_DATAGRAM};
 use protocol::{
     encode_frame, hello_version, normalize_username, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo,
-    RejectReason, RoomChoice, RoomErrorReason, RoomId, ServerMsg, CLOSE_BLOCKED, MAX_BLOB, MAX_CHAT_BLOB,
+    RejectReason, RoomChoice, RoomErrorReason, RoomId, RoomInfo, ServerMsg, CLOSE_BLOCKED, MAX_BLOB, MAX_CHAT_BLOB,
     MIN_PASSWORD_CHARS, PROTOCOL_VERSION, TOKEN_TTL_S,
 };
 use quinn::{Connection, RecvStream, SendStream, VarInt};
@@ -28,8 +28,8 @@ pub const CLOSE_REPLACED: u32 = 1;
 pub const CLOSE_PROTOCOL: u32 = 2;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often the store is checked for accounts the admin blocked from the shell.
-const BLOCKED_POLL: Duration = Duration::from_secs(5);
+/// How often the store is checked for accounts and rooms the admin changed from the shell.
+const STORE_POLL: Duration = Duration::from_secs(5);
 /// How long to wait for the peer to read a final message before closing.
 const LINGER: Duration = Duration::from_secs(2);
 const AUDIO_RATE_PER_S: u32 = 100;
@@ -309,29 +309,85 @@ async fn argon2<R: Send + 'static>(
     tokio::task::spawn_blocking(f).await.ok()
 }
 
-/// Closes the connections of accounts blocked since they logged in.
-pub(crate) async fn kick_blocked(shared: Arc<Shared>) {
-    let mut tick = tokio::time::interval(BLOCKED_POLL);
+/// Picks up what the admin changed from the shell: blocked accounts are disconnected and
+/// rooms created or deleted there reach the running server and its clients.
+pub(crate) async fn watch_store(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(STORE_POLL);
     loop {
         tick.tick().await;
-        let blocked = match with_store(&shared, |s| s.blocked_accounts()).await {
-            Some(Ok(names)) => names.iter().map(|n| n.to_lowercase()).collect::<HashSet<_>>(),
-            _ => {
-                store_failed("blocked accounts check");
-                continue;
-            }
-        };
-        if blocked.is_empty() {
-            continue;
+        kick_blocked(&shared).await;
+        sync_rooms(&shared).await;
+    }
+}
+
+/// Closes the connections of accounts blocked since they logged in.
+async fn kick_blocked(shared: &Arc<Shared>) {
+    let blocked = match with_store(shared, |s| s.blocked_accounts()).await {
+        Some(Ok(names)) => names.iter().map(|n| n.to_lowercase()).collect::<HashSet<_>>(),
+        _ => {
+            store_failed("blocked accounts check");
+            return;
         }
-        let reg = shared.registry.lock().unwrap();
-        let (_, members) = reg.snapshot();
-        for m in members.iter().filter(|m| blocked.contains(&m.name.to_lowercase())) {
-            if let Some(p) = reg.get(m.id) {
-                tracing::info!(user = %m.name, id = m.id, "blocked account disconnected");
-                p.conn.close(VarInt::from_u32(CLOSE_BLOCKED), b"blocked");
+    };
+    if blocked.is_empty() {
+        return;
+    }
+    let reg = shared.registry.lock().unwrap();
+    let (_, members) = reg.snapshot();
+    for m in members.iter().filter(|m| blocked.contains(&m.name.to_lowercase())) {
+        if let Some(p) = reg.get(m.id) {
+            tracing::info!(user = %m.name, id = m.id, "blocked account disconnected");
+            p.conn.close(VarInt::from_u32(CLOSE_BLOCKED), b"blocked");
+        }
+    }
+}
+
+/// Mirrors the stored room list into the registry. The list is read while holding the
+/// registry lock, like the room handlers do, so a room being created by a client is not
+/// mistaken for a deleted one.
+async fn sync_rooms(shared: &Arc<Shared>) {
+    let shared = shared.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut reg = shared.registry.lock().unwrap();
+        let stored = shared.store.lock().unwrap().rooms();
+        match stored {
+            Ok(stored) => apply_room_changes(&mut reg, &stored),
+            Err(_) => {
+                store_failed("room refresh");
             }
         }
+    })
+    .await;
+    if done.is_err() {
+        tracing::warn!("room refresh panicked");
+    }
+}
+
+fn apply_room_changes(reg: &mut Registry<Peer>, stored: &[RoomInfo]) {
+    for info in stored {
+        if !reg.has_room(info.id) {
+            reg.add_room(info.clone());
+            broadcast(reg, ServerMsg::RoomCreated(info.clone()));
+        }
+    }
+    for room in reg.room_ids().into_iter().filter(|id| !stored.iter().any(|r| r.id == *id)) {
+        for id in reg.members_in(room) {
+            if reg.move_to(id, None) == Ok(true) {
+                // It was meant for the old room's members.
+                if let Some(me) = reg.get_mut(id) {
+                    me.announce = None;
+                }
+                broadcast(reg, ServerMsg::MemberMoved { id, room: None });
+            }
+        }
+        reg.remove_room(room);
+        broadcast(reg, ServerMsg::RoomDeleted { room });
+    }
+}
+
+fn broadcast(reg: &Registry<Peer>, msg: ServerMsg) {
+    for p in reg.everyone() {
+        let _ = p.ctrl.send(msg.clone());
     }
 }
 

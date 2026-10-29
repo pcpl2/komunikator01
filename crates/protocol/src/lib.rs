@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod control;
 pub mod framing;
+pub mod invite;
 
 pub use control::{
     hello_version, normalize_room_name, normalize_username, Auth, ClientMsg, MemberId, MemberInfo, RejectReason,
@@ -10,6 +11,7 @@ pub use control::{
     MAX_ROOMS, MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS, MAX_USERNAME_CHARS, MIN_PASSWORD_CHARS, TOKEN_TTL_S,
 };
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
+pub use invite::{decode_invite, encode_invite, Invite, InviteError, MAX_SERVER_LEN};
 
 /// Bumped whenever the wire format changes incompatibly.
 pub const PROTOCOL_VERSION: u16 = 4;

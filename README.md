@@ -27,6 +27,30 @@ Wymagania: Rust (stable) i CMake (do zbudowania libopus).
    Przy starcie serwer wypisuje `fingerprint: <64 znaki hex>`. To odcisk certyfikatu, który trzeba przekazać znajomym. Certyfikat powstaje przy pierwszym uruchomieniu w `data_dir` (`cert.der`, `key.der`) i potem się nie zmienia.
 4. Otwórz w firewallu port **UDP 7700** (albo ten ustawiony w `bind`).
 
+## Administracja
+
+Administratorem jest każdy, kto ma dostęp do powłoki serwera. Wszystkie polecenia przyjmują `--config <plik.toml>` (stąd biorą `data_dir`) i działają na bazie bezpośrednio, więc nie wymagają zatrzymania serwera: działający serwer zauważa blokady i zmiany pokoi w ciągu kilku sekund.
+
+| Polecenie | Działanie |
+|---|---|
+| `invite [--days 7] [--server host:port]` | tworzy jednorazowe zaproszenie i wypisuje jego tekst (`kom1-…`) wraz z instrukcją dla znajomego; adres z `--server`, a bez niego z `public_address` w konfiguracji |
+| `users` | konta: nazwa, administrator, zablokowany, data utworzenia |
+| `invites` | zaproszenia: utworzone, wygasa, kto użył (kody nie są nigdzie zapisane w postaci jawnej) |
+| `block <nazwa>` / `unblock <nazwa>` | blokuje konto (także rozłącza je w ciągu kilku sekund, jeśli jest online) / odblokowuje |
+| `make-admin <nazwa>` / `revoke-admin <nazwa>` | nadaje / odbiera prawo usuwania cudzych pokoi |
+| `reset-password <nazwa>` | nowe hasło czytane ze standardowego wejścia (minimum 8 znaków); zapamiętane sesje konta wygasają |
+| `rooms` | pokoje z numerami |
+| `create-room <nazwa>` / `delete-room <nr>` | zakłada pokój / usuwa pokój, także zajęty (osoby w nim trafiają do „bez pokoju”) |
+| `hash-password` | hash hasła do `[[users]]` w konfiguracji (te konta są importowane przy starcie) |
+
+Przykład zaproszenia znajomego (ustaw `public_address = "gra.example.pl:7700"` w konfiguracji):
+
+```
+komunikator-server invite --config server.toml --days 3
+```
+
+Polecenie wypisuje tekst w rodzaju `kom1-1A2B3-…`. Przekaż go znajomemu bezpiecznym kanałem: w programie wybiera `Mam zaproszenie`, wkleja cały tekst, potem wybiera nazwę użytkownika i hasło. Zaproszenie zawiera adres serwera i odcisk certyfikatu, więc nic więcej nie trzeba przepisywać. Wygasa po podanej liczbie dni albo po pierwszym użyciu.
+
 ## Klient (Windows)
 
 ### Okno: `komunikator.exe`
