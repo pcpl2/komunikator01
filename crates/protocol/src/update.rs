@@ -111,7 +111,18 @@ pub fn verify_manifest(public: &[u8; 32], bytes: &[u8]) -> Result<Manifest, Upda
     Ok(m)
 }
 
-/// Strictly greater: equal or older is never an update (no downgrade).
+/// The manifest's `file` field with the signature unchecked. Only for the server, which has no
+/// key and needs nothing but the name of the one file it may serve; clients use `verify_manifest`.
+pub fn unverified_file_name(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_MANIFEST {
+        return None;
+    }
+    let (signed, rest) = postcard::take_from_bytes::<SignedManifest>(bytes).ok()?;
+    let (m, body_rest) = postcard::take_from_bytes::<Manifest>(&signed.body).ok()?;
+    (rest.is_empty() && body_rest.is_empty()).then_some(m.file)
+}
+
+/// Strictly greater:equal or older is never an update (no downgrade).
 pub fn is_newer(candidate: Version, current: Version) -> bool {
     candidate > current
 }
@@ -184,6 +195,15 @@ mod tests {
         assert!(is_newer(v("2.0.0"), v("1.9.9")));
         assert!(!is_newer(v("1.2.3"), v("1.2.3")));
         assert!(!is_newer(v("1.2.2"), v("1.2.3")));
+    }
+
+    #[test]
+    fn unverified_file_name_reads_without_key() {
+        let bytes = sign_manifest(&key(), &manifest(r"..\x"));
+        assert_eq!(unverified_file_name(&bytes).as_deref(), Some(r"..\x"));
+        assert_eq!(unverified_file_name(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(unverified_file_name(&[bytes.clone(), vec![0]].concat()), None);
+        assert_eq!(unverified_file_name(&[]), None);
     }
 
     #[test]

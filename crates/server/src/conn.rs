@@ -66,6 +66,7 @@ pub(crate) struct Shared {
     /// Account key (lowercase name) → client runs that were replaced by a login elsewhere.
     /// They may not come back, or a client that missed its notice would kick out the newer one.
     pub(crate) retired: Mutex<HashMap<String, VecDeque<u64>>>,
+    pub(crate) updates: Arc<crate::updates::Host>,
 }
 
 /// Simple token bucket limiting audio datagrams per connection.
@@ -103,9 +104,17 @@ enum End {
 
 pub(crate) async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) {
     let Ok(conn) = incoming.await else { return };
+    if negotiated_alpn(&conn).as_deref() == Some(protocol::update::UPDATE_ALPN) {
+        crate::updates::serve(conn, shared.updates.clone()).await;
+        return;
+    }
     if let Err(e) = serve(conn, shared).await {
         tracing::debug!("connection ended: {e:#}");
     }
+}
+
+fn negotiated_alpn(conn: &Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()?.downcast::<quinn::crypto::rustls::HandshakeData>().ok()?.protocol
 }
 
 async fn serve(conn: Connection, shared: Arc<Shared>) -> anyhow::Result<()> {

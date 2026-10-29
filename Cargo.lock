@@ -1633,6 +1633,7 @@ dependencies = [
  "bytes",
  "clap",
  "client-core",
+ "ed25519-dalek",
  "password-hash",
  "protocol",
  "quinn",

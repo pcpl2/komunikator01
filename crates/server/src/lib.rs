@@ -7,6 +7,7 @@ pub mod conn;
 pub mod room;
 pub mod store;
 pub mod tls;
+mod updates;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -85,6 +86,7 @@ pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
         dummy_hash,
         verify_slots: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
         retired: Mutex::new(Default::default()),
+        updates: Arc::new(updates::Host::new(&config.data_dir)),
     });
     let watcher = tokio::spawn(conn::watch_store(shared.clone()));
     let accept_endpoint = endpoint.clone();
@@ -136,7 +138,8 @@ async fn bind_endpoint(
     }
 }
 
-/// TLS 1.3 + ALPN + transport limits for the relay endpoint.
+/// TLS 1.3 + ALPN + transport limits for the relay endpoint. The same port also serves the
+/// update channel, told apart by its own ALPN.
 pub fn quic_config(identity: &tls::ServerIdentity) -> anyhow::Result<quinn::ServerConfig> {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -145,7 +148,7 @@ pub fn quic_config(identity: &tls::ServerIdentity) -> anyhow::Result<quinn::Serv
             vec![identity.cert.clone()],
             PrivateKeyDer::Pkcs8(identity.key.clone_key()),
         )?;
-    tls.alpn_protocols = vec![protocol::ALPN.to_vec()];
+    tls.alpn_protocols = vec![protocol::ALPN.to_vec(), protocol::update::UPDATE_ALPN.to_vec()];
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     let mut transport = quinn::TransportConfig::default();

@@ -13,13 +13,19 @@ use sha2::{Digest, Sha256};
 pub const SERVER_NAME: &str = "komunikator";
 
 pub fn client_config(fingerprint: [u8; 32]) -> anyhow::Result<quinn::ClientConfig> {
+    client_config_with_alpn(fingerprint, protocol::ALPN)
+}
+
+/// The same pinned configuration speaking another protocol on the server's port, such as the
+/// update channel (`protocol::update::UPDATE_ALPN`).
+pub fn client_config_with_alpn(fingerprint: [u8; 32], alpn: &[u8]) -> anyhow::Result<quinn::ClientConfig> {
     let provider = Arc::new(ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(fingerprint)))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![protocol::ALPN.to_vec()];
+    tls.alpn_protocols = vec![alpn.to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(transport_config()));
