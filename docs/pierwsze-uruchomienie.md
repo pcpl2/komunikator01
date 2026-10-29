@@ -28,41 +28,53 @@ target\release\komunikator-release keygen --out release.key
 2. Plik `release.key` przenieś w bezpieczne miejsce, np. na pendrive i do menedżera haseł. Nigdy nie wrzucaj go do repozytorium.
 3. Jeśli wolisz, żeby GitHub nie miał klucza tajnego, zamiast sekretu dodaj zmienną `RELEASE_PUBLIC_KEY` z kluczem publicznym (zakładka `Variables`) i podpisuj aktualizacje u siebie. Różnice: `docs/wydanie.md`, sekcja „Klucz wydań klienta”.
 
-### 3. Pierwsze wydania (GitHub Actions)
+### 3. Wydanie obrazu serwera (GitHub Actions)
 
-W repozytorium na GitHubie: `Actions → Wydanie serwera → Run workflow`, wersja `0.1.0`. Workflow publikuje obraz `ghcr.io/pcpl2/komunikator-server`. Klienta wydasz w kroku 5, gdy serwer już działa i znasz jego odcisk.
+1. W repozytorium na GitHubie wejdź w `Actions → Wydanie serwera → Run workflow`. Zostaw gałąź `main` i wpisz wersję `0.1.0`.
+2. Workflow uruchamia testy, buduje obraz Dockera i publikuje go w ghcr.io jako:
+   - `ghcr.io/pcpl2/komunikator-server:0.1.0`;
+   - `ghcr.io/pcpl2/komunikator-server:latest`.
 
-Każde kolejne wydanie dostaje wyższą wersję wpisaną w tym samym polu.
+   Tworzy też release `server-v0.1.0` z digestem obrazu, bez plików do pobrania.
+3. Obraz widać w repozytorium w `Packages` po prawej stronie. Jest prywatny tak jak repozytorium.
+
+Każde kolejne wydanie serwera dostaje wyższą wersję wpisaną w tym samym polu.
 
 ### 4. Postaw serwer (Debian z Dockerem)
 
-1. Zainstaluj Dockera.
-2. Zaloguj się do ghcr.io tokenem z uprawnieniem `read:packages`: `docker login ghcr.io -u pcpl2`.
-3. Skopiuj `deploy/docker-compose.yml` i `deploy/komunikator.toml` do katalogu, np. `/opt/komunikator`, i utwórz w nim pusty podkatalog `updates` (tu później trafiają aktualizacje klienta).
-4. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`.
-5. Uruchom:
+1. Zainstaluj Dockera z pluginem compose ([instrukcja Dockera dla Debiana](https://docs.docker.com/engine/install/debian/)).
+2. Utwórz token GitHub do pobierania obrazu: `Settings → Developer settings → Personal access tokens → Tokens (classic)` z jedynym uprawnieniem `read:packages`. Tokeny fine-grained nie działają z ghcr.io. Na serwerze zaloguj się nim, wpisując token jako hasło:
+   ```
+   docker login ghcr.io -u pcpl2
+   ```
+3. Repozytorium jest prywatne, więc pliki konfiguracji skopiuj ze swojego komputera:
+   ```
+   ssh serwer 'sudo install -d -o $USER /opt/komunikator'
+   scp deploy/docker-compose.yml deploy/komunikator.toml serwer:/opt/komunikator/
+   ```
+4. W `/opt/komunikator/komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`. Ten adres trafia do zaproszeń.
+5. Otwórz port **UDP** 7700 w firewallu dostawcy serwera (panel VPS), a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. TCP nie wystarczy. W samym systemie Docker otwiera ten port sam, z pominięciem `ufw`.
+6. Uruchom serwer:
+   ```
+   cd /opt/komunikator
+   mkdir -p updates
+   docker compose up -d
+   docker compose logs komunikator
+   ```
 
-```
-cd /opt/komunikator
-mkdir -p updates
-docker compose up -d
-docker compose logs komunikator
-```
+W logu powinny być linie `listening: 0.0.0.0:7700` i `fingerprint: …` (64 znaki). Zanotuj odcisk: przyda się w kroku 5. Nie zmieni się, dopóki istnieje wolumen `komunikator-data`.
 
-W logu powinna pojawić się linia `fingerprint: …`. Oznacza ona, że serwer działa.
+Podkatalog `updates` jest zamontowany w kontenerze tylko do odczytu. Trafiają do niego aktualizacje klienta (patrz „Kolejne wersje” niżej).
 
 ### 5. Wydanie klienta z wbudowanym serwerem
 
-1. W repozytorium na GitHubie (`Settings → Secrets and variables → Actions`) dodaj dwa sekrety:
-   - `SERVER_ADDRESS`: adres z portem, np. `gra.example.pl:7700`;
+1. W repozytorium na GitHubie (`Settings → Secrets and variables → Actions → New repository secret`) dodaj dwa sekrety:
+   - `SERVER_ADDRESS`: ten sam adres co `public_address`, np. `gra.example.pl:7700`;
    - `SERVER_FINGERPRINT`: 64 znaki z linii `fingerprint:`.
-2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`. Powstanie release z `komunikator.exe` dla graczy, z wbudowanym adresem serwera i kluczem wydań. Bez tych sekretów workflow się zatrzyma.
+2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`.
+3. Powstanie release `client-v0.1.0` z `komunikator.exe` dla graczy. Program ma wbudowany adres serwera i klucz wydań, a okno logowania pyta tylko o nazwę i hasło. Bez sekretów z kroków 2 i 5 workflow się zatrzyma.
 
-### 6. Otwórz port UDP 7700
-
-Otwórz go w firewallu dostawcy serwera, a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. Port **UDP** jest wymagany, TCP nie wystarczy. Docker otwiera opublikowany port w systemie sam, z pominięciem `ufw`.
-
-### 7. Twoje konto administratora
+### 6. Twoje konto administratora
 
 ```
 docker exec komunikator komunikator-server invite --config /etc/komunikator/komunikator.toml
@@ -76,16 +88,39 @@ docker exec komunikator komunikator-server invite --config /etc/komunikator/komu
 docker exec komunikator komunikator-server make-admin --config /etc/komunikator/komunikator.toml <twoja-nazwa>
 ```
 
-### 8. Zaproszenia dla znajomych
+### 7. Zaproszenia dla znajomych
 
 Wygeneruj osobny kod dla każdej osoby tym samym poleceniem `invite`. Kod jest jednorazowy i domyślnie ważny 7 dni.
 
-Wyślij każdemu `komunikator.exe` z release na GitHubie i jego kod prywatną wiadomością, nie na publicznym kanale.
+Wyślij każdemu prywatną wiadomością `komunikator.exe` z release `client-v0.1.0` i jego kod, nie na publicznym kanale. Repozytorium jest prywatne, więc znajomi nie pobiorą pliku z GitHuba sami.
 
 Później przydadzą się polecenia (każde z `docker exec komunikator komunikator-server … --config /etc/komunikator/komunikator.toml`):
 - `users`: kto ma konto;
 - `invites`: które zaproszenia zostały użyte;
 - `block <nazwa>`: zablokowanie konta.
+
+### Kolejne wersje
+
+**Serwer:**
+1. `Actions → Wydanie serwera → Run workflow` z wyższą wersją.
+2. Na serwerze:
+   ```
+   cd /opt/komunikator
+   docker compose pull
+   docker compose up -d
+   ```
+   Trwające rozmowy zerwą się na kilka sekund, a programy połączą się same.
+
+**Klient:**
+1. `Actions → Wydanie klienta → Run workflow` z wyższą wersją.
+2. Z release pobierz `komunikator-X.Y.Z.exe` i `manifest.bin`.
+3. Wgraj je do `/opt/komunikator/updates`. Najpierw plik wydania, a manifest na końcu pod tymczasową nazwą, zamienianą jednym `mv`:
+   ```
+   scp komunikator-0.2.0.exe serwer:/opt/komunikator/updates/
+   scp manifest.bin serwer:/opt/komunikator/updates/manifest.bin.tmp
+   ssh serwer 'mv /opt/komunikator/updates/manifest.bin.tmp /opt/komunikator/updates/manifest.bin'
+   ```
+   Restart nie jest potrzebny. Programy graczy pobiorą aktualizację same, gdy nie będą w rozmowie.
 
 ## B. Gracz
 
