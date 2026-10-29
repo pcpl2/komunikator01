@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use client_core::audio::activity::Activity;
 use client_core::audio::volume::GainTable;
 use client_core::e2e::KnownDevices;
-use client_core::net::session::{spawn_session, SessionHandle, SessionParams};
+use client_core::net::session::{spawn_session, Credentials, SessionHandle, SessionParams};
 
 use crate::engine::AudioEngine;
 use crate::identity_store::{load_or_create_identity, IdentityStatus};
@@ -25,7 +25,7 @@ pub struct Account {
     pub server: String,
     pub fingerprint: [u8; 32],
     pub username: String,
-    pub password: String,
+    pub credentials: Credentials,
 }
 
 /// Something the user should read; `warning` ones are about trust and deserve attention.
@@ -95,7 +95,7 @@ pub fn start_client(
             server: account.server,
             fingerprint: account.fingerprint,
             username: account.username,
-            password: account.password,
+            credentials: account.credentials,
             identity: Arc::new(identity),
             trust: trust.clone(),
         },

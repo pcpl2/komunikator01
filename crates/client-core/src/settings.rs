@@ -34,8 +34,11 @@ pub struct Settings {
     pub server: String,
     pub fingerprint: String,
     pub username: String,
-    /// Hex of the DPAPI blob holding the password; empty when unset.
+    /// Hex of the DPAPI blob holding the password; empty when unset. Cleared once a session
+    /// token replaces it.
     pub password_protected: String,
+    /// Hex of the DPAPI blob holding the session token for the next start; empty when unset.
+    pub token_protected: String,
     pub capture_device: Option<String>,
     pub render_device: Option<String>,
     /// 0.0..=1.0
@@ -58,6 +61,7 @@ impl Default for Settings {
             fingerprint: String::new(),
             username: String::new(),
             password_protected: String::new(),
+            token_protected: String::new(),
             capture_device: None,
             render_device: None,
             vad_sensitivity: 0.5,
@@ -79,7 +83,21 @@ impl Settings {
         !self.server.is_empty()
             && !self.fingerprint.is_empty()
             && !self.username.is_empty()
-            && !self.password_protected.is_empty()
+            && (!self.token_protected.is_empty() || !self.password_protected.is_empty())
+    }
+
+    /// Keeps a freshly issued token (protected) and forgets the password: a logged-in client
+    /// needs only the token.
+    pub fn remember_token(&mut self, token_protected: String) {
+        self.token_protected = token_protected;
+        self.password_protected.clear();
+    }
+
+    /// Keeps a typed password (protected) for the next login; any old token belongs to the
+    /// login it replaces.
+    pub fn remember_password(&mut self, password_protected: String) {
+        self.password_protected = password_protected;
+        self.token_protected.clear();
     }
 
     /// Values a hand-edited file may get wrong, brought back into range.
@@ -187,6 +205,7 @@ mod tests {
             fingerprint: "ab12".into(),
             username: "Gżegżółka".into(),
             password_protected: "deadbeef".into(),
+            token_protected: "cafe".into(),
             capture_device: Some("Mikrofon".into()),
             render_device: Some("Słuchawki".into()),
             vad_sensitivity: 0.8,
@@ -286,6 +305,31 @@ mod tests {
     }
 
     #[test]
+    fn token_replaces_password_after_login() {
+        let mut s = Settings {
+            server: "s".into(),
+            fingerprint: "f".into(),
+            username: "u".into(),
+            password_protected: "aa".into(),
+            ..Settings::default()
+        };
+        s.remember_token("bb".into());
+        assert_eq!(s.token_protected, "bb");
+        assert!(s.password_protected.is_empty(), "the password is not kept once a token exists");
+        assert!(s.is_configured());
+        // Typing a password again (new login) drops the token it replaces.
+        s.remember_password("cc".into());
+        assert_eq!(s.password_protected, "cc");
+        assert!(s.token_protected.is_empty());
+        assert!(s.is_configured());
+        let (_d, p) = path();
+        let (store, _, _) = SettingsStore::load(&p);
+        s.remember_token("dd".into());
+        store.save(&s).unwrap();
+        assert_eq!(SettingsStore::load(&p).1, s);
+    }
+
+    #[test]
     fn is_configured_rules() {
         let full = Settings {
             server: "s".into(),
@@ -295,6 +339,8 @@ mod tests {
             ..Settings::default()
         };
         assert!(full.is_configured());
+        let with_token = Settings { password_protected: String::new(), token_protected: "t".into(), ..full.clone() };
+        assert!(with_token.is_configured());
         assert!(!Settings::default().is_configured());
         for clear in [
             |s: &mut Settings| s.server.clear(),

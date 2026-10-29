@@ -23,11 +23,11 @@ use windows::Win32::UI::Controls::{
     TVM_HITTEST, TVM_SELECTITEM,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::app::{account_input, App};
-use super::dialogs::{self, SafetyChoice, SafetyInfo, SettingsEnv, SettingsInput};
+use super::app::{account_form, App};
+use super::dialogs::{self, AccountForm, SafetyChoice, SafetyInfo, SettingsEnv, SettingsInput};
 use super::hotkey;
 use super::icons::{make_icon, tray_pixels, TrayState};
 use super::instance::SHOW_MESSAGE;
@@ -382,6 +382,8 @@ impl Window {
                 if let Ok(mut inner) = self.inner.try_borrow_mut() {
                     inner.app.drain_events(hwnd);
                     self.draw(&mut inner);
+                    drop(inner);
+                    self.login_prompt();
                 } else {
                     // Events stay queued; ask again once the current handler is done.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SESSION, WPARAM(0), LPARAM(0)) };
@@ -562,18 +564,37 @@ impl Window {
         // Back to what the settings say, whether the dialog tried others or not.
         self.apply_hotkeys();
         self.redraw();
+        // A login that failed while the dialog was open asks now.
+        self.login_prompt();
     }
 
     /// The account dialog over `owner`; a changed account restarts the session.
     fn account_dialog(&self, owner: HWND) {
-        let hwnd = self.hwnd();
         let Ok(inner) = self.inner.try_borrow() else { return };
-        let initial = account_input(inner.app.settings());
+        let form = account_form(inner.app.settings());
         drop(inner);
-        if let Some(a) = dialogs::account_dialog(Some(owner), &initial, false) {
-            self.with_app(|app| app.change_account(hwnd, a));
+        self.run_account_dialog(owner, &form);
+    }
+
+    fn run_account_dialog(&self, owner: HWND, form: &AccountForm) {
+        let hwnd = self.hwnd();
+        if let Some(choice) = dialogs::account_dialog(Some(owner), form, false) {
+            self.with_app(|app| app.change_account(hwnd, choice));
             self.redraw();
         }
+    }
+
+    /// Opens the account form a failed login asked for. While another dialog is open (the
+    /// window is disabled) it waits: that dialog's end asks again.
+    fn login_prompt(&self) {
+        let hwnd = self.hwnd();
+        if !unsafe { IsWindowEnabled(hwnd) }.as_bool() {
+            return;
+        }
+        let Some(form) = self.inner.try_borrow_mut().ok().and_then(|mut i| i.app.take_login_prompt()) else {
+            return;
+        };
+        self.run_account_dialog(hwnd, &form);
     }
 
     fn tree_item_at_cursor(&self) -> Option<(HTREEITEM, TreeItem)> {

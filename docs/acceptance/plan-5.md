@@ -1,0 +1,16 @@
+# Akceptacja planu 5 (konta z zaproszeniami, panel administratora, zapamiętane sesje)
+
+Testy automatyczne obejmują zaproszenia (kodowanie, literówki), rejestrację, tokeny sesji (jednorazowe, odnawiane), blokowanie i odblokowanie, reset hasła, polecenia administratora, ograniczenie prób logowania, walidację formularza zaproszenia, zapis tokenu w ustawieniach (DPAPI) i sesję klienta z prawdziwym serwerem (rejestracja → logowanie tokenem → zużyty token odrzucony; blokada w trakcie rozmowy). Poniższe punkty wymagają prawdziwego serwera i znajomych.
+
+## Do sprawdzenia przez graczy
+
+1. **Znajomy zakłada konto z zaproszenia:** na serwerze `komunikator-server invite --config server.toml --days 3`; przekaż wypisany tekst `kom1-…` znajomemu. U niego: świeża instalacja (bez `%APPDATA%\komunikator\settings.toml`), `komunikator.exe` → `Mam zaproszenie` → wkleja cały kod, wybiera nazwę i hasło (dwa razy) → `OK`. Program łączy się bez wpisywania adresu ani odcisku; `komunikator-server users` pokazuje nowe konto, `invites` — kto użył zaproszenia.
+2. **Restart bez hasła:** znajomy wychodzi z programu (`Wyjdź`) i uruchamia go ponownie (także po restarcie Windows, z `Uruchamiaj z Windows`): łączy się sam, nie pyta o hasło. W `settings.toml` nie ma jawnego hasła ani tokenu (`token_protected` to zaszyfrowany blob, `password_protected` pusty).
+3. **Blokada i odblokowanie:** w trakcie rozmowy `komunikator-server block <nazwa>`: w ciągu kilku sekund znajomy zostaje rozłączony z komunikatem `konto zostało zablokowane przez administratora` i program nie łączy się ponownie. Blokada unieważnia zapamiętaną sesję, więc ponowne uruchomienie też nie wpuszcza (hasło daje `konto zostało zablokowane przez administratora`). `unblock <nazwa>`, potem znajomy uruchamia program: okno `Mam już konto` prosi o hasło, po nim znów rozmawia.
+4. **Reset hasła:** `komunikator-server reset-password <nazwa>` (nowe hasło na standardowe wejście). Przy następnym połączeniu (restart programu albo zerwanie sieci) program pokazuje `sesja wygasła — zaloguj się ponownie` i otwiera `Mam już konto` z wpisanym serwerem i nazwą; nowe hasło wpuszcza, a kolejne uruchomienia znów nie pytają.
+5. **Zaproszenie użyte drugi raz:** ten sam kod `kom1-…` wklejony na drugim komputerze (inna nazwa) kończy się komunikatem `kod zaproszenia jest nieważny lub już użyty`. Zaproszenie przeterminowane (`--days 1`, po dobie) daje ten sam komunikat. Kod z literówką: okno od razu mówi `niepoprawny kod zaproszenia`.
+6. **Zajęta nazwa:** rejestracja z nazwą istniejącego konta (także inną wielkością liter) → `ta nazwa jest już zajęta`, okno `Mam zaproszenie` wraca z wklejonym kodem; po zmianie nazwy rejestracja się udaje (zaproszenie nie przepadło).
+7. **Stare konta z `[[users]]` działają:** gracz z kontem z pliku konfiguracji (plan 1–4) uruchamia nowy klient ze starym `settings.toml`: łączy się zapamiętanym hasłem, a po pierwszym połączeniu `settings.toml` ma już tylko `token_protected` (hasło usunięte); kolejne starty łączą się tokenem.
+8. **Wiersz poleceń:** `set KOMUNIKATOR_PASSWORD=…` i `komunikator-cli --invite kom1-… --user <nazwa> --data-dir C:\tmp\k` zakłada konto i łączy; potem `komunikator-cli --data-dir C:\tmp\k` (bez hasła w zmiennej) łączy się zapamiętaną sesją.
+
+Wyniki: _do uzupełnienia_.

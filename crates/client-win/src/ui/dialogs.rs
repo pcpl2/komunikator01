@@ -10,6 +10,8 @@ use std::ffi::c_void;
 use client_core::app::trust_label;
 use client_core::e2e::Trust;
 use client_core::settings::{Settings, Sounds};
+use protocol::invite::{decode_invite, Invite};
+use protocol::{normalize_username, MIN_PASSWORD_CHARS};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -39,6 +41,30 @@ pub enum Field {
     Fingerprint,
     User,
     Password,
+    Invite,
+    PasswordRepeat,
+}
+
+const NAME_RULE: &str = "nazwa: 1–32 znaki, litery, cyfry, _ - .";
+const PASSWORD_RULE: &str = "hasło musi mieć co najmniej 8 znaków";
+const _: () = assert!(MIN_PASSWORD_CHARS == 8, "PASSWORD_RULE names the limit");
+
+/// Checks the invite form; on success the decoded invite, the trimmed name and the password.
+pub fn validate_registration(
+    invite: &str,
+    user: &str,
+    pw: &str,
+    pw2: &str,
+) -> Result<(Invite, String, String), (Field, &'static str)> {
+    let invite = decode_invite(invite).map_err(|_| (Field::Invite, "niepoprawny kod zaproszenia"))?;
+    let name = normalize_username(user).ok_or((Field::User, NAME_RULE))?;
+    if pw.chars().count() < MIN_PASSWORD_CHARS {
+        return Err((Field::Password, PASSWORD_RULE));
+    }
+    if pw != pw2 {
+        return Err((Field::PasswordRepeat, "hasła się różnią"));
+    }
+    Ok((invite, name, pw.to_owned()))
 }
 
 /// Checks the first-run / account form; the error names the field and says what is wrong.
@@ -160,6 +186,53 @@ impl std::fmt::Debug for AccountInput {
             .field("password", &"<ukryte>")
             .finish()
     }
+}
+
+/// A filled-in invite form.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// Carries the server and its fingerprint.
+    pub invite: Invite,
+    pub username: String,
+    pub password: String,
+}
+
+/// Leaves the invite code and the password out, so they never end up in a log.
+impl std::fmt::Debug for Registration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registration")
+            .field("server", &self.invite.server)
+            .field("username", &self.username)
+            .field("invite", &"<ukryte>")
+            .field("password", &"<ukryte>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountMode {
+    /// `Mam zaproszenie`: create the account with an invite.
+    Invite,
+    /// `Mam już konto`: server, fingerprint, name and password.
+    Login,
+}
+
+/// What the account dialog starts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountForm {
+    pub mode: AccountMode,
+    pub login: AccountInput,
+    /// The invite mode's code and name, kept when a registration was refused.
+    pub invite: String,
+    pub invite_user: String,
+    /// Why the dialog opened (a failed login), shown above the fields.
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChoice {
+    Login(AccountInput),
+    Register(Registration),
 }
 
 /// What the settings dialog edits.
@@ -592,10 +665,16 @@ fn checked(h: HWND) -> bool {
 // --- First run / account ----------------------------------------------------------------
 
 const ID_SERVER: u16 = 201;
+const ID_INVITE: u16 = 211;
+const ID_MODE_INVITE: u16 = 221;
+const ID_MODE_LOGIN: u16 = 222;
+/// Error labels: the login fields' from `ID_ERROR`, the invite fields' from here.
+const ID_INVITE_ERROR: u16 = ID_ERROR + 4;
+const ID_NOTICE: u16 = ID_ERROR + 8;
 
-/// The account form. `first_run` adds a greeting; `None` means cancelled.
-pub fn account_dialog(owner: Option<HWND>, initial: &AccountInput, first_run: bool) -> Option<AccountInput> {
-    try_account_dialog(owner, initial, first_run).ok().flatten()
+/// The account form; `None` means cancelled. `first_run` adds a greeting.
+pub fn account_dialog(owner: Option<HWND>, form: &AccountForm, first_run: bool) -> Option<AccountChoice> {
+    try_account_dialog(owner, form, first_run).ok().flatten()
 }
 
 /// The dialog window could not be created (as opposed to the user cancelling it).
@@ -605,65 +684,157 @@ pub struct DialogUnavailable;
 /// Like `account_dialog`, telling a dialog that never opened apart from Cancel.
 pub fn try_account_dialog(
     owner: Option<HWND>,
-    initial: &AccountInput,
+    form: &AccountForm,
     first_run: bool,
-) -> Result<Option<AccountInput>, DialogUnavailable> {
+) -> Result<Option<AccountChoice>, DialogUnavailable> {
     let title = if first_run { "Komunikator — pierwsze uruchomienie" } else { "Konto" };
     let d = Dialog::new(owner, title).ok_or(DialogUnavailable)?;
-    Ok(account_form(&d, initial, first_run))
+    Ok(account_form(&d, form, first_run))
 }
 
-fn account_form(d: &Dialog, initial: &AccountInput, first_run: bool) -> Option<AccountInput> {
+/// One mode's labels, fields and error messages; only the chosen mode's are visible.
+struct FieldSet {
+    labels: Vec<HWND>,
+    edits: Vec<HWND>,
+    errors: Vec<HWND>,
+}
+
+impl FieldSet {
+    fn show(&self, on: bool) {
+        let cmd = if on { SW_SHOW } else { SW_HIDE };
+        for h in self.labels.iter().chain(&self.edits).chain(&self.errors) {
+            let _ = unsafe { ShowWindow(*h, cmd) };
+        }
+    }
+
+    /// Shows `text` next to field `i` only, and selects that field.
+    fn error(&self, i: usize, text: &str) {
+        for (j, e) in self.errors.iter().enumerate() {
+            set_text(*e, if j == i { text } else { "" });
+        }
+        focus_all(self.edits[i]);
+    }
+
+    fn values(&self) -> Vec<String> {
+        self.edits.iter().map(|e| get_text(*e)).collect()
+    }
+}
+
+/// Row of a field in the invite form.
+fn invite_row(f: Field) -> usize {
+    match f {
+        Field::Invite => 0,
+        Field::User => 1,
+        Field::Password => 2,
+        _ => 3,
+    }
+}
+
+fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<AccountChoice> {
     let (m, w) = (12, 420);
     let fw = w - 2 * m;
     let mut y = m;
     if first_run {
-        d.label("Wpisz dane od osoby prowadzącej serwer.", m, y, fw, 32);
+        let hello = "Masz kod zaproszenia od znajomego? Wklej go poniżej. Masz już konto? Wybierz „Mam już konto”.";
+        d.label(hello, m, y, fw, 32);
         y += 36;
     }
-    let fields = [
-        ("Adres serwera (host:port)", initial.server.as_str(), 0, 255),
-        ("Odcisk certyfikatu (64 znaki)", initial.fingerprint.as_str(), 0, 128),
-        ("Nazwa użytkownika", initial.username.as_str(), 0, 64),
-        ("Hasło", initial.password.as_str(), ES_PASSWORD as u32, 256),
-    ];
-    let mut edits = Vec::new();
-    let mut errors = Vec::new();
-    for (i, (label, value, style, limit)) in fields.into_iter().enumerate() {
-        d.label(label, m, y, fw, 16);
-        edits.push(d.edit(ID_SERVER + i as u16, value, style, limit, m, y + 18, fw));
-        errors.push(d.error(ID_ERROR + i as u16, m, y + 43, fw));
-        y += 64;
+    if let Some(n) = &form.notice {
+        d.control(WC_STATICW, n, SS_NOPREFIX, WINDOW_EX_STYLE::default(), ID_NOTICE, m, y, fw, 32);
+        y += 36;
     }
-    y += 4;
+    let radio = |id, text, x, group: u32| {
+        let style = WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | group;
+        d.control(WC_BUTTONW, text, style, WINDOW_EX_STYLE::default(), id, x, y, 190, 22)
+    };
+    let invite_radio = radio(ID_MODE_INVITE, "Mam zaproszenie", m, WS_GROUP.0);
+    let login_radio = radio(ID_MODE_LOGIN, "Mam już konto", m + 200, 0);
+    y += 30;
+    let fields = |first_id: u16, first_error: u16, rows: [(&str, &str, u32, usize); 4]| {
+        let mut set = FieldSet { labels: Vec::new(), edits: Vec::new(), errors: Vec::new() };
+        for (i, (label, value, style, limit)) in rows.into_iter().enumerate() {
+            let fy = y + 64 * i as i32;
+            // Ends the radio buttons' group, so arrow keys stay with them.
+            let group = if i == 0 { WS_GROUP.0 } else { 0 };
+            set.labels.push(d.label(label, m, fy, fw, 16));
+            set.edits.push(d.edit(first_id + i as u16, value, style | group, limit, m, fy + 18, fw));
+            set.errors.push(d.error(first_error + i as u16, m, fy + 43, fw));
+        }
+        set
+    };
+    let invite = fields(
+        ID_INVITE,
+        ID_INVITE_ERROR,
+        [
+            ("Kod zaproszenia", form.invite.as_str(), 0, 1024),
+            ("Nazwa użytkownika", form.invite_user.as_str(), 0, 64),
+            ("Hasło (co najmniej 8 znaków)", "", ES_PASSWORD as u32, 256),
+            ("Powtórz hasło", "", ES_PASSWORD as u32, 256),
+        ],
+    );
+    let login = fields(
+        ID_SERVER,
+        ID_ERROR,
+        [
+            ("Adres serwera (host:port)", form.login.server.as_str(), 0, 255),
+            ("Odcisk certyfikatu (64 znaki)", form.login.fingerprint.as_str(), 0, 128),
+            ("Nazwa użytkownika", form.login.username.as_str(), 0, 64),
+            ("Hasło", form.login.password.as_str(), ES_PASSWORD as u32, 256),
+        ],
+    );
+    y += 4 * 64 + 4;
     d.button(ID_OK, "OK", true, w - m - 2 * 88 - 8, y, 88);
     d.button(ID_CANCEL, "Anuluj", false, w - m - 88, y, 88);
-    d.show(w, y + 26 + m, edits[0]);
+    let switch = |mode: AccountMode| {
+        let on = mode == AccountMode::Invite;
+        invite.show(on);
+        login.show(!on);
+        for (r, checked) in [(invite_radio, on), (login_radio, !on)] {
+            unsafe { SendMessageW(r, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None) };
+        }
+        if on { &invite } else { &login }
+    };
+    let mut mode = form.mode;
+    let first = switch(mode).edits.iter().find(|e| get_text(**e).is_empty()).copied();
+    d.show(w, y + 26 + m, first.unwrap_or(login.edits[3]));
     loop {
         match d.next() {
-            Ev::Command { id: ID_OK, .. } => {
-                let v: Vec<String> = edits.iter().map(|e| get_text(*e)).collect();
+            Ev::Command { id: ID_OK, .. } if mode == AccountMode::Login => {
+                let v = login.values();
                 match validate_account(&v[0], &v[1], &v[2], &v[3]) {
                     Ok(()) => {
-                        return Some(AccountInput {
+                        return Some(AccountChoice::Login(AccountInput {
                             server: v[0].trim().to_owned(),
                             fingerprint: v[1].trim().to_owned(),
                             username: v[2].trim().to_owned(),
                             password: v[3].clone(),
-                        })
+                        }))
                     }
-                    Err((field, text)) => {
-                        let i = field as usize;
-                        for (j, e) in errors.iter().enumerate() {
-                            set_text(*e, if j == i { text } else { "" });
-                        }
-                        focus_all(edits[i]);
+                    Err((field, text)) => login.error(field as usize, text),
+                }
+            }
+            Ev::Command { id: ID_OK, .. } => {
+                let v = invite.values();
+                match validate_registration(&v[0], &v[1], &v[2], &v[3]) {
+                    Ok((invite, username, password)) => {
+                        return Some(AccountChoice::Register(Registration { invite, username, password }))
                     }
+                    Err((field, text)) => invite.error(invite_row(field), text),
                 }
             }
             Ev::Command { id: ID_CANCEL, .. } | Ev::Cancel => return None,
+            Ev::Command { id: id @ (ID_MODE_INVITE | ID_MODE_LOGIN), .. } => {
+                let chosen = if id == ID_MODE_INVITE { AccountMode::Invite } else { AccountMode::Login };
+                if chosen != mode {
+                    mode = chosen;
+                    let _ = unsafe { SetFocus(Some(switch(mode).edits[0])) };
+                }
+            }
             Ev::Command { id, code } if u32::from(code) == EN_CHANGE && (ID_SERVER..ID_SERVER + 4).contains(&id) => {
-                set_text(errors[usize::from(id - ID_SERVER)], "");
+                set_text(login.errors[usize::from(id - ID_SERVER)], "");
+            }
+            Ev::Command { id, code } if u32::from(code) == EN_CHANGE && (ID_INVITE..ID_INVITE + 4).contains(&id) => {
+                set_text(invite.errors[usize::from(id - ID_INVITE)], "");
             }
             _ => {}
         }
@@ -945,6 +1116,39 @@ mod tests {
     }
 
     #[test]
+    fn registration_validation_messages() {
+        use protocol::invite::{encode_invite, Invite};
+        let invite = Invite { server: "serwer.pl:7700".into(), fingerprint: [0xAB; 32], code: [5; 16] };
+        let text = encode_invite(&invite);
+        assert_eq!(
+            validate_registration(&format!("  {}
+", text.to_lowercase()), " Żaneta ", "długie hasło", "długie hasło"),
+            Ok((invite.clone(), "Żaneta".to_owned(), "długie hasło".to_owned()))
+        );
+        let mut typo = text.clone().into_bytes();
+        // A character in the middle, so the change hits data bits, not base32 padding.
+        let i = (typo.len() / 2..).find(|&i| typo[i] != b'-').unwrap();
+        typo[i] = if typo[i] == b'7' { b'8' } else { b'7' };
+        let typo = String::from_utf8(typo).unwrap();
+        let name_rule = "nazwa: 1–32 znaki, litery, cyfry, _ - .";
+        let cases = [
+            (("", "ola", "długie hasło", "długie hasło"), (Field::Invite, "niepoprawny kod zaproszenia")),
+            (("kom1-abc", "ola", "długie hasło", "długie hasło"), (Field::Invite, "niepoprawny kod zaproszenia")),
+            ((typo.as_str(), "ola", "długie hasło", "długie hasło"), (Field::Invite, "niepoprawny kod zaproszenia")),
+            ((text.as_str(), "  ", "długie hasło", "długie hasło"), (Field::User, name_rule)),
+            ((text.as_str(), "o la", "długie hasło", "długie hasło"), (Field::User, name_rule)),
+            ((text.as_str(), &"x".repeat(33), "długie hasło", "długie hasło"), (Field::User, name_rule)),
+            ((text.as_str(), "ola", "krótkie", "krótkie"), (Field::Password, "hasło musi mieć co najmniej 8 znaków")),
+            ((text.as_str(), "ola", "długie hasło", "długie hasł0"), (Field::PasswordRepeat, "hasła się różnią")),
+        ];
+        for ((inv, user, pw, pw2), want) in cases {
+            assert_eq!(validate_registration(inv, user, pw, pw2), Err(want), "{inv:?} {user:?}");
+        }
+        // Eight characters, not bytes: "żółćżółć" is long enough.
+        assert!(validate_registration(&text, "ola", "żółćżółć", "żółćżółć").is_ok());
+    }
+
+    #[test]
     fn sensitivity_maps_to_vad_range() {
         assert_eq!(sensitivity_from_trackbar(0), 0.0);
         assert_eq!(sensitivity_from_trackbar(50), 0.5);
@@ -1093,9 +1297,19 @@ mod tests {
         }
     }
 
+    fn login_form(login: AccountInput) -> AccountForm {
+        AccountForm {
+            mode: AccountMode::Login,
+            login,
+            invite: String::new(),
+            invite_user: String::new(),
+            notice: None,
+        }
+    }
+
     #[test]
     fn account_dialog_validates_then_returns_values() {
-        let initial = AccountInput { server: "serwer.pl".into(), ..AccountInput::default() };
+        let initial = login_form(AccountInput { server: "serwer.pl".into(), ..AccountInput::default() });
         let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
         let log = seen.clone();
         let result = scripted::run(
@@ -1123,17 +1337,89 @@ mod tests {
         assert_eq!(*seen.borrow(), vec!["brakuje portu, np. serwer.pl:7700".to_owned(), String::new()]);
         assert_eq!(
             result,
-            Some(AccountInput {
+            Some(AccountChoice::Login(AccountInput {
                 server: "serwer.pl:7700".into(),
                 fingerprint: FP.into(),
                 username: "ola".into(),
                 password: "tajne hasło".into(),
-            })
+            }))
         );
         // Esc is Cancel.
         let esc = |d, _| scripted::key(scripted::item(d, ID_SERVER), 0x1B);
         let cancelled = scripted::run(esc, || account_dialog(None, &initial, false));
         assert_eq!(cancelled, None);
+    }
+
+    #[test]
+    fn account_dialog_registers_with_an_invite() {
+        use protocol::invite::encode_invite;
+        let invite = Invite { server: "serwer.pl:7700".into(), fingerprint: [0xAB; 32], code: [5; 16] };
+        let text = encode_invite(&invite);
+        let form = AccountForm {
+            mode: AccountMode::Invite,
+            notice: Some("ta nazwa jest już zajęta".into()),
+            invite: text.clone(),
+            invite_user: "ola".into(),
+            ..login_form(AccountInput::default())
+        };
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let visible = |d, id| unsafe { IsWindowVisible(scripted::item(d, id)) }.as_bool();
+        let result = scripted::run(
+            move |d, step| match step {
+                0 => {
+                    log.borrow_mut().push(get_text(scripted::item(d, ID_NOTICE)));
+                    log.borrow_mut().push(get_text(scripted::item(d, ID_INVITE)));
+                    log.borrow_mut().push(format!("{} {}", visible(d, ID_INVITE), visible(d, ID_SERVER)));
+                    set_text(scripted::item(d, ID_INVITE + 1), "Ola2");
+                    set_text(scripted::item(d, ID_INVITE + 2), "długie hasło");
+                    set_text(scripted::item(d, ID_INVITE + 3), "inne hasło");
+                    scripted::press(d, ID_OK);
+                }
+                1 => {
+                    log.borrow_mut().push(get_text(scripted::item(d, ID_INVITE_ERROR + 3)));
+                    set_text(scripted::item(d, ID_INVITE + 3), "długie hasło");
+                    scripted::press(d, ID_MODE_LOGIN);
+                }
+                2 => {
+                    log.borrow_mut().push(format!("{} {}", visible(d, ID_INVITE), visible(d, ID_SERVER)));
+                    scripted::press(d, ID_MODE_INVITE);
+                }
+                3 => scripted::press(d, ID_OK),
+                _ => {}
+            },
+            || account_dialog(None, &form, true),
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                "ta nazwa jest już zajęta".to_owned(),
+                text,
+                "true false".to_owned(),
+                "hasła się różnią".to_owned(),
+                "false true".to_owned(),
+            ]
+        );
+        assert_eq!(
+            result,
+            Some(AccountChoice::Register(Registration {
+                invite,
+                username: "Ola2".into(),
+                password: "długie hasło".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn registration_debug_hides_secrets() {
+        let r = Registration {
+            invite: Invite { server: "serwer.pl:7700".into(), fingerprint: [1; 32], code: [0xCD; 16] },
+            username: "ola".into(),
+            password: "Tajne-Hasło-42".into(),
+        };
+        let text = format!("{r:?} {r:#?}");
+        assert!(!text.contains("Tajne") && !text.contains("205"), "{text}");
+        assert!(text.contains("ola"), "{text}");
     }
 
     #[test]

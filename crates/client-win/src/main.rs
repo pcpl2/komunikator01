@@ -1,4 +1,6 @@
-//! Headless voice client: komunikator --server host:port --fingerprint HEX --user NAME
+//! Headless voice client. First start with an invite: komunikator-cli --invite KOD --user NAME
+//! (password in KOMUNIKATOR_PASSWORD); later starts need no options. Or, without saving
+//! anything: --server host:port --fingerprint HEX --user NAME.
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +17,7 @@ use client_core::lobby::Lobby;
 use client_core::net::session::{
     ChatLine, ChatSendError, SessionCommand, SessionEvent,
 };
+use protocol::invite::{decode_invite, Invite};
 use protocol::{MemberId, RoomId};
 
 #[derive(Parser)]
@@ -28,13 +31,17 @@ struct Cli {
     fingerprint: Option<String>,
     #[arg(long)]
     user: Option<String>,
+    /// Invite code from the server admin: creates the account (with --user; password from
+    /// KOMUNIKATOR_PASSWORD) and remembers it in settings.toml for later starts
+    #[arg(long)]
+    invite: Option<String>,
     /// Capture device id (see --list-devices); default communications microphone otherwise
     #[arg(long)]
     capture_device: Option<String>,
     /// Render device id (see --list-devices); default communications output otherwise
     #[arg(long)]
     render_device: Option<String>,
-    /// Directory for identity.bin and known_devices.toml (default: %APPDATA%\komunikator)
+    /// Directory for identity.bin, known_devices.toml and settings.toml (default: %APPDATA%\komunikator)
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
     /// Print audio devices and exit
@@ -61,23 +68,66 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let (Some(server), Some(fp), Some(user)) = (cli.server, cli.fingerprint, cli.user) else {
-        anyhow::bail!("wymagane: --server, --fingerprint, --user");
+    use client_core::net::session::Credentials;
+    use client_core::settings::SettingsStore;
+    use client_win::dpapi::{load_password, load_token};
+
+    let password = std::env::var("KOMUNIKATOR_PASSWORD").ok();
+    let login = choose_login(cli.invite.as_deref(), cli.server, cli.fingerprint, cli.user, password)
+        .map_err(anyhow::Error::msg)?;
+    let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);
+    let settings_path = data_dir.join("settings.toml");
+    // Where a new token goes: settings.toml, unless the account came from the command line.
+    let (account, mut saved) = match login {
+        Login::Given { server, fingerprint, user, password } => (
+            startup::Account { server, fingerprint, username: user, credentials: Credentials::Password(password) },
+            None,
+        ),
+        Login::Register { invite, user, password } => {
+            let (store, mut s, _) = SettingsStore::load(&settings_path);
+            // Written only with the first token, so a refused registration changes nothing.
+            s.server = invite.server.clone();
+            s.fingerprint = protocol::fingerprint_hex(&invite.fingerprint);
+            s.username = user.clone();
+            let account = startup::Account {
+                server: invite.server,
+                fingerprint: invite.fingerprint,
+                username: user,
+                credentials: Credentials::Register { invite: invite.code, password },
+            };
+            (account, Some((store, s)))
+        }
+        Login::Saved => {
+            let (store, s, broken) = SettingsStore::load(&settings_path);
+            if let Some(Ok(p)) = broken {
+                println!("UWAGA: plik ustawień był uszkodzony i został odłożony jako {}", p.display());
+            }
+            let credentials = match load_token(&s) {
+                Some(t) => Some(Credentials::Token(t)),
+                None => load_password(&s).map(Credentials::Password),
+            };
+            let fingerprint = protocol::parse_fingerprint(&s.fingerprint);
+            let (true, Some(fingerprint), Some(credentials)) = (s.is_configured(), fingerprint, credentials) else {
+                anyhow::bail!(
+                    "brak zapisanego konta w {}: użyj --invite <kod> --user <nazwa> \
+                     albo --server, --fingerprint i --user",
+                    settings_path.display()
+                );
+            };
+            let account =
+                startup::Account { server: s.server.clone(), fingerprint, username: s.username.clone(), credentials };
+            (account, Some((store, s)))
+        }
     };
-    let fingerprint = protocol::parse_fingerprint(&fp)
-        .ok_or_else(|| anyhow::anyhow!("--fingerprint musi mieć 64 znaki hex"))?;
-    let password = std::env::var("KOMUNIKATOR_PASSWORD")
-        .map_err(|_| anyhow::anyhow!("ustaw hasło w zmiennej KOMUNIKATOR_PASSWORD"))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()?;
-    let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);
     let (client, notices) = startup::start_client(
         rt.handle(),
         &data_dir,
-        startup::Account { server, fingerprint, username: user, password },
+        account,
         startup::Audio { capture: cli.capture_device, render: cli.render_device, sensitivity: 0.5 },
     )?;
     for n in notices {
@@ -105,6 +155,11 @@ fn main() -> anyhow::Result<()> {
                     Some(SessionEvent::Fatal(reason)) => {
                         println!("błąd: {}", describe_fatal(reason));
                         return 1;
+                    }
+                    Some(SessionEvent::TokenIssued(token)) => {
+                        if let Some((store, s)) = &mut saved {
+                            remember_token(store, s, &token);
+                        }
                     }
                     Some(e) => {
                         // Before the lobby applies the event: a leaver's name is gone after.
@@ -208,6 +263,57 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(exit_code);
 }
 
+/// Where the login comes from.
+enum Login {
+    /// `--invite` and `--user`: create the account and remember it.
+    Register { invite: Invite, user: String, password: String },
+    /// `--server`, `--fingerprint` and `--user`: log in with the password, save nothing.
+    Given { server: String, fingerprint: [u8; 32], user: String, password: String },
+    /// No options: the account saved in settings.toml.
+    Saved,
+}
+
+/// Checks which options go together; the error is for the user, in Polish.
+fn choose_login(
+    invite: Option<&str>,
+    server: Option<String>,
+    fingerprint: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+) -> Result<Login, String> {
+    const NO_PASSWORD: &str = "ustaw hasło w zmiennej KOMUNIKATOR_PASSWORD";
+    if let Some(invite) = invite {
+        if server.is_some() || fingerprint.is_some() {
+            return Err("zaproszenie zawiera już adres serwera i odcisk: nie podawaj --server ani --fingerprint".into());
+        }
+        let user = user.ok_or("do --invite podaj też --user <nazwa>")?;
+        let invite = decode_invite(invite).map_err(|e| format!("niepoprawny kod zaproszenia: {e}"))?;
+        return Ok(Login::Register { invite, user, password: password.ok_or(NO_PASSWORD)? });
+    }
+    match (server, fingerprint, user) {
+        (None, None, None) => Ok(Login::Saved),
+        (Some(server), Some(fp), Some(user)) => {
+            let fingerprint = protocol::parse_fingerprint(&fp).ok_or("--fingerprint musi mieć 64 znaki hex")?;
+            Ok(Login::Given { server, fingerprint, user, password: password.ok_or(NO_PASSWORD)? })
+        }
+        _ => Err("wymagane: --server, --fingerprint i --user (albo --invite i --user)".into()),
+    }
+}
+
+/// Keeps the new token in settings.toml in place of the password; a failure is only reported
+/// (the session goes on, the next start will ask for a password).
+#[cfg(windows)]
+fn remember_token(
+    store: &client_core::settings::SettingsStore,
+    s: &mut client_core::settings::Settings,
+    token: &[u8; 32],
+) {
+    let saved = client_win::dpapi::store_token(s, token).and_then(|()| Ok(store.save(s)?));
+    if let Err(e) = saved {
+        println!("UWAGA: nie udało się zapamiętać logowania w settings.toml: {e:#}");
+    }
+}
+
 const HELP: &str = "komendy:
   p            pokoje i osoby (* = Twój pokój)
   w <nr>       wejdź do pokoju      o            wyjdź z pokoju
@@ -235,6 +341,8 @@ fn toggle(label: &str, flag: &AtomicBool) {
 fn print_event(e: &SessionEvent, now: (u16, u16)) {
     match e {
         SessionEvent::Connecting => println!("łączenie…"),
+        // Handled (and never printed) in the main loop.
+        SessionEvent::TokenIssued(_) => {}
         SessionEvent::Connected { you, room, members, .. } => {
             let names: Vec<_> = members
                 .iter()
@@ -730,6 +838,54 @@ mod tests {
             format!("niezgodna wersja programu (serwer: 9, Twoja: {}) — zaktualizuj komunikator", protocol::PROTOCOL_VERSION)
         );
         assert_eq!(describe_fatal(FatalReason::SessionReplaced), "zalogowano się na to konto w innym miejscu");
+    }
+
+    #[test]
+    fn login_options() {
+        use protocol::invite::encode_invite;
+        let invite = Invite { server: "serwer.pl:7700".into(), fingerprint: [0xAB; 32], code: [5; 16] };
+        let code = encode_invite(&invite);
+        let some = |s: &str| Some(s.to_owned());
+        let pw = some("długie hasło");
+        let err = |r: Result<Login, String>| r.err().unwrap_or_default();
+
+        match choose_login(Some(&code), None, None, some("ola"), pw.clone()) {
+            Ok(Login::Register { invite: i, user, password }) => {
+                assert_eq!((i, user.as_str(), password.as_str()), (invite.clone(), "ola", "długie hasło"))
+            }
+            _ => panic!("expected a registration"),
+        }
+        assert!(matches!(choose_login(None, None, None, None, None), Ok(Login::Saved)));
+        let fp = "ab".repeat(32);
+        match choose_login(None, some("serwer.pl:7700"), Some(fp.clone()), some("ola"), pw.clone()) {
+            Ok(Login::Given { server, fingerprint, user, .. }) => {
+                assert_eq!((server.as_str(), fingerprint, user.as_str()), ("serwer.pl:7700", [0xAB; 32], "ola"))
+            }
+            _ => panic!("expected a password login"),
+        }
+
+        assert_eq!(err(choose_login(Some(&code), None, None, None, pw.clone())), "do --invite podaj też --user <nazwa>");
+        assert_eq!(
+            err(choose_login(Some(&code), some("a:1"), None, some("ola"), pw.clone())),
+            "zaproszenie zawiera już adres serwera i odcisk: nie podawaj --server ani --fingerprint"
+        );
+        assert_eq!(
+            err(choose_login(Some("kom1-xyz"), None, None, some("ola"), pw.clone())),
+            "niepoprawny kod zaproszenia: to nie wygląda na zaproszenie"
+        );
+        assert_eq!(err(choose_login(Some(&code), None, None, some("ola"), None)), "ustaw hasło w zmiennej KOMUNIKATOR_PASSWORD");
+        assert_eq!(
+            err(choose_login(None, None, None, some("ola"), pw.clone())),
+            "wymagane: --server, --fingerprint i --user (albo --invite i --user)"
+        );
+        assert_eq!(
+            err(choose_login(None, some("a:1"), some("abc"), some("ola"), pw)),
+            "--fingerprint musi mieć 64 znaki hex"
+        );
+        assert_eq!(
+            err(choose_login(None, some("a:1"), Some(fp), some("ola"), None)),
+            "ustaw hasło w zmiennej KOMUNIKATOR_PASSWORD"
+        );
     }
 
     #[test]

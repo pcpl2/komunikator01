@@ -1,4 +1,4 @@
-//! Per-user (CurrentUser scope) DPAPI helpers and the protected settings password.
+//! Per-user (CurrentUser scope) DPAPI helpers and the protected settings password and token.
 
 use client_core::settings::Settings;
 use windows::core::PCWSTR;
@@ -51,9 +51,10 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
-/// Stores the password in `s` as hex of its DPAPI blob; only this Windows user can read it back.
+/// Stores the password in `s` as hex of its DPAPI blob (only this Windows user can read it
+/// back), dropping any stored token.
 pub fn store_password(s: &mut Settings, pw: &str) -> anyhow::Result<()> {
-    s.password_protected = hex(&protect(pw.as_bytes())?);
+    s.remember_password(hex(&protect(pw.as_bytes())?));
     Ok(())
 }
 
@@ -61,6 +62,18 @@ pub fn store_password(s: &mut Settings, pw: &str) -> anyhow::Result<()> {
 pub fn load_password(s: &Settings) -> Option<String> {
     let blob = unhex(&s.password_protected).filter(|b| !b.is_empty())?;
     String::from_utf8(unprotect(&blob).ok()?).ok()
+}
+
+/// Stores a session token like the password, and forgets the password.
+pub fn store_token(s: &mut Settings, token: &[u8; 32]) -> anyhow::Result<()> {
+    s.remember_token(hex(&protect(token)?));
+    Ok(())
+}
+
+/// The stored token, or `None` when unset, undecryptable or not 32 bytes.
+pub fn load_token(s: &Settings) -> Option<[u8; 32]> {
+    let blob = unhex(&s.token_protected).filter(|b| !b.is_empty())?;
+    unprotect(&blob).ok()?.try_into().ok()
 }
 
 #[cfg(test)]
@@ -76,6 +89,23 @@ mod tests {
         assert!(!s.password_protected.contains(pw));
         assert!(!s.password_protected.contains(&hex(pw.as_bytes())));
         assert_eq!(load_password(&s).as_deref(), Some(pw));
+    }
+
+    #[test]
+    fn token_is_stored_protected_and_replaces_the_password() {
+        let mut s = Settings::default();
+        store_password(&mut s, "tajne hasło 123").unwrap();
+        let token = [0x5A; 32];
+        store_token(&mut s, &token).unwrap();
+        assert!(!s.token_protected.contains(&hex(&token)));
+        assert_eq!(load_token(&s), Some(token));
+        assert_eq!(load_password(&s), None);
+        store_password(&mut s, "nowe hasło").unwrap();
+        assert_eq!(load_token(&s), None);
+        assert_eq!(load_password(&s).as_deref(), Some("nowe hasło"));
+        // A blob of the wrong length is no token.
+        s.token_protected = hex(&protect(&[1, 2, 3]).unwrap());
+        assert_eq!(load_token(&s), None);
     }
 
     #[test]

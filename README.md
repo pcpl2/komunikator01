@@ -2,7 +2,7 @@
 
 Lekki komunikator głosowy dla małej grupy graczy: natywny klient na Windows (Rust, WASAPI, Opus) i serwer przekazujący dźwięk (QUIC) na Linuksie.
 
-Stan: **plan 4, okno programu.** Klient ma natywne okno Windows z ikoną w zasobniku: pokoje, czat, wyciszanie skrótami, okna pierwszego uruchomienia, ustawień i kodu bezpieczeństwa. Konta z zaproszeniami pojawią się w kolejnych planach (`docs/superpowers/`).
+Stan: **plan 5, konta z zaproszeniami.** Klient ma natywne okno Windows z ikoną w zasobniku: pokoje, czat, wyciszanie skrótami, okna pierwszego uruchomienia, ustawień i kodu bezpieczeństwa. Znajomi zakładają konta z jednorazowym zaproszeniem od administratora, a program pamięta logowanie, więc hasło wpisuje się tylko raz.
 
 ## Budowanie
 
@@ -55,7 +55,12 @@ Polecenie wypisuje tekst w rodzaju `kom1-1A2B3-…`. Przekaż go znajomemu bezpi
 
 ### Okno: `komunikator.exe`
 
-Przy pierwszym uruchomieniu program pyta o `Adres serwera` (host:port), `Odcisk certyfikatu` (64 znaki z wydruku serwera), `Nazwę użytkownika` i `Hasło`; `Anuluj` kończy program. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (hasło chronione DPAPI, tylko dla tego konta Windows).
+Przy pierwszym uruchomieniu program pyta o konto (`Anuluj` kończy program):
+
+- `Mam zaproszenie`: wklej cały `Kod zaproszenia` (`kom1-…`) od administratora, wybierz `Nazwę użytkownika` (1–32 znaki: litery, cyfry, `_ - .`) i `Hasło` (co najmniej 8 znaków, wpisane dwa razy). Zaproszenie zawiera adres serwera i odcisk certyfikatu.
+- `Mam już konto`: `Adres serwera` (host:port), `Odcisk certyfikatu` (64 znaki z wydruku serwera), `Nazwa użytkownika` i `Hasło`.
+
+Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym logowaniu) i zapomina hasło: kolejne uruchomienia łączą się bez pytania. Gdy sesja wygaśnie (np. administrator zresetował hasło), okno `Mam już konto` otwiera się samo z wpisanym serwerem i nazwą. Ustawienia są w `%APPDATA%\komunikator\settings.toml` (token i hasło chronione DPAPI, tylko dla tego konta Windows).
 
 - U góry: `Mikrofon` i `Dźwięk` (wyciszenie mikrofonu / wszystkich), `Opuść pokój`, `Nowy pokój…` (po utworzeniu wchodzisz do niego), `Ustawienia…`.
 - Po lewej pokoje z osobami: 🔊 przy mówiącej osobie, `(Ty)` przy Tobie, głośność i wyciszenie u Ciebie, a w Twoim pokoju stan zaufania (`[nowa osoba]`, `[NOWE URZĄDZENIE]`, `[ZMIENIONY KLUCZ]`, `[zweryfikowany ✓]`). Dwuklik na pokoju: wejście. Prawy przycisk na pokoju: `Wejdź`, `Usuń pokój`; na osobie: głośność 0–200%, `Wycisz u mnie` i `Kod bezpieczeństwa…` (osoby z Twojego pokoju: porównajcie kod głosowo i wpisz jego pierwszą grupę, żeby oznaczyć urządzenie jako zweryfikowane albo zaakceptować zmieniony klucz).
@@ -67,9 +72,12 @@ Przy pierwszym uruchomieniu program pyta o `Adres serwera` (host:port), `Odcisk 
 ### Wiersz poleceń: `komunikator-cli.exe`
 
 ```
-set KOMUNIKATOR_PASSWORD=haslo
-komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala
+set KOMUNIKATOR_PASSWORD=dlugie-haslo
+komunikator-cli --invite kom1-… --user ala
+komunikator-cli
 ```
+
+`--invite` zakłada konto (hasło ze zmiennej `KOMUNIKATOR_PASSWORD`, co najmniej 8 znaków) i zapisuje serwer, odcisk, nazwę i sesję w `settings.toml` w katalogu danych; kolejne uruchomienia bez opcji używają zapamiętanej sesji. Można też zalogować się hasłem bez zapisywania czegokolwiek: `komunikator-cli --server adres.serwera:7700 --fingerprint <odcisk> --user ala`.
 
 Polecenia (wpisz i naciśnij Enter):
 
@@ -89,7 +97,7 @@ Polecenia (wpisz i naciśnij Enter):
 Odebrane wiadomości wyglądają jak `[14:05] ala: tekst`; każdy adres (URL lub host:port) w wiadomości dostaje osobną linię `  link 1: …` do skopiowania.
 
 - `--list-devices` wypisuje urządzenia. Wybrane urządzenie ustawiasz przez `--capture-device <id>` i `--render-device <id>`; bez tych opcji używane są domyślne urządzenia komunikacyjne Windows.
-- `--data-dir <katalog>`: gdzie leżą `identity.bin` (tożsamość chroniona DPAPI) i `known_devices.toml` (domyślnie `%APPDATA%\komunikator`).
+- `--data-dir <katalog>`: gdzie leżą `identity.bin` (tożsamość chroniona DPAPI), `known_devices.toml` i `settings.toml` (domyślnie `%APPDATA%\komunikator`, ten sam co dla okna).
 
 Dźwięk jest szyfrowany end-to-end: serwer nie może go odsłuchać. „Nowe urządzenie” oznacza, że znajomy ma nową tożsamość (np. nowy komputer): porównaj kod z nim głosowo. „Zmieniony klucz” (to samo urządzenie, inny klucz) to możliwe podszywanie się. Szczegóły i ograniczenia: [docs/e2e.md](docs/e2e.md).
 

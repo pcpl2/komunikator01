@@ -166,6 +166,8 @@ impl AppState {
         let mut out = Vec::new();
         match e {
             SessionEvent::Connecting => self.set_status(Status::Connecting),
+            // The GUI stores it before the event gets here; nothing to show.
+            SessionEvent::TokenIssued(_) => {}
             SessionEvent::Connected { you, room, rooms, members } => {
                 self.lobby = Some(Lobby::new(you, room, rooms, members).0);
                 self.e2e.clear();
@@ -539,6 +541,12 @@ pub fn describe_fatal(r: FatalReason) -> String {
             "niezgodna wersja programu (serwer: {server}, Twoja: {PROTOCOL_VERSION}) — zaktualizuj komunikator"
         ),
         FatalReason::SessionReplaced => "zalogowano się na to konto w innym miejscu".into(),
+        FatalReason::LoginRequired => "sesja wygasła — zaloguj się ponownie".into(),
+        FatalReason::InviteInvalid => "kod zaproszenia jest nieważny lub już użyty".into(),
+        FatalReason::NameTaken => "ta nazwa jest już zajęta".into(),
+        FatalReason::NameInvalid => "nazwa: 1–32 znaki, litery, cyfry, _ - .".into(),
+        FatalReason::PasswordTooShort => "hasło musi mieć co najmniej 8 znaków".into(),
+        FatalReason::AccountBlocked => "konto zostało zablokowane przez administratora".into(),
     }
 }
 
@@ -984,5 +992,26 @@ mod tests {
         assert_eq!(describe_fatal(FatalReason::SessionReplaced), "zalogowano się na to konto w innym miejscu");
         s.on_event(SessionEvent::Fatal(FatalReason::BadCredentials));
         assert_eq!(s.view().status, Status::Fatal("zły login lub hasło".into()));
+    }
+
+    #[test]
+    fn fatal_texts_for_account_errors() {
+        let all = [
+            (FatalReason::LoginRequired, "sesja wygasła — zaloguj się ponownie"),
+            (FatalReason::InviteInvalid, "kod zaproszenia jest nieważny lub już użyty"),
+            (FatalReason::NameTaken, "ta nazwa jest już zajęta"),
+            (FatalReason::NameInvalid, "nazwa: 1–32 znaki, litery, cyfry, _ - ."),
+            (FatalReason::PasswordTooShort, "hasło musi mieć co najmniej 8 znaków"),
+            (FatalReason::AccountBlocked, "konto zostało zablokowane przez administratora"),
+        ];
+        for (reason, text) in all {
+            assert_eq!(describe_fatal(reason), text);
+        }
+        assert_eq!(protocol::MIN_PASSWORD_CHARS, 8, "the text names the limit");
+        // A new token changes nothing on screen; the GUI stores it.
+        let mut s = online();
+        let before = s.view().clone();
+        assert_eq!(s.on_event(SessionEvent::TokenIssued([9; 32])), vec![]);
+        assert_eq!(*s.view(), before);
     }
 }

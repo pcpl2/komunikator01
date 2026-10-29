@@ -8,7 +8,7 @@ use bytes::Bytes;
 use protocol::audio::{encode_upstream, parse_downstream, MAX_AUDIO_PAYLOAD, MAX_DATAGRAM};
 use protocol::{
     encode_frame, Auth, ClientMsg, FrameDecoder, MemberId, MemberInfo, RejectReason, RoomChoice,
-    RoomErrorReason, RoomId, RoomInfo, ServerMsg, PROTOCOL_VERSION,
+    RoomErrorReason, RoomId, RoomInfo, ServerMsg, CLOSE_BLOCKED, PROTOCOL_VERSION,
 };
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
 use tokio::sync::{mpsc, watch};
@@ -42,7 +42,9 @@ pub struct SessionParams {
     pub server: String,
     pub fingerprint: [u8; 32],
     pub username: String,
-    pub password: String,
+    /// How the first login proves who I am; after any `Welcome` the session logs in again
+    /// with the token it was given.
+    pub credentials: Credentials,
     /// This device's long-term E2E identity.
     pub identity: Arc<Identity>,
     /// TOFU store of peer devices, shared with whoever accepts or verifies keys.
@@ -58,9 +60,45 @@ impl std::fmt::Debug for SessionParams {
     }
 }
 
+/// What the session logs in with.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credentials {
+    Password(String),
+    /// From an earlier `Welcome`; single use.
+    Token([u8; 32]),
+    /// Creates the account with a one-time invite code.
+    Register { invite: [u8; 16], password: String },
+}
+
+/// Names the kind only, so secrets never end up in a log.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Password(_) => f.write_str("Password(<ukryte>)"),
+            Credentials::Token(_) => f.write_str("Token(<ukryte>)"),
+            Credentials::Register { .. } => f.write_str("Register { invite: <ukryte>, password: <ukryte> }"),
+        }
+    }
+}
+
+impl Credentials {
+    fn auth(&self) -> Auth {
+        match self {
+            Credentials::Password(p) => Auth::Password(p.clone()),
+            Credentials::Token(t) => Auth::Token(*t),
+            Credentials::Register { invite, password } => {
+                Auth::Register { invite: *invite, password: password.clone() }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Connecting,
+    /// The server issued a new session token; store it for the next start (the one used to
+    /// log in is spent). Never log it.
+    TokenIssued([u8; 32]),
     /// `members` are everyone online (me included), whatever their room.
     Connected { you: MemberId, room: Option<RoomId>, rooms: Vec<RoomInfo>, members: Vec<MemberInfo> },
     MemberJoined(MemberInfo),
@@ -114,6 +152,13 @@ pub enum FatalReason {
     BadCredentials,
     VersionMismatch { server: u16 },
     SessionReplaced,
+    /// The stored session token was spent, expired or revoked; a password is needed.
+    LoginRequired,
+    InviteInvalid,
+    NameTaken,
+    NameInvalid,
+    PasswordTooShort,
+    AccountBlocked,
 }
 
 pub struct SessionHandle {
@@ -266,7 +311,7 @@ impl Task {
         let hello = ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             username: self.params.username.clone(),
-            auth: Auth::Password(self.params.password.clone()),
+            auth: self.params.credentials.auth(),
             session: self.session,
             room: self.room_choice,
         };
@@ -288,8 +333,12 @@ impl Task {
             return Outcome::Retry;
         };
         let (lobby, entered, queued) = match reply {
-            Some(ServerMsg::Welcome { you, room, rooms, members, .. }) => {
+            Some(ServerMsg::Welcome { you, room, rooms, members, token }) => {
                 backoff.reset();
+                // The credentials just used are spent (a token) or must not be sent again (an
+                // invite); every later login of this run uses the fresh token.
+                self.params.credentials = Credentials::Token(token);
+                self.emit(SessionEvent::TokenIssued(token));
                 self.welcomed(you, room, rooms, members)
             }
             Some(ServerMsg::Rejected { reason }) => {
@@ -299,13 +348,12 @@ impl Task {
                         Outcome::Fatal(FatalReason::VersionMismatch { server })
                     }
                     RejectReason::RateLimited => Outcome::Retry,
-                    // Only a password is sent for now; none of these can be fixed by retrying.
-                    RejectReason::InviteInvalid
-                    | RejectReason::NameTaken
-                    | RejectReason::NameInvalid
-                    | RejectReason::AccountBlocked
-                    | RejectReason::TokenInvalid
-                    | RejectReason::PasswordTooShort => Outcome::Fatal(FatalReason::BadCredentials),
+                    RejectReason::TokenInvalid => Outcome::Fatal(FatalReason::LoginRequired),
+                    RejectReason::InviteInvalid => Outcome::Fatal(FatalReason::InviteInvalid),
+                    RejectReason::NameTaken => Outcome::Fatal(FatalReason::NameTaken),
+                    RejectReason::NameInvalid => Outcome::Fatal(FatalReason::NameInvalid),
+                    RejectReason::PasswordTooShort => Outcome::Fatal(FatalReason::PasswordTooShort),
+                    RejectReason::AccountBlocked => Outcome::Fatal(FatalReason::AccountBlocked),
                 }
             }
             Some(ServerMsg::SessionReplaced) => return Outcome::Fatal(FatalReason::SessionReplaced),
@@ -736,10 +784,11 @@ impl<'a> Link<'a> {
 
 fn closed_outcome(conn: &Connection) -> Outcome {
     match conn.close_reason() {
-        Some(ConnectionError::ApplicationClosed(c))
-            if c.error_code == VarInt::from_u32(CLOSE_REPLACED) =>
-        {
+        Some(ConnectionError::ApplicationClosed(c)) if c.error_code == VarInt::from_u32(CLOSE_REPLACED) => {
             Outcome::Fatal(FatalReason::SessionReplaced)
+        }
+        Some(ConnectionError::ApplicationClosed(c)) if c.error_code == VarInt::from_u32(CLOSE_BLOCKED) => {
+            Outcome::Fatal(FatalReason::AccountBlocked)
         }
         _ => Outcome::Retry,
     }
@@ -782,7 +831,7 @@ mod tests {
             server: "127.0.0.1:1".into(),
             fingerprint: [0; 32],
             username: "ja".into(),
-            password: String::new(),
+            credentials: Credentials::Password(String::new()),
             identity: Arc::new(Identity::generate()),
             trust: Arc::new(Mutex::new(trust)),
         };
@@ -831,6 +880,19 @@ mod tests {
         assert_eq!(queued, vec![SessionCommand::JoinRoom(2)]);
         assert_eq!(h.events.try_recv(), Ok(SessionEvent::ChatNotSent(ChatSendError::NotConnected)));
         assert!(matches!(h.events.try_recv(), Ok(SessionEvent::Connected { .. })));
+    }
+
+    #[test]
+    fn credentials_debug_hides_secrets() {
+        let all = [
+            Credentials::Password("Tajne-Hasło".into()),
+            Credentials::Token([0xAB; 32]),
+            Credentials::Register { invite: [0xCD; 16], password: "Tajne-Hasło".into() },
+        ];
+        for c in all {
+            let text = format!("{c:?} {c:#?}");
+            assert!(!text.contains("Tajne") && !text.contains("171") && !text.contains("205"), "{text}");
+        }
     }
 
     #[test]

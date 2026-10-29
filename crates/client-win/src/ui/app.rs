@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use client_core::app::{Action, AppState, Effect, Status, View};
-use client_core::net::session::{SessionCommand, SessionEvent};
+use client_core::app::{describe_fatal, Action, AppState, Effect, Status, View};
+use client_core::net::session::{Credentials, FatalReason, SessionCommand, SessionEvent};
 use client_core::settings::{Settings, SettingsStore};
+use protocol::invite::encode_invite;
 use protocol::MemberId;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -17,12 +18,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::autostart::{autostart_enabled, is_elevated, relaunch_as_admin, set_autostart};
 use super::clipboard;
-use super::dialogs::{try_account_dialog, AccountInput, DialogUnavailable, SettingsInput};
+use super::dialogs::{
+    try_account_dialog, AccountChoice, AccountForm, AccountInput, AccountMode, DialogUnavailable, Registration,
+    SettingsInput,
+};
 use super::instance;
 use super::sound::Sounds;
 use super::wide::wide;
 use super::window::{Start, Window, WM_APP_SESSION};
-use crate::dpapi::{load_password, store_password};
+use crate::dpapi::{load_password, load_token, store_password, store_token};
 use crate::startup::{default_data_dir, start_client, Account, Audio, Client, Notice};
 
 pub struct Options {
@@ -62,23 +66,27 @@ pub fn run(opts: Options) -> i32 {
         };
         message_box(None, &text, MB_ICONWARNING);
     }
-    if account(&settings).is_none() {
+    let mut register = None;
+    if account(&settings, None).is_none() {
         // The self-test never waits for a person.
         if opts.smoke {
             return 1;
         }
-        let a = match try_account_dialog(None, &account_input(&settings), true) {
-            Ok(Some(a)) => a,
+        let choice = match try_account_dialog(None, &account_form(&settings), true) {
+            Ok(Some(c)) => c,
             Ok(None) => return 0,
             Err(DialogUnavailable) => {
                 message_box(None, "Nie udało się otworzyć okna z danymi konta.", MB_ICONERROR);
                 return 1;
             }
         };
-        if let Err(e) = set_account(&mut settings, &a) {
-            message_box(None, &format!("Nie udało się zapisać hasła: {e:#}"), MB_ICONERROR);
-            return 1;
-        }
+        register = match set_account(&mut settings, choice) {
+            Ok(r) => r,
+            Err(e) => {
+                message_box(None, &format!("Nie udało się zapisać hasła: {e:#}"), MB_ICONERROR);
+                return 1;
+            }
+        };
         if let Err(e) = store.save(&settings) {
             message_box(None, &format!("Nie udało się zapisać ustawień: {e}"), MB_ICONWARNING);
         }
@@ -112,6 +120,8 @@ pub fn run(opts: Options) -> i32 {
         speaking: Vec::new(),
         local_notice: startup_notice,
         playback_lost_shown: false,
+        register,
+        login_prompt: None,
     };
 
     let window = match Window::create(app, Start { minimized: opts.minimized, smoke: opts.smoke }) {
@@ -159,34 +169,95 @@ pub fn run(opts: Options) -> i32 {
     code
 }
 
-fn account(s: &Settings) -> Option<Account> {
+/// What to log in with: a registration in progress, else the saved token, else the saved
+/// password.
+fn account(s: &Settings, register: Option<&Registration>) -> Option<Account> {
+    if let Some(r) = register {
+        return Some(Account {
+            server: r.invite.server.clone(),
+            fingerprint: r.invite.fingerprint,
+            username: r.username.clone(),
+            credentials: Credentials::Register { invite: r.invite.code, password: r.password.clone() },
+        });
+    }
     if !s.is_configured() {
         return None;
     }
+    let credentials = match load_token(s) {
+        Some(t) => Credentials::Token(t),
+        None => Credentials::Password(load_password(s)?),
+    };
     Some(Account {
         server: s.server.clone(),
         fingerprint: protocol::parse_fingerprint(&s.fingerprint)?,
         username: s.username.clone(),
-        password: load_password(s)?,
+        credentials,
     })
 }
 
 /// The account form's starting values; the password only if it can still be decrypted.
-pub fn account_input(s: &Settings) -> AccountInput {
-    AccountInput {
-        server: s.server.clone(),
-        fingerprint: s.fingerprint.clone(),
-        username: s.username.clone(),
-        password: load_password(s).unwrap_or_default(),
+pub fn account_form(s: &Settings) -> AccountForm {
+    AccountForm {
+        // Nothing set up yet most likely means a friend's invite.
+        mode: if s.server.is_empty() { AccountMode::Invite } else { AccountMode::Login },
+        login: AccountInput {
+            server: s.server.clone(),
+            fingerprint: s.fingerprint.clone(),
+            username: s.username.clone(),
+            password: load_password(s).unwrap_or_default(),
+        },
+        invite: String::new(),
+        invite_user: String::new(),
+        notice: None,
     }
 }
 
-fn set_account(s: &mut Settings, a: &AccountInput) -> anyhow::Result<()> {
-    store_password(s, &a.password)?;
-    s.server = a.server.clone();
-    s.fingerprint = a.fingerprint.clone();
-    s.username = a.username.clone();
-    Ok(())
+/// The form to reopen after a login failed for good, or `None` when the account is not the
+/// problem. Registration errors reopen the invite form only while registering.
+fn login_prompt(s: &Settings, reason: FatalReason, register: Option<&Registration>) -> Option<AccountForm> {
+    let mut form = account_form(s);
+    form.notice = Some(describe_fatal(reason));
+    match reason {
+        FatalReason::LoginRequired | FatalReason::BadCredentials => form.mode = AccountMode::Login,
+        FatalReason::InviteInvalid
+        | FatalReason::NameTaken
+        | FatalReason::NameInvalid
+        | FatalReason::PasswordTooShort => {
+            let r = register?;
+            form.mode = AccountMode::Invite;
+            if reason != FatalReason::InviteInvalid {
+                form.invite = encode_invite(&r.invite);
+            }
+            form.invite_user = r.username.clone();
+        }
+        FatalReason::VersionMismatch { .. } | FatalReason::SessionReplaced | FatalReason::AccountBlocked => {
+            return None
+        }
+    }
+    Some(form)
+}
+
+/// Saves the dialog's account to the settings. A login's password is stored protected; a
+/// registration is returned instead, to be used once and then replaced by its token.
+fn set_account(s: &mut Settings, choice: AccountChoice) -> anyhow::Result<Option<Registration>> {
+    match choice {
+        AccountChoice::Login(a) => {
+            store_password(s, &a.password)?;
+            s.server = a.server;
+            s.fingerprint = a.fingerprint;
+            s.username = a.username;
+            Ok(None)
+        }
+        AccountChoice::Register(r) => {
+            s.server = r.invite.server.clone();
+            s.fingerprint = protocol::fingerprint_hex(&r.invite.fingerprint);
+            s.username = r.username.clone();
+            // Neither belongs to the new account.
+            s.password_protected.clear();
+            s.token_protected.clear();
+            Ok(Some(r))
+        }
+    }
 }
 
 fn local_hm() -> (u8, u8) {
@@ -227,6 +298,10 @@ pub struct App {
     local_notice: Option<String>,
     /// The "playback broke" notice was shown for the current client.
     playback_lost_shown: bool,
+    /// An invite registration not yet confirmed by a token; kept only in memory.
+    register: Option<Registration>,
+    /// The account form a failed login asks the window to open.
+    login_prompt: Option<AccountForm>,
 }
 
 impl App {
@@ -267,7 +342,8 @@ impl App {
         }
         self.generation += 1;
         let s = self.state.settings();
-        let account = account(s).ok_or_else(|| "brak konta albo nie da się odczytać zapisanego hasła".to_owned())?;
+        let account = account(s, self.register.as_ref())
+            .ok_or_else(|| "brak konta albo nie da się odczytać zapisanego hasła".to_owned())?;
         let audio =
             Audio { capture: s.capture_device.clone(), render: s.render_device.clone(), sensitivity: s.vad_sensitivity };
         let (mut client, notices) =
@@ -294,21 +370,31 @@ impl App {
 
     /// Saves a changed account and reconnects with it. An unchanged one does nothing, unless
     /// the session has failed for good: then OK is the way to try again.
-    pub fn change_account(&mut self, hwnd: HWND, a: AccountInput) {
+    pub fn change_account(&mut self, hwnd: HWND, choice: AccountChoice) {
         let s = self.state.settings();
-        let same = s.server == a.server
-            && s.fingerprint == a.fingerprint
-            && s.username == a.username
-            && load_password(s).as_deref() == Some(a.password.as_str());
+        let same = match &choice {
+            AccountChoice::Login(a) => {
+                s.server == a.server
+                    && s.fingerprint == a.fingerprint
+                    && s.username == a.username
+                    && load_password(s).as_deref() == Some(a.password.as_str())
+            }
+            AccountChoice::Register(_) => false,
+        };
         if !needs_reconnect(same, &self.state.view().status) {
             return;
         }
-        if let Err(e) = set_account(self.state.settings_mut(), &a) {
-            self.local_notice = Some(format!("nie udało się zapisać hasła: {e:#}"));
-            return;
+        match set_account(self.state.settings_mut(), choice) {
+            Ok(r) => self.register = r,
+            Err(e) => {
+                self.local_notice = Some(format!("nie udało się zapisać hasła: {e:#}"));
+                return;
+            }
         }
         self.save_settings();
         self.state.reset_session();
+        // A prompt still waiting was about the account just replaced.
+        self.login_prompt = None;
         match self.connect(hwnd) {
             Ok(notices) => {
                 if let Some(n) = notices.into_iter().last() {
@@ -353,15 +439,29 @@ impl App {
         self.run_effects(hwnd, fx);
     }
 
+    /// The account form a failed login asked for, once.
+    pub fn take_login_prompt(&mut self) -> Option<AccountForm> {
+        self.login_prompt.take()
+    }
+
     /// Applies every session event queued by the forwarder.
     pub fn drain_events(&mut self, hwnd: HWND) {
         while let Ok((generation, e)) = self.events.try_recv() {
             if generation != self.generation {
                 continue;
             }
-            if let (SessionEvent::MemberLeft(id), Some(c)) = (&e, &self.client) {
+            match &e {
                 // Frees the slot; the model only sets gains, it never removes them.
-                c.gains.remove(*id);
+                SessionEvent::MemberLeft(id) => {
+                    if let Some(c) = &self.client {
+                        c.gains.remove(*id);
+                    }
+                }
+                SessionEvent::TokenIssued(token) => self.token_issued(token),
+                SessionEvent::Fatal(reason) => {
+                    self.login_prompt = login_prompt(self.state.settings(), *reason, self.register.as_ref());
+                }
+                _ => {}
             }
             let fx = self.state.on_event(e);
             self.run_effects(hwnd, fx);
@@ -379,6 +479,15 @@ impl App {
             self.local_notice = Some(PLAYBACK_LOST.to_owned());
         }
         self.state.on_activity(&self.speaking, me) || lost
+    }
+
+    /// Keeps the token for the next start in place of the password (and of the invite).
+    fn token_issued(&mut self, token: &[u8; 32]) {
+        self.register = None;
+        match store_token(self.state.settings_mut(), token) {
+            Ok(()) => self.save_settings(),
+            Err(e) => self.local_notice = Some(format!("nie udało się zapamiętać logowania: {e:#}")),
+        }
     }
 
     pub fn save_settings(&mut self) {
@@ -464,6 +573,48 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration() -> Registration {
+        let invite = protocol::invite::Invite { server: "serwer.pl:7700".into(), fingerprint: [0xAB; 32], code: [5; 16] };
+        Registration { invite, username: "Ola2".into(), password: "długie hasło".into() }
+    }
+
+    #[test]
+    fn registration_saves_server_and_name_but_no_secret() {
+        let mut s = Settings::default();
+        store_password(&mut s, "stare hasło").unwrap();
+        let r = set_account(&mut s, AccountChoice::Register(registration())).unwrap().unwrap();
+        assert_eq!((s.server.as_str(), s.username.as_str()), ("serwer.pl:7700", "Ola2"));
+        assert_eq!(s.fingerprint, "ab".repeat(32));
+        assert!(s.password_protected.is_empty() && s.token_protected.is_empty());
+        assert!(account(&s, None).is_none(), "nothing to log in with until the token arrives");
+        let a = account(&s, Some(&r)).unwrap();
+        assert_eq!(a.credentials, Credentials::Register { invite: [5; 16], password: "długie hasło".into() });
+        store_token(&mut s, &[7; 32]).unwrap();
+        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([7; 32]));
+    }
+
+    #[test]
+    fn account_errors_reopen_the_right_form() {
+        let mut s = Settings { server: "serwer.pl:7700".into(), username: "ola".into(), ..Settings::default() };
+        store_token(&mut s, &[7; 32]).unwrap();
+        for reason in [FatalReason::LoginRequired, FatalReason::BadCredentials] {
+            let form = login_prompt(&s, reason, None).unwrap();
+            assert_eq!(form.mode, AccountMode::Login);
+            assert_eq!((form.login.server.as_str(), form.login.username.as_str()), ("serwer.pl:7700", "ola"));
+            assert_eq!(form.notice, Some(describe_fatal(reason)));
+        }
+        let r = registration();
+        let form = login_prompt(&s, FatalReason::NameTaken, Some(&r)).unwrap();
+        assert_eq!(form.mode, AccountMode::Invite);
+        assert_eq!(form.invite, encode_invite(&r.invite));
+        assert_eq!(form.invite_user, "Ola2");
+        assert_eq!(login_prompt(&s, FatalReason::InviteInvalid, Some(&r)).unwrap().invite, "");
+        assert_eq!(login_prompt(&s, FatalReason::NameTaken, None), None);
+        for reason in [FatalReason::AccountBlocked, FatalReason::SessionReplaced, FatalReason::VersionMismatch { server: 9 }] {
+            assert_eq!(login_prompt(&s, reason, Some(&r)), None);
+        }
+    }
 
     #[test]
     fn unchanged_account_reconnects_only_after_a_fatal_error() {

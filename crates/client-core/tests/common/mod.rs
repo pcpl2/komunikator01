@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use client_core::audio::frame::EncodedFrame;
 use client_core::e2e::{E2eEvent, Identity, KnownDevices, Trust};
-use client_core::net::session::{spawn_session, SessionCommand, SessionEvent, SessionHandle, SessionParams};
+use client_core::net::session::{
+    spawn_session, Credentials, SessionCommand, SessionEvent, SessionHandle, SessionParams,
+};
 use protocol::{MemberId, RoomId};
 use server::{RunningServer, ServerConfig, UserEntry};
 use tokio::time::{timeout, Instant};
@@ -53,7 +55,7 @@ pub fn params(server: String, fingerprint: [u8; 32], user: &str, pw: &str, dev: 
         server,
         fingerprint,
         username: user.into(),
-        password: pw.into(),
+        credentials: Credentials::Password(pw.into()),
         identity: dev.identity.clone(),
         trust: dev.trust.clone(),
     }
