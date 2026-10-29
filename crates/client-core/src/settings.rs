@@ -9,14 +9,13 @@ use crate::audio::volume::VolumeBook;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Sounds {
-    pub mute: bool,
     pub join_leave: bool,
     pub chat: bool,
 }
 
 impl Default for Sounds {
     fn default() -> Self {
-        Self { mute: true, join_leave: true, chat: true }
+        Self { join_leave: true, chat: true }
     }
 }
 
@@ -167,7 +166,7 @@ mod tests {
         let (_, s, broken) = SettingsStore::load(&p);
         assert_eq!(s, Settings::default());
         assert_eq!(s.vad_sensitivity, 0.5);
-        assert!(s.sounds.mute && s.sounds.join_leave && s.sounds.chat);
+        assert!(s.sounds.join_leave && s.sounds.chat);
         assert!(broken.is_none());
     }
 
@@ -186,7 +185,7 @@ mod tests {
             vad_sensitivity: 0.8,
             hotkey_mute: Some("Ctrl+Shift+M".into()),
             hotkey_deafen: Some("Ctrl+Shift+D".into()),
-            sounds: Sounds { mute: false, join_leave: true, chat: false },
+            sounds: Sounds { join_leave: true, chat: false },
             autostart: true,
             run_as_admin: true,
             always_on_top: true,
@@ -202,6 +201,18 @@ mod tests {
     }
 
     #[test]
+    fn old_mute_sound_key_is_ignored() {
+        let (_d, p) = path();
+        std::fs::write(&p, "[sounds]
+mute = true
+chat = false
+").unwrap();
+        let (_, s, broken) = SettingsStore::load(&p);
+        assert!(broken.is_none());
+        assert_eq!(s.sounds, Sounds { join_leave: true, chat: false });
+    }
+
+    #[test]
     fn partial_file_uses_defaults_for_the_rest() {
         let (_d, p) = path();
         std::fs::write(&p, "server = \"a:1\"\n[sounds]\nchat = false\n").unwrap();
@@ -209,7 +220,7 @@ mod tests {
         assert!(broken.is_none());
         assert_eq!(s.server, "a:1");
         assert!(!s.sounds.chat);
-        assert!(s.sounds.mute && s.sounds.join_leave);
+        assert!(s.sounds.join_leave);
         assert_eq!(s.vad_sensitivity, 0.5);
         assert_eq!(s.window, None);
     }

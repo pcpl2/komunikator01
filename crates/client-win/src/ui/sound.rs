@@ -27,8 +27,6 @@ fn sweep(out: &mut Vec<i16>, f0: f32, f1: f32, len: usize) {
 pub fn tone_wav(kind: SoundKind) -> Vec<u8> {
     let mut s = Vec::new();
     match kind {
-        SoundKind::Muted => sweep(&mut s, 660.0, 440.0, ms(120)),
-        SoundKind::Unmuted => sweep(&mut s, 440.0, 660.0, ms(120)),
         SoundKind::Joined => sweep(&mut s, 880.0, 880.0, ms(100)),
         SoundKind::Left => sweep(&mut s, 330.0, 330.0, ms(100)),
         SoundKind::Chat => {
@@ -57,17 +55,15 @@ pub fn tone_wav(kind: SoundKind) -> Vec<u8> {
     w
 }
 
-const ALL: [SoundKind; 5] = [
-    SoundKind::Muted,
-    SoundKind::Unmuted,
+const ALL: [SoundKind; 3] = [
     SoundKind::Joined,
     SoundKind::Left,
     SoundKind::Chat,
 ];
 
-/// The five WAVs, built once; PlaySoundW reads them straight from memory.
+/// The three WAVs, built once; PlaySoundW reads them straight from memory.
 pub struct Sounds {
-    wavs: [Vec<u8>; 5],
+    wavs: [Vec<u8>; 3],
 }
 
 impl Sounds {
@@ -79,11 +75,9 @@ impl Sounds {
     /// buffer from a background thread, which `Drop` stops before the buffers are freed.
     pub fn play(&self, kind: SoundKind) {
         let idx = match kind {
-            SoundKind::Muted => 0,
-            SoundKind::Unmuted => 1,
-            SoundKind::Joined => 2,
-            SoundKind::Left => 3,
-            SoundKind::Chat => 4,
+            SoundKind::Joined => 0,
+            SoundKind::Left => 1,
+            SoundKind::Chat => 2,
         };
         unsafe {
             let _ = PlaySoundW(
@@ -114,9 +108,7 @@ impl Default for Sounds {
 mod tests {
     use super::*;
 
-    const KINDS: [SoundKind; 5] = [
-        SoundKind::Muted,
-        SoundKind::Unmuted,
+    const KINDS: [SoundKind; 3] = [
         SoundKind::Joined,
         SoundKind::Left,
         SoundKind::Chat,

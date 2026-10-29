@@ -968,7 +968,6 @@ const ID_HOTKEY_MUTE: u16 = 505;
 const ID_HOTKEY_DEAFEN: u16 = 506;
 const ID_CLEAR_MUTE: u16 = 507;
 const ID_CLEAR_DEAFEN: u16 = 508;
-const ID_SOUND_MUTE: u16 = 509;
 const ID_SOUND_JOIN: u16 = 510;
 const ID_SOUND_CHAT: u16 = 511;
 const ID_AUTOSTART: u16 = 512;
@@ -1036,13 +1035,12 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
 
     let cw = w - 2 * m;
     let sounds = &current.sounds;
-    let sound_mute = d.checkbox(ID_SOUND_MUTE, "Dźwięk przy wyciszeniu", sounds.mute, m, y, cw);
-    let sound_join = d.checkbox(ID_SOUND_JOIN, "Dźwięk przy wejściu/wyjściu osoby", sounds.join_leave, m, y + 24, cw);
-    let sound_chat = d.checkbox(ID_SOUND_CHAT, "Dźwięk nowej wiadomości", sounds.chat, m, y + 48, cw);
-    let autostart = d.checkbox(ID_AUTOSTART, "Uruchamiaj z Windows", current.autostart, m, y + 72, cw);
+    let sound_join = d.checkbox(ID_SOUND_JOIN, "Dźwięk przy wejściu/wyjściu osoby", sounds.join_leave, m, y, cw);
+    let sound_chat = d.checkbox(ID_SOUND_CHAT, "Dźwięk nowej wiadomości", sounds.chat, m, y + 24, cw);
+    let autostart = d.checkbox(ID_AUTOSTART, "Uruchamiaj z Windows", current.autostart, m, y + 48, cw);
     let admin_text = "Uruchamiaj jako administrator (gdy skróty nie działają w grze)";
-    let admin = d.checkbox(ID_ADMIN, admin_text, current.run_as_admin, m, y + 96, cw);
-    y += 130;
+    let admin = d.checkbox(ID_ADMIN, admin_text, current.run_as_admin, m, y + 72, cw);
+    y += 106;
     d.button(ID_ACCOUNT, "Konto…", false, m, y, 88);
     d.button(ID_OK, "OK", true, w - m - 2 * 88 - 8, y, 88);
     d.button(ID_CANCEL, "Anuluj", false, w - m - 88, y, 88);
@@ -1094,7 +1092,7 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
                     sensitivity: sensitivity_from_trackbar(u32::try_from(pos).unwrap_or(0)),
                     hotkey_mute: mute,
                     hotkey_deafen: deafen,
-                    sounds: Sounds { mute: checked(sound_mute), join_leave: checked(sound_join), chat: checked(sound_chat) },
+                    sounds: Sounds { join_leave: checked(sound_join), chat: checked(sound_chat) },
                     autostart: checked(autostart),
                     run_as_admin: checked(admin),
                 });

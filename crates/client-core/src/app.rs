@@ -38,8 +38,6 @@ pub enum Action {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundKind {
-    Muted,
-    Unmuted,
     Joined,
     Left,
     Chat,
@@ -259,12 +257,10 @@ impl AppState {
             Action::ToggleMute => {
                 self.view.muted = !self.view.muted;
                 self.dirty = true;
-                out.extend(self.mute_sound(self.view.muted));
             }
             Action::ToggleDeafen => {
                 self.view.deafened = !self.view.deafened;
                 self.dirty = true;
-                out.extend(self.mute_sound(self.view.deafened));
             }
             Action::JoinRoom(id) => out.push(Effect::Command(SessionCommand::JoinRoom(id))),
             Action::LeaveRoom => out.push(Effect::Command(SessionCommand::LeaveRoom)),
@@ -379,11 +375,6 @@ impl AppState {
                 out.push(Effect::PlaySound(k));
             }
         }
-    }
-
-    fn mute_sound(&self, now: bool) -> Option<Effect> {
-        let kind = if now { SoundKind::Muted } else { SoundKind::Unmuted };
-        self.settings.sounds.mute.then_some(Effect::PlaySound(kind))
     }
 
     fn in_my_room(&self, id: MemberId) -> bool {
@@ -715,20 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn toggle_mute_plays_sound_and_respects_setting() {
+    fn toggle_mute_is_silent() {
         let mut s = state();
-        assert_eq!(s.on_action(Action::ToggleMute), vec![Effect::PlaySound(SoundKind::Muted)]);
-        assert!(s.muted() && s.view().muted);
-        assert_eq!(s.on_action(Action::ToggleMute), vec![Effect::PlaySound(SoundKind::Unmuted)]);
-        assert!(!s.muted() && !s.view().muted);
-        assert_eq!(s.on_action(Action::ToggleDeafen), vec![Effect::PlaySound(SoundKind::Muted)]);
-        assert!(s.deafened() && s.view().deafened);
-        assert_eq!(s.on_action(Action::ToggleDeafen), vec![Effect::PlaySound(SoundKind::Unmuted)]);
-        s.settings_mut().sounds.mute = false;
         assert_eq!(s.on_action(Action::ToggleMute), vec![]);
-        assert!(s.muted());
+        assert!(s.muted() && s.view().muted);
+        assert_eq!(s.on_action(Action::ToggleMute), vec![]);
+        assert!(!s.muted() && !s.view().muted);
         assert_eq!(s.on_action(Action::ToggleDeafen), vec![]);
-        assert!(s.deafened());
+        assert!(s.deafened() && s.view().deafened);
+        assert_eq!(s.on_action(Action::ToggleDeafen), vec![]);
+        assert!(!s.deafened());
     }
 
     #[test]
