@@ -159,6 +159,27 @@ mod tests {
         assert_eq!(verify_manifest(&key().verifying_key().to_bytes(), &bytes), Ok(m));
     }
 
+    /// The encoding is frozen with `komunikator-update/1`: these bytes must never change.
+    #[test]
+    fn manifest_encoding_is_frozen() {
+        let m = Manifest {
+            version: Version { major: 1, minor: 2, patch: 3 },
+            file: "komunikator-1.2.3.exe".into(),
+            size: 4242,
+            sha256: [0xAB; 32],
+        };
+        let hex: String = sign_manifest(&key(), &m).iter().map(|b| format!("{b:02x}")).collect();
+        let expected = concat!(
+            // body: length 59, version 1.2.3, name length 21, name, size 4242 (varint), sha256
+            "3b", "010203", "15", "6b6f6d756e696b61746f722d312e322e332e657865", "9221",
+            "abababababababababababababababababababababababababababababababab",
+            // Ed25519 signature halves (deterministic for the fixed seed)
+            "a38e4236f4a8a70717a65b4a267645710fbb05aa7e2364b981bf6939f076831f",
+            "635e1825f5ffd9dd95d45dca5d6a1ff3b51577be83fb31dca59ed196f800280b",
+        );
+        assert_eq!(hex, expected);
+    }
+
     #[test]
     fn tampered_body_or_signature_fails() {
         let public = key().verifying_key().to_bytes();

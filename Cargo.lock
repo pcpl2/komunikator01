@@ -1225,7 +1225,6 @@ dependencies = [
  "ed25519-dalek",
  "postcard",
  "serde",
- "sha2",
  "thiserror",
 ]
 
