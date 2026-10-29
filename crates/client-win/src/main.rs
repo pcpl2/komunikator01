@@ -1,6 +1,7 @@
 //! Headless voice client. First start with an invite: komunikator-cli --invite KOD --user NAME
-//! (password in KOMUNIKATOR_PASSWORD); later starts need no options. Or, without saving
-//! anything: --server host:port --fingerprint HEX --user NAME.
+//! (password in KOMUNIKATOR_PASSWORD); later starts need no options. An existing account logs
+//! in with --server host:port --fingerprint HEX --user NAME (password likewise), which is
+//! remembered the same way.
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,7 @@ use client_core::chat::{find_links, sanitize_name};
 use client_core::e2e::{AnnounceError, E2eEvent, IdentityPublic, KnownDevices, Trust};
 use client_core::lobby::Lobby;
 use client_core::net::session::{
-    ChatLine, ChatSendError, SessionCommand, SessionEvent,
+    ChatLine, ChatSendError, FatalReason, SessionCommand, SessionEvent,
 };
 use protocol::invite::{decode_invite, Invite};
 use protocol::{MemberId, RoomId};
@@ -75,27 +76,27 @@ fn main() -> anyhow::Result<()> {
     let password = std::env::var("KOMUNIKATOR_PASSWORD").ok();
     let login = choose_login(cli.invite.as_deref(), cli.server, cli.fingerprint, cli.user, password)
         .map_err(anyhow::Error::msg)?;
+    let given_data_dir = cli.data_dir.clone();
     let data_dir = cli.data_dir.unwrap_or_else(startup::default_data_dir);
     let settings_path = data_dir.join("settings.toml");
-    // Where a new token goes: settings.toml, unless the account came from the command line.
+    // The settings the account is saved to: the new token (and the account given on the
+    // command line) are written with every token issued.
     let (account, mut saved) = match login {
-        Login::Given { server, fingerprint, user, password } => (
-            startup::Account { server, fingerprint, username: user, credentials: Credentials::Password(password) },
-            None,
-        ),
+        Login::Given { server, fingerprint, user, password } => {
+            let saved = pending_account(&settings_path, &server, &fingerprint, &user);
+            let account =
+                startup::Account { server, fingerprint, username: user, credentials: Credentials::Password(password) };
+            (account, saved)
+        }
         Login::Register { invite, user, password } => {
-            let (store, mut s, _) = SettingsStore::load(&settings_path);
-            // Written only with the first token, so a refused registration changes nothing.
-            s.server = invite.server.clone();
-            s.fingerprint = protocol::fingerprint_hex(&invite.fingerprint);
-            s.username = user.clone();
+            let saved = pending_account(&settings_path, &invite.server, &invite.fingerprint, &user);
             let account = startup::Account {
                 server: invite.server,
                 fingerprint: invite.fingerprint,
                 username: user,
                 credentials: Credentials::Register { invite: invite.code, password },
             };
-            (account, Some((store, s)))
+            (account, saved)
         }
         Login::Saved => {
             let (store, s, broken) = SettingsStore::load(&settings_path);
@@ -116,9 +117,10 @@ fn main() -> anyhow::Result<()> {
             };
             let account =
                 startup::Account { server: s.server.clone(), fingerprint, username: s.username.clone(), credentials };
-            (account, Some((store, s)))
+            (account, (store, s))
         }
     };
+    let (store, saved) = &mut saved;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -154,11 +156,19 @@ fn main() -> anyhow::Result<()> {
                 e = session.events.recv() => match e {
                     Some(SessionEvent::Fatal(reason)) => {
                         println!("błąd: {}", describe_fatal(reason));
+                        if reason == FatalReason::LoginRequired {
+                            println!("{}", relogin_hint(saved, given_data_dir.as_deref()));
+                        }
                         return 1;
                     }
-                    Some(SessionEvent::TokenIssued(token)) => {
-                        if let Some((store, s)) = &mut saved {
-                            remember_token(store, s, &token.0);
+                    Some(SessionEvent::TokenIssued(token)) => remember_token(store, saved, &token.0),
+                    Some(SessionEvent::SignedInAs(name)) => {
+                        // The server's spelling; peers know me by it.
+                        if saved.username != name {
+                            saved.username = name;
+                            if let Err(e) = store.save(saved) {
+                                println!("UWAGA: nie udało się zapisać nazwy w settings.toml: {e}");
+                            }
                         }
                     }
                     Some(e) => {
@@ -267,7 +277,7 @@ fn main() -> anyhow::Result<()> {
 enum Login {
     /// `--invite` and `--user`: create the account and remember it.
     Register { invite: Invite, user: String, password: String },
-    /// `--server`, `--fingerprint` and `--user`: log in with the password, save nothing.
+    /// `--server`, `--fingerprint` and `--user`: log in with the password and remember it.
     Given { server: String, fingerprint: [u8; 32], user: String, password: String },
     /// No options: the account saved in settings.toml.
     Saved,
@@ -312,6 +322,33 @@ fn remember_token(
     if let Err(e) = saved {
         println!("UWAGA: nie udało się zapamiętać logowania w settings.toml: {e:#}");
     }
+}
+
+/// The settings with a not yet confirmed account filled in; written only with its first token,
+/// so a refused login leaves the saved account as it was.
+#[cfg(windows)]
+fn pending_account(
+    path: &std::path::Path,
+    server: &str,
+    fingerprint: &[u8; 32],
+    user: &str,
+) -> (client_core::settings::SettingsStore, client_core::settings::Settings) {
+    let (store, mut s, _) = client_core::settings::SettingsStore::load(path);
+    s.server = server.to_owned();
+    s.fingerprint = protocol::fingerprint_hex(fingerprint);
+    s.username = user.to_owned();
+    (store, s)
+}
+
+/// What to run when the remembered session is no longer accepted (spent, expired or revoked).
+fn relogin_hint(s: &client_core::settings::Settings, data_dir: Option<&std::path::Path>) -> String {
+    let dir = data_dir.map(|d| format!(" --data-dir \"{}\"", d.display())).unwrap_or_default();
+    format!(
+        "zaloguj się ponownie hasłem (zapamięta nową sesję):\n  \
+         komunikator-cli --server {} --fingerprint {} --user {}{dir}\n\
+         z hasłem w zmiennej KOMUNIKATOR_PASSWORD",
+        s.server, s.fingerprint, s.username
+    )
 }
 
 const HELP: &str = "komendy:
@@ -886,6 +923,27 @@ mod tests {
             err(choose_login(None, some("a:1"), Some(fp), some("ola"), None)),
             "ustaw hasło w zmiennej KOMUNIKATOR_PASSWORD"
         );
+    }
+
+    #[test]
+    fn expired_session_hint_names_the_command() {
+        let s = client_core::settings::Settings {
+            server: "serwer.pl:7700".into(),
+            fingerprint: "ab".repeat(32),
+            username: "Ola".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            relogin_hint(&s, None),
+            format!(
+                "zaloguj się ponownie hasłem (zapamięta nową sesję):\n  \
+                 komunikator-cli --server serwer.pl:7700 --fingerprint {} --user Ola\n\
+                 z hasłem w zmiennej KOMUNIKATOR_PASSWORD",
+                "ab".repeat(32)
+            )
+        );
+        let with_dir = relogin_hint(&s, Some(std::path::Path::new("D:\\dane kom")));
+        assert!(with_dir.contains("--user Ola --data-dir \"D:\\dane kom\""), "{with_dir}");
     }
 
     #[test]

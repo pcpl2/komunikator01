@@ -68,7 +68,15 @@ pub fn validate_registration(
 }
 
 /// Checks the first-run / account form; the error names the field and says what is wrong.
-pub fn validate_account(server: &str, fingerprint: &str, user: &str, password: &str) -> Result<(), (Field, &'static str)> {
+/// `remembered` is the account whose session token is stored: for it an empty password means
+/// "log in with the stored session".
+pub fn validate_account(
+    server: &str,
+    fingerprint: &str,
+    user: &str,
+    password: &str,
+    remembered: Option<&AccountInput>,
+) -> Result<(), (Field, &'static str)> {
     let server = server.trim();
     if server.is_empty() {
         return Err((Field::Server, "podaj adres serwera"));
@@ -88,7 +96,12 @@ pub fn validate_account(server: &str, fingerprint: &str, user: &str, password: &
     if user.trim().is_empty() {
         return Err((Field::User, "podaj nazwę użytkownika"));
     }
-    if password.is_empty() {
+    let same_account = |r: &AccountInput| {
+        r.server.trim() == server
+            && protocol::parse_fingerprint(&r.fingerprint) == protocol::parse_fingerprint(fingerprint)
+            && r.username.trim() == user.trim()
+    };
+    if password.is_empty() && !remembered.is_some_and(same_account) {
         return Err((Field::Password, "podaj hasło"));
     }
     Ok(())
@@ -218,7 +231,7 @@ pub enum AccountMode {
 }
 
 /// What the account dialog starts with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccountForm {
     pub mode: AccountMode,
     pub login: AccountInput,
@@ -227,6 +240,22 @@ pub struct AccountForm {
     pub invite_user: String,
     /// Why the dialog opened (a failed login), shown above the fields.
     pub notice: Option<String>,
+    /// A session token is stored for `login`'s account, so its password may be left empty.
+    pub remembered: bool,
+}
+
+/// Leaves the invite code out (the password is hidden by `AccountInput`).
+impl std::fmt::Debug for AccountForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountForm")
+            .field("mode", &self.mode)
+            .field("login", &self.login)
+            .field("invite", &"<ukryte>")
+            .field("invite_user", &self.invite_user)
+            .field("notice", &self.notice)
+            .field("remembered", &self.remembered)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -772,6 +801,7 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
             ("Powtórz hasło", "", ES_PASSWORD as u32, 256),
         ],
     );
+    let password_label = if form.remembered { "Hasło (zostaw puste, aby użyć zapamiętanej sesji)" } else { "Hasło" };
     let login = fields(
         ID_SERVER,
         ID_ERROR,
@@ -779,7 +809,7 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
             ("Adres serwera (host:port)", form.login.server.as_str(), 0, 255),
             ("Odcisk certyfikatu (64 znaki)", form.login.fingerprint.as_str(), 0, 128),
             ("Nazwa użytkownika", form.login.username.as_str(), 0, 64),
-            ("Hasło", form.login.password.as_str(), ES_PASSWORD as u32, 256),
+            (password_label, form.login.password.as_str(), ES_PASSWORD as u32, 256),
         ],
     );
     y += 4 * 64 + 4;
@@ -801,7 +831,7 @@ fn account_form(d: &Dialog, form: &AccountForm, first_run: bool) -> Option<Accou
         match d.next() {
             Ev::Command { id: ID_OK, .. } if mode == AccountMode::Login => {
                 let v = login.values();
-                match validate_account(&v[0], &v[1], &v[2], &v[3]) {
+                match validate_account(&v[0], &v[1], &v[2], &v[3], form.remembered.then_some(&form.login)) {
                     Ok(()) => {
                         return Some(AccountChoice::Login(AccountInput {
                             server: v[0].trim().to_owned(),
@@ -1094,8 +1124,8 @@ mod tests {
 
     #[test]
     fn account_validation_messages() {
-        assert_eq!(validate_account("serwer.pl:7700", FP, "ola", "tajne"), Ok(()));
-        assert_eq!(validate_account(" [::1]:7700 ", &FP.to_uppercase(), " ola ", " "), Ok(()));
+        assert_eq!(validate_account("serwer.pl:7700", FP, "ola", "tajne", None), Ok(()));
+        assert_eq!(validate_account(" [::1]:7700 ", &FP.to_uppercase(), " ola ", " ", None), Ok(()));
         let bad_fp = FP.replace('a', "g");
         let cases = [
             (("", FP, "ola", "x"), (Field::Server, "podaj adres serwera")),
@@ -1111,8 +1141,39 @@ mod tests {
             (("serwer.pl:7700", FP, "ola", ""), (Field::Password, "podaj hasło")),
         ];
         for ((server, fp, user, pw), want) in cases {
-            assert_eq!(validate_account(server, fp, user, pw), Err(want), "{server:?} {fp:?} {user:?} {pw:?}");
+            assert_eq!(validate_account(server, fp, user, pw, None), Err(want), "{server:?} {fp:?} {user:?} {pw:?}");
         }
+    }
+
+    #[test]
+    fn empty_password_means_the_remembered_session() {
+        let remembered = AccountInput {
+            server: "serwer.pl:7700".into(),
+            fingerprint: FP.into(),
+            username: "Ola".into(),
+            password: String::new(),
+        };
+        let r = Some(&remembered);
+        assert_eq!(validate_account("serwer.pl:7700", FP, "Ola", "", r), Ok(()));
+        assert_eq!(validate_account(" serwer.pl:7700 ", &FP.to_uppercase(), " Ola ", "", r), Ok(()));
+        // Another account has no remembered session.
+        let need = Err((Field::Password, "podaj hasło"));
+        assert_eq!(validate_account("inny.pl:7700", FP, "Ola", "", r), need);
+        assert_eq!(validate_account("serwer.pl:7700", &"cd".repeat(32), "Ola", "", r), need);
+        assert_eq!(validate_account("serwer.pl:7700", FP, "Ewa", "", r), need);
+        assert_eq!(validate_account("serwer.pl:7700", FP, "Ola", "", None), need);
+    }
+
+    #[test]
+    fn account_form_debug_hides_the_invite() {
+        let form = AccountForm {
+            invite: "kom1-TAJNY-KOD".into(),
+            invite_user: "ola".into(),
+            ..login_form(AccountInput { password: "Tajne-Hasło-42".into(), ..AccountInput::default() })
+        };
+        let text = format!("{form:?} {form:#?}");
+        assert!(!text.contains("TAJNY") && !text.contains("Tajne"), "{text}");
+        assert!(text.contains("ola"), "{text}");
     }
 
     #[test]
@@ -1304,6 +1365,7 @@ mod tests {
             invite: String::new(),
             invite_user: String::new(),
             notice: None,
+            remembered: false,
         }
     }
 

@@ -195,7 +195,8 @@ fn account(s: &Settings, register: Option<&Registration>) -> Option<Account> {
     })
 }
 
-/// The account form's starting values; the password only if it can still be decrypted.
+/// The account form's starting values; the password only if it can still be decrypted (with
+/// a stored session there is none, and it may be left empty).
 pub fn account_form(s: &Settings) -> AccountForm {
     AccountForm {
         // Nothing set up yet most likely means a friend's invite.
@@ -209,7 +210,39 @@ pub fn account_form(s: &Settings) -> AccountForm {
         invite: String::new(),
         invite_user: String::new(),
         notice: None,
+        remembered: load_token(s).is_some(),
     }
+}
+
+/// Whether the account dialog returned the saved account as it is: same server, fingerprint
+/// and name, and the saved password or none (meaning the stored session).
+fn unchanged_login(s: &Settings, a: &AccountInput) -> bool {
+    s.server == a.server
+        && s.fingerprint == a.fingerprint
+        && s.username == a.username
+        && (a.password.is_empty() || load_password(s).as_deref() == Some(a.password.as_str()))
+}
+
+/// Keeps a freshly issued token for the next start. The first one of a registration also makes
+/// the new account the saved one, replacing the old account's credentials only now that the
+/// registration has succeeded.
+fn adopt_token(s: &mut Settings, token: &[u8; 32], register: Option<Registration>) -> anyhow::Result<()> {
+    store_token(s, token)?;
+    if let Some(r) = register {
+        s.server = r.invite.server;
+        s.fingerprint = protocol::fingerprint_hex(&r.invite.fingerprint);
+        s.username = r.username;
+    }
+    Ok(())
+}
+
+/// Saves my name as the server spells it; true when it differed from the one typed.
+fn signed_in_as(s: &mut Settings, name: &str) -> bool {
+    if s.username == name {
+        return false;
+    }
+    s.username = name.to_owned();
+    true
 }
 
 /// The form to reopen after a login failed for good, or `None` when the account is not the
@@ -237,26 +270,22 @@ fn login_prompt(s: &Settings, reason: FatalReason, register: Option<&Registratio
     Some(form)
 }
 
-/// Saves the dialog's account to the settings. A login's password is stored protected; a
-/// registration is returned instead, to be used once and then replaced by its token.
+/// Saves the dialog's account to the settings. A login's password is stored protected (an
+/// empty one, allowed only for the saved account, keeps its stored session). A registration
+/// changes nothing yet: it is returned, used once, and saved with its first token
+/// (`adopt_token`), so a refused one leaves the old account working.
 fn set_account(s: &mut Settings, choice: AccountChoice) -> anyhow::Result<Option<Registration>> {
     match choice {
         AccountChoice::Login(a) => {
-            store_password(s, &a.password)?;
+            if !a.password.is_empty() {
+                store_password(s, &a.password)?;
+            }
             s.server = a.server;
             s.fingerprint = a.fingerprint;
             s.username = a.username;
             Ok(None)
         }
-        AccountChoice::Register(r) => {
-            s.server = r.invite.server.clone();
-            s.fingerprint = protocol::fingerprint_hex(&r.invite.fingerprint);
-            s.username = r.username.clone();
-            // Neither belongs to the new account.
-            s.password_protected.clear();
-            s.token_protected.clear();
-            Ok(Some(r))
-        }
+        AccountChoice::Register(r) => Ok(Some(r)),
     }
 }
 
@@ -371,14 +400,8 @@ impl App {
     /// Saves a changed account and reconnects with it. An unchanged one does nothing, unless
     /// the session has failed for good: then OK is the way to try again.
     pub fn change_account(&mut self, hwnd: HWND, choice: AccountChoice) {
-        let s = self.state.settings();
         let same = match &choice {
-            AccountChoice::Login(a) => {
-                s.server == a.server
-                    && s.fingerprint == a.fingerprint
-                    && s.username == a.username
-                    && load_password(s).as_deref() == Some(a.password.as_str())
-            }
+            AccountChoice::Login(a) => unchanged_login(self.state.settings(), a),
             AccountChoice::Register(_) => false,
         };
         if !needs_reconnect(same, &self.state.view().status) {
@@ -458,6 +481,11 @@ impl App {
                     }
                 }
                 SessionEvent::TokenIssued(token) => self.token_issued(&token.0),
+                SessionEvent::SignedInAs(name) => {
+                    if signed_in_as(self.state.settings_mut(), name) {
+                        self.save_settings();
+                    }
+                }
                 SessionEvent::Fatal(reason) => {
                     self.login_prompt = login_prompt(self.state.settings(), *reason, self.register.as_ref());
                 }
@@ -483,8 +511,8 @@ impl App {
 
     /// Keeps the token for the next start in place of the password (and of the invite).
     fn token_issued(&mut self, token: &[u8; 32]) {
-        self.register = None;
-        match store_token(self.state.settings_mut(), token) {
+        let register = self.register.take();
+        match adopt_token(self.state.settings_mut(), token, register) {
             Ok(()) => self.save_settings(),
             Err(e) => self.local_notice = Some(format!("nie udało się zapamiętać logowania: {e:#}")),
         }
@@ -579,19 +607,66 @@ mod tests {
         Registration { invite, username: "Ola2".into(), password: "długie hasło".into() }
     }
 
+    fn logged_in() -> Settings {
+        let mut s = Settings { server: "stary.pl:7700".into(), fingerprint: "cd".repeat(32), username: "Ola".into(), ..Settings::default() };
+        store_token(&mut s, &[3; 32]).unwrap();
+        s
+    }
+
     #[test]
-    fn registration_saves_server_and_name_but_no_secret() {
-        let mut s = Settings::default();
-        store_password(&mut s, "stare hasło").unwrap();
+    fn registration_keeps_the_old_account_until_its_first_token() {
+        let mut s = logged_in();
+        let before = s.clone();
         let r = set_account(&mut s, AccountChoice::Register(registration())).unwrap().unwrap();
-        assert_eq!((s.server.as_str(), s.username.as_str()), ("serwer.pl:7700", "Ola2"));
-        assert_eq!(s.fingerprint, "ab".repeat(32));
-        assert!(s.password_protected.is_empty() && s.token_protected.is_empty());
-        assert!(account(&s, None).is_none(), "nothing to log in with until the token arrives");
+        assert_eq!(s, before, "a registration that may still fail must not touch the saved account");
         let a = account(&s, Some(&r)).unwrap();
         assert_eq!(a.credentials, Credentials::Register { invite: [5; 16], password: "długie hasło".into() });
-        store_token(&mut s, &[7; 32]).unwrap();
+        assert_eq!((a.server.as_str(), a.username.as_str()), ("serwer.pl:7700", "Ola2"));
+
+        // Refused: the old account still logs in.
+        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([3; 32]));
+
+        // The first token makes the new account the saved one.
+        adopt_token(&mut s, &[7; 32], Some(r)).unwrap();
+        assert_eq!((s.server.as_str(), s.username.as_str()), ("serwer.pl:7700", "Ola2"));
+        assert_eq!(s.fingerprint, "ab".repeat(32));
+        assert!(s.password_protected.is_empty());
         assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([7; 32]));
+        adopt_token(&mut s, &[8; 32], None).unwrap();
+        assert_eq!(account(&s, None).unwrap().credentials, Credentials::Token([8; 32]));
+        assert_eq!(s.username, "Ola2");
+    }
+
+    #[test]
+    fn the_servers_spelling_of_the_name_is_saved() {
+        let mut s = logged_in();
+        assert!(!signed_in_as(&mut s, "Ola"));
+        assert!(signed_in_as(&mut s, "OLA"));
+        assert_eq!(s.username, "OLA");
+    }
+
+    #[test]
+    fn empty_password_reconnects_with_the_remembered_session() {
+        let s = logged_in();
+        let form = account_form(&s);
+        assert!(form.remembered && form.login.password.is_empty());
+        let same = AccountInput {
+            server: s.server.clone(),
+            fingerprint: s.fingerprint.clone(),
+            username: s.username.clone(),
+            password: String::new(),
+        };
+        assert!(unchanged_login(&s, &same));
+        assert!(!unchanged_login(&s, &AccountInput { password: "nowe hasło".into(), ..same.clone() }));
+        assert!(!unchanged_login(&s, &AccountInput { username: "Ewa".into(), ..same.clone() }));
+        // Saving it keeps the token instead of storing an empty password.
+        let mut saved = s.clone();
+        assert_eq!(set_account(&mut saved, AccountChoice::Login(same)).unwrap(), None);
+        assert_eq!(account(&saved, None).unwrap().credentials, Credentials::Token([3; 32]));
+        // Password-only settings have no session to remember.
+        let mut pw = Settings { token_protected: String::new(), ..s };
+        store_password(&mut pw, "hasło").unwrap();
+        assert!(!account_form(&pw).remembered);
     }
 
     #[test]
