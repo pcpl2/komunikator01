@@ -96,3 +96,61 @@ Klucz podpisujący leży tylko na Twoim komputerze, nigdy na serwerze.
    Dokładną nazwę pliku wydania podaje `komunikator-release sign` i pole `file` manifestu. Restart serwera nie jest potrzebny.
 
 Klienci znajdą wydanie przy następnym sprawdzeniu, a pobiorą je i zainstalują, gdy nie będą w rozmowie.
+
+## Wydania przez GitHub Actions
+
+Dwa workflow uruchamia się tylko ręcznie: `Actions → Wydanie serwera / Wydanie klienta → Run workflow`. Push niczego nie buduje. Każde uruchomienie:
+
+1. czyta wersję z `Cargo.toml` i przerywa, jeśli tag już istnieje;
+2. uruchamia testy, buduje i tworzy release na GitHubie z tagiem;
+3. jeśli zaznaczono `deploy`, wgrywa wynik na serwer.
+
+Serwer i klient mają osobne wersje:
+
+| Część | Wersja w | Tag | Pliki w release |
+|---|---|---|---|
+| Serwer | `crates/server/Cargo.toml` (`version`) | `server-vX.Y.Z` | `komunikator-server-X.Y.Z-linux-x86_64` (statyczny, musl), `SHA256SUMS` |
+| Klient | `Cargo.toml` (`[workspace.package] version`) | `client-vX.Y.Z` | `komunikator.exe`, `komunikator-cli.exe`, `manifest.bin`, `SHA256SUMS` |
+
+Nowe wydanie: podnieś wersję, zrób commit, wypchnij, uruchom workflow. Wdrożenie serwera restartuje usługę, więc trwające rozmowy zerwą się na kilka sekund, a klienci połączą się sami. Wdrożenie klienta tylko wgrywa aktualizację do `/var/lib/komunikator/updates/`. Programy graczy pobiorą ją, gdy nie będą w rozmowie.
+
+### Jednorazowe przygotowanie
+
+**Środowisko `produkcja`** (`Settings → Environments → New environment`, nazwa `produkcja`): włącz `Required reviewers`, a wgranie na serwer będzie czekało na Twoje zatwierdzenie. Sekrety wdrożenia dodaj w tym środowisku:
+
+| Sekret | Wartość |
+|---|---|
+| `DEPLOY_HOST` | adres serwera |
+| `DEPLOY_PORT` | port SSH (opcjonalny, domyślnie 22) |
+| `DEPLOY_USER` | użytkownik do wdrożeń, np. `deploy` |
+| `DEPLOY_SSH_KEY` | klucz prywatny SSH tego użytkownika (osobny, tylko do wdrożeń) |
+| `DEPLOY_KNOWN_HOSTS` | wynik `ssh-keyscan -p <port> <adres>` sprawdzony z odciskiem z serwera |
+
+**Sekret repozytorium `RELEASE_SIGNING_KEY`** (opcjonalny): zawartość pliku `release.key`. Z nim workflow klienta sam podpisuje wydanie i może je wgrać na serwer. Bez niego release dostaje niepodpisane `komunikator.exe` i `komunikator-cli.exe`, uruchomienie z `deploy` jest odrzucane, a aktualizację podpisujesz i wgrywasz ręcznie, jak w sekcji „Publikowanie wydania”.
+
+**Użytkownik wdrożeń na serwerze**:
+
+```
+sudo useradd --create-home --shell /bin/bash deploy
+sudo install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+echo '<klucz publiczny SSH>' | sudo tee /home/deploy/.ssh/authorized_keys
+sudo chown deploy:deploy /home/deploy/.ssh/authorized_keys
+sudo chmod 600 /home/deploy/.ssh/authorized_keys
+sudo visudo -f /etc/sudoers.d/komunikator-deploy
+```
+
+Do pliku sudoers wpisz:
+
+```
+deploy ALL=(root) NOPASSWD: /usr/bin/install, /usr/bin/mv, /usr/bin/systemctl restart komunikator
+```
+
+### Klucz wydań w GitHubie: co to zmienia
+
+Po dodaniu `RELEASE_SIGNING_KEY` klucz przestaje być offline. Ktoś, kto przejmie Twoje konto GitHub albo repozytorium, mógłby podpisać i rozesłać graczom dowolny program. Dlatego:
+
+- włącz na GitHubie weryfikację dwuetapową;
+- wymagaj zatwierdzenia środowiska `produkcja`;
+- nie dawaj nikomu prawa zapisu do repozytorium.
+
+Jeśli wolisz trzymać klucz offline, nie dodawaj sekretu i uruchamiaj workflow klienta bez `deploy`. Pobierz z release `komunikator.exe`, podpisz go lokalnie (`komunikator-release sign --exe komunikator.exe …`) i wgraj, jak w sekcji „Publikowanie wydania”. Podpis sprawdza wersję i klucz wbudowane w exe, więc podpisujesz dokładnie ten plik, który pobrali gracze.

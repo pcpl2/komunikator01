@@ -4,6 +4,8 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+# Wersja klienta (komunikator.exe, komunikator-cli.exe): wydanie `client-vX.Y.Z`.
+# Serwer ma własną wersję w crates/server/Cargo.toml (wydanie `server-vX.Y.Z`).
 version = "0.1.0"
 license = "MIT"
 
