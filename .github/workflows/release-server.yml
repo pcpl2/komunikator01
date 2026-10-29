@@ -1,18 +1,15 @@
 # Wydanie serwera: uruchamiane tylko ręcznie (Actions → Wydanie serwera → Run workflow).
 # Wersja pochodzi z crates/server/Cargo.toml; przed uruchomieniem ją podnieś i wypchnij.
-# Tworzy release z tagiem server-vX.Y.Z, a na żądanie wgrywa serwer i restartuje usługę.
+# Buduje obraz Dockera, publikuje go w prywatnym ghcr.io jako :X.Y.Z i :latest
+# i tworzy release z tagiem server-vX.Y.Z.
 name: Wydanie serwera
 
 on:
   workflow_dispatch:
-    inputs:
-      deploy:
-        description: Wgraj na serwer i zrestartuj usługę (trwające rozmowy zerwą się na kilka sekund)
-        type: boolean
-        default: true
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-server
@@ -20,11 +17,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   release:
-    name: Budowanie i release
+    name: Obraz i release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -40,72 +36,51 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/komunikator-server" >> "$GITHUB_OUTPUT"
 
       - name: Rust
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          rustup toolchain install stable --profile minimal
-          rustup target add "$TARGET"
+        run: rustup toolchain install stable --profile minimal
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Testy
         run: cargo test --locked -p protocol -p server
 
-      # musl: jeden statyczny plik, działa na każdym Debianie niezależnie od wersji glibc.
-      - name: Budowanie
-        run: |
-          cargo build --locked --release -p server --target "$TARGET"
-          mkdir dist
-          cp "target/$TARGET/release/komunikator-server" "dist/komunikator-server-${{ steps.version.outputs.version }}-linux-x86_64"
-          cd dist && sha256sum * > SHA256SUMS
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: actions/upload-artifact@v7
+      - uses: docker/login-action@v4
         with:
-          name: server
-          path: dist/
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Etykieta source wiąże pakiet z repozytorium: jest prywatny jak ono i dziedziczy dostęp.
+      - name: Obraz
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.version.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=komunikator-server
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
         run: |
-          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+          gh release create "${{ steps.version.outputs.tag }}" \
             --target "$GITHUB_SHA" \
-            --title "Serwer ${{ steps.version.outputs.version }}" \
-            --notes "Serwer komunikatora (Linux x86_64, statyczny). Instalacja: docs/wydanie.md."
-
-  deploy:
-    name: Wdrożenie na serwer
-    needs: release
-    if: inputs.deploy
-    runs-on: ubuntu-24.04
-    environment: produkcja
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: server
-          path: dist
-
-      - name: SSH
-        env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-        run: |
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-
-      - name: Wgranie i restart
-        env:
-          HOST: ${{ secrets.DEPLOY_HOST }}
-          USER: ${{ secrets.DEPLOY_USER }}
-          PORT: ${{ secrets.DEPLOY_PORT || '22' }}
-        run: |
-          ssh_opts=(-i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes -o BatchMode=yes)
-          scp "${ssh_opts[@]}" -P "$PORT" dist/komunikator-server-*-linux-x86_64 "$USER@$HOST:/tmp/komunikator-server.new"
-          ssh "${ssh_opts[@]}" -p "$PORT" "$USER@$HOST" 'set -e
-            sudo install -m 755 /tmp/komunikator-server.new /usr/local/bin/komunikator-server
-            rm -f /tmp/komunikator-server.new
-            sudo systemctl restart komunikator
-            sleep 2
-            systemctl is-active komunikator'
+            --title "Serwer $VERSION" \
+            --notes "$(printf 'Obraz: `%s:%s`\nDigest: `%s@%s`\n\nAktualizacja na serwerze: `docker compose pull && docker compose up -d` (docs/wydanie.md).' "$IMAGE" "$VERSION" "$IMAGE" "$DIGEST")"

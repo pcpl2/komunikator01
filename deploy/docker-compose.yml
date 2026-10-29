@@ -1,0 +1,20 @@
+# Serwer komunikatora: `docker compose up -d` w katalogu z tym plikiem i komunikator.toml.
+# Obraz jest prywatny: najpierw `docker login ghcr.io` (token z uprawnieniem read:packages).
+services:
+  komunikator:
+    image: ghcr.io/pcpl2/komunikator-server:latest
+    container_name: komunikator
+    restart: unless-stopped
+    ports:
+      - "7700:7700/udp"
+    volumes:
+      - komunikator-data:/data
+      - ./komunikator.toml:/etc/komunikator/komunikator.toml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  komunikator-data:

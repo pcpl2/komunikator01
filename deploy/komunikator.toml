@@ -1,7 +1,8 @@
-# Konfiguracja produkcyjna serwera: /etc/komunikator/komunikator.toml
-# Adres i port UDP, na którym serwer nasłuchuje (otwórz go w firewallu).
+# Konfiguracja serwera w kontenerze: /etc/komunikator/komunikator.toml.
+# W docker-compose.yml montowana z pliku obok; zmień public_address i zrestartuj kontener.
+# Adres i port UDP, na którym serwer nasłuchuje w kontenerze.
 bind = "0.0.0.0:7700"
-# Certyfikat serwera, klucz prywatny i baza kont (komunikator.db). Katalog zakłada systemd (StateDirectory).
-data_dir = "/var/lib/komunikator"
+# Wolumen z certyfikatem serwera, kluczem prywatnym, bazą kont (komunikator.db) i katalogiem updates/.
+data_dir = "/data"
 # Adres, który trafia do zaproszeń. Zmień na prawdziwy adres serwera.
 public_address = "serwer.example.pl:7700"

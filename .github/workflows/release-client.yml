@@ -1,16 +1,11 @@
 # Wydanie klienta: uruchamiane tylko ręcznie (Actions → Wydanie klienta → Run workflow).
 # Wersja pochodzi z [workspace.package] w Cargo.toml; przed uruchomieniem ją podnieś i wypchnij.
-# Tworzy release z tagiem client-vX.Y.Z (komunikator.exe do pobrania), a na żądanie wgrywa
-# podpisane wydanie na serwer, skąd programy graczy zaktualizują się same.
+# Tworzy release z tagiem client-vX.Y.Z: komunikator.exe dla graczy oraz, gdy jest klucz,
+# podpisaną aktualizację (manifest.bin + komunikator-X.Y.Z.exe) do wgrania na serwer.
 name: Wydanie klienta
 
 on:
   workflow_dispatch:
-    inputs:
-      deploy:
-        description: Wgraj na serwer jako aktualizację dla graczy
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -26,8 +21,6 @@ jobs:
   release:
     name: Budowanie, podpis i release
     runs-on: windows-2025
-    outputs:
-      signed: ${{ steps.sign.outputs.signed }}
     steps:
       - uses: actions/checkout@v7
 
@@ -63,37 +56,23 @@ jobs:
       # Klucz tajny istnieje na dysku maszyny tylko na czas podpisu. Bez sekretu (klucz trzymany
       # offline) release dostaje niepodpisany exe, a aktualizację podpisuje się lokalnie.
       - name: Podpis
-        id: sign
         shell: bash
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           mkdir dist
+          cp target/release/komunikator.exe target/release/komunikator-cli.exe dist/
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
-            if [ "${{ inputs.deploy }}" = "true" ]; then
-              echo "::error::Wgranie na serwer wymaga podpisu: dodaj sekret RELEASE_SIGNING_KEY albo uruchom bez deploy i podpisz lokalnie (docs/wydanie.md)."
-              exit 1
-            fi
-            echo "::warning::Brak RELEASE_SIGNING_KEY: release bez manifest.bin, podpisz wydanie lokalnie."
-            cp target/release/komunikator.exe target/release/komunikator-cli.exe dist/
-            (cd dist && sha256sum * > SHA256SUMS)
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::warning::Brak RELEASE_SIGNING_KEY: release bez podpisanej aktualizacji, podpisz ją lokalnie (docs/wydanie.md)."
+          else
+            key="$RUNNER_TEMP/release.key"
+            trap 'rm -f "$key"' EXIT
+            printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+            target/release/komunikator-release.exe sign --key "$key" --exe target/release/komunikator.exe \
+              --version "${{ steps.version.outputs.version }}" --out update
+            cp update/* dist/
           fi
-          key="$RUNNER_TEMP/release.key"
-          trap 'rm -f "$key"' EXIT
-          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
-          target/release/komunikator-release.exe sign --key "$key" --exe target/release/komunikator.exe \
-            --version "${{ steps.version.outputs.version }}" --out update
-          cp target/release/komunikator.exe target/release/komunikator-cli.exe update/manifest.bin dist/
           (cd dist && sha256sum * > SHA256SUMS)
-          echo "signed=true" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v7
-        if: steps.sign.outputs.signed == 'true'
-        with:
-          name: update
-          path: update/
 
       - name: Release
         shell: bash
@@ -103,44 +82,4 @@ jobs:
           gh release create "${{ steps.version.outputs.tag }}" dist/* \
             --target "$GITHUB_SHA" \
             --title "Komunikator ${{ steps.version.outputs.version }}" \
-            --notes "Pobierz komunikator.exe (Windows). Pierwsze uruchomienie: docs/pierwsze-uruchomienie.md. Zainstalowane programy zaktualizują się same."
-
-  deploy:
-    name: Wgranie aktualizacji na serwer
-    needs: release
-    if: inputs.deploy && needs.release.outputs.signed == 'true'
-    runs-on: ubuntu-24.04
-    environment: produkcja
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: update
-          path: update
-
-      - name: SSH
-        env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-        run: |
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-
-      # Najpierw plik wydania, na końcu jednym mv manifest: klient nigdy nie zobaczy manifestu
-      # wskazującego na brakujący plik.
-      - name: Wgranie
-        env:
-          HOST: ${{ secrets.DEPLOY_HOST }}
-          USER: ${{ secrets.DEPLOY_USER }}
-          PORT: ${{ secrets.DEPLOY_PORT || '22' }}
-        run: |
-          exe=$(cd update && ls komunikator-*.exe)
-          ssh_opts=(-i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes -o BatchMode=yes)
-          scp "${ssh_opts[@]}" -P "$PORT" "update/$exe" update/manifest.bin "$USER@$HOST:/tmp/"
-          ssh "${ssh_opts[@]}" -p "$PORT" "$USER@$HOST" "set -e
-            d=/var/lib/komunikator/updates
-            sudo install -d -m 755 -o komunikator -g komunikator \$d
-            sudo install -m 644 -o komunikator -g komunikator /tmp/$exe \$d/
-            sudo install -m 644 -o komunikator -g komunikator /tmp/manifest.bin \$d/manifest.bin.tmp
-            sudo mv \$d/manifest.bin.tmp \$d/manifest.bin
-            rm -f /tmp/$exe /tmp/manifest.bin"
+            --notes "Dla graczy: komunikator.exe (pierwsze uruchomienie: docs/pierwsze-uruchomienie.md). Aktualizacja dla zainstalowanych programów: manifest.bin i komunikator-X.Y.Z.exe wgraj do /data/updates kontenera serwera (docs/wydanie.md)."

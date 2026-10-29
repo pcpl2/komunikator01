@@ -17,74 +17,47 @@ i podaje średni czas oraz utratę pakietów. Wybierz lokalizację, w której **
 
 ### 2. Klucz wydań (jednorazowo, na Windows)
 
-Klucz pozwala później rozsyłać aktualizacje automatycznie. Zrób to przed zbudowaniem wersji, którą dostaną gracze. Inaczej każdą następną wersję trzeba będzie rozesłać ręcznie.
+Klucz pozwala później rozsyłać aktualizacje automatycznie. Bez niego workflow klienta się nie uruchomi.
 
 ```
 cargo build --release -p release
-target\release\komunikator-release keygen --out release.key
+targetelease\komunikator-release keygen --out release.key
 ```
 
-1. Wypisany klucz publiczny wklej do `crates/client-win/release-key.pub` w miejsce zer (pierwszy wiersz niebędący komentarzem), potem zrób commit.
-2. Plik `release.key` przenieś w bezpieczne miejsce, np. na pendrive i do menedżera haseł. Nie kopiuj go na serwer ani do repozytorium. Bez niego nie wydasz aktualizacji dla rozdanych programów.
+1. Wypisany klucz publiczny wpisz do `crates/client-win/release-key.pub` w miejsce zer, zrób commit i wypchnij.
+2. Plik `release.key` przenieś w bezpieczne miejsce, np. na pendrive i do menedżera haseł. Nigdy nie wrzucaj go do repozytorium.
+3. Zdecyduj, czy GitHub ma podpisywać aktualizacje sam (sekret `RELEASE_SIGNING_KEY`), czy podpisujesz je u siebie. Różnice: `docs/wydanie.md`, sekcja „Klucz wydań klienta”.
 
-### 3. Zbuduj program dla graczy (Windows)
+### 3. Pierwsze wydania (GitHub Actions)
 
-Wymagania: Rust i CMake.
+W repozytorium na GitHubie: `Actions`, potem po kolei:
+- **Wydanie serwera → Run workflow**: publikuje obraz `ghcr.io/pcpl2/komunikator-server`;
+- **Wydanie klienta → Run workflow**: tworzy release z `komunikator.exe` dla graczy.
 
-```
-cargo build --release -p client-win
-```
+### 4. Postaw serwer (Debian z Dockerem)
 
-Plik dla graczy to `target\release\komunikator.exe`. To jeden plik, który nie wymaga instalacji.
-
-### 4. Postaw serwer (Debian)
-
-Repozytorium nie ma zdalnego serwera, więc przenieś kod paczką:
-
-```
-git bundle create komunikator.bundle main
-scp komunikator.bundle uzytkownik@serwer:~
-```
-
-Na serwerze:
+1. Zainstaluj Dockera.
+2. Zaloguj się do ghcr.io tokenem z uprawnieniem `read:packages`: `docker login ghcr.io -u pcpl2`.
+3. Skopiuj `deploy/docker-compose.yml` i `deploy/komunikator.toml` do katalogu, np. `/opt/komunikator`.
+4. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera z portem, np. `"gra.example.pl:7700"`.
+5. Uruchom:
 
 ```
-sudo apt install build-essential pkg-config git curl
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
-git clone komunikator.bundle komunikator && cd komunikator
-cargo build --release -p server
-
-sudo install -m 755 target/release/komunikator-server /usr/local/bin/
-sudo useradd --system --home-dir /var/lib/komunikator --shell /usr/sbin/nologin komunikator
-sudo install -d /etc/komunikator
-sudo install -m 644 deploy/komunikator.toml /etc/komunikator/komunikator.toml
-sudo install -m 644 deploy/komunikator.service /etc/systemd/system/komunikator.service
-sudoedit /etc/komunikator/komunikator.toml
-```
-
-W pliku konfiguracji ustaw `public_address` na prawdziwy adres serwera (domena albo IP) z portem, np. `"gra.example.pl:7700"`. Ten adres trafi do zaproszeń.
-
-```
-sudo systemctl daemon-reload
-sudo systemctl enable --now komunikator
-journalctl -u komunikator -n 20
+cd /opt/komunikator
+docker compose up -d
+docker compose logs komunikator
 ```
 
 W logu powinna pojawić się linia `fingerprint: …`. Oznacza ona, że serwer działa.
 
 ### 5. Otwórz port UDP 7700
 
-```
-sudo ufw allow 7700/udp
-```
-
-Przy nftables dopisz `udp dport 7700 accept` do łańcucha `input`. Jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. Port **UDP** jest wymagany, TCP nie wystarczy.
+Otwórz go w firewallu dostawcy serwera, a jeśli serwer stoi za routerem, przekieruj na nim UDP 7700. Port **UDP** jest wymagany, TCP nie wystarczy. Docker otwiera opublikowany port w systemie sam, z pominięciem `ufw`.
 
 ### 6. Twoje konto administratora
 
 ```
-sudo -u komunikator komunikator-server invite --config /etc/komunikator/komunikator.toml
+docker exec komunikator komunikator-server invite --config /etc/komunikator/komunikator.toml
 ```
 
 1. Skopiuj wypisany kod `kom1-…`.
@@ -92,20 +65,16 @@ sudo -u komunikator komunikator-server invite --config /etc/komunikator/komunika
 3. Nadaj sobie uprawnienia administratora:
 
 ```
-sudo -u komunikator komunikator-server make-admin --config /etc/komunikator/komunikator.toml <twoja-nazwa>
+docker exec komunikator komunikator-server make-admin --config /etc/komunikator/komunikator.toml <twoja-nazwa>
 ```
 
 ### 7. Zaproszenia dla znajomych
 
-Wygeneruj osobny kod dla każdej osoby. Kod jest jednorazowy i domyślnie ważny 7 dni:
+Wygeneruj osobny kod dla każdej osoby tym samym poleceniem `invite`. Kod jest jednorazowy i domyślnie ważny 7 dni.
 
-```
-sudo -u komunikator komunikator-server invite --config /etc/komunikator/komunikator.toml
-```
+Wyślij każdemu `komunikator.exe` z release na GitHubie i jego kod prywatną wiadomością, nie na publicznym kanale.
 
-Wyślij każdemu `komunikator.exe` i jego kod prywatną wiadomością, nie na publicznym kanale.
-
-Później przydadzą się polecenia:
+Później przydadzą się polecenia (każde z `docker exec komunikator komunikator-server … --config /etc/komunikator/komunikator.toml`):
 - `users`: kto ma konto;
 - `invites`: które zaproszenia zostały użyte;
 - `block <nazwa>`: zablokowanie konta.
@@ -146,4 +115,4 @@ Na wspólnej sesji przejdźcie listy w `docs/acceptance/plan-1.md` … `plan-6.m
 - czy po krótkim zerwaniu internetu program łączy się sam;
 - zużycie pamięci i procesora po kilku godzinach (Menedżer zadań).
 
-Zapiszcie, co nie działa. Takie uwagi poprawia się w kolejnej wersji, która dotrze do wszystkich automatycznie, jeśli zrobiłeś krok A.2.
+Zapiszcie, co nie działa. Takie uwagi poprawia się w kolejnej wersji, która dotrze do wszystkich automatycznie: workflow „Wydanie klienta” i wgranie aktualizacji na serwer opisuje `docs/wydanie.md`.

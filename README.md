@@ -13,11 +13,11 @@ cargo build --release -p server            # Debian: tylko serwer
 
 Wymagania: Rust (stable) i CMake (do zbudowania libopus). Klient jest linkowany ze statycznym CRT (`.cargo/config.toml`), więc `komunikator.exe` działa bez VC++ Redistributable.
 
-Od zera do pierwszej rozmowy krok po kroku: [docs/pierwsze-uruchomienie.md](docs/pierwsze-uruchomienie.md). Wdrożenie serwera na Debianie (usługa systemd, firewall) i publikowanie wydań: [docs/wydanie.md](docs/wydanie.md); gotowe pliki w `deploy/`.
+Od zera do pierwszej rozmowy krok po kroku: [docs/pierwsze-uruchomienie.md](docs/pierwsze-uruchomienie.md). Serwer działa jako kontener Dockera z prywatnego `ghcr.io/pcpl2/komunikator-server`. Wydania serwera i klienta robią ręcznie uruchamiane workflow GitHub Actions. Wdrożenie, firewall i wydania: [docs/wydanie.md](docs/wydanie.md); gotowe `docker-compose.yml` i konfiguracja w `deploy/`.
 
 ## Serwer
 
-Konta zakłada się z zaproszeń; hasła nie trafiają do pliku konfiguracji.
+Konta zakłada się z zaproszeń; hasła nie trafiają do pliku konfiguracji. Poniżej uruchomienie samego pliku `komunikator-server`. W kontenerze (zalecane) te same polecenia wywołuje się przez `docker exec komunikator komunikator-server …`, patrz [docs/wydanie.md](docs/wydanie.md).
 
 1. Przygotuj konfigurację na podstawie `server.example.toml`: `bind`, `data_dir` i `public_address` (adres, który trafi do zaproszeń).
 2. Załóż użytkownika systemowego dla serwera i katalog danych dostępny tylko dla niego (baza `komunikator.db` zawiera hashe haseł Argon2, a `key.der` to klucz prywatny serwera):
