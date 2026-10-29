@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::Context;
 use protocol::{RoomId, RoomInfo, DEFAULT_ROOM_NAME};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -92,7 +93,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Store> {
-        let db = Connection::open(path)?;
+        let db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         // AUTOINCREMENT so ids of deleted rooms are never handed out again.

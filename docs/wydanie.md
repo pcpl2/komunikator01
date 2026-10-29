@@ -2,7 +2,7 @@
 
 Szczegóły administrowania kontami i pokojami są w [README, sekcje „Serwer” i „Administracja”](../README.md); kanał aktualizacji opisuje [docs/updates.md](updates.md).
 
-Serwer działa jako kontener Dockera. Obraz `ghcr.io/pcpl2/komunikator-server` jest prywatny i powstaje w GitHub Actions (sekcja „Wydania przez GitHub Actions”). Obraz waży kilka MB: statyczny plik na distroless, bez powłoki, uruchamiany jako użytkownik bez uprawnień (uid 65532). Wszystkie dane trzyma wolumen `/data`:
+Serwer działa jako kontener Dockera. Obraz `ghcr.io/pcpl2/komunikator-server` jest prywatny i powstaje w GitHub Actions (sekcja „Wydania przez GitHub Actions”). Obraz waży kilka MB: statyczny plik na distroless, bez powłoki, uruchamiany jako użytkownik bez uprawnień (uid 65532). Wszystkie dane trzyma katalog `/opt/komunikator/data` na hoście, zamontowany w kontenerze jako `/data`. To zwykły katalog, nie wolumen Dockera, więc nie zniknie przy `docker compose down -v` ani `docker volume prune`. Są w nim:
 - certyfikat i klucz serwera (`cert.der`, `key.der`);
 - bazę kont i pokoi (`komunikator.db`);
 - aktualizacje klienta (`updates/`). Ten katalog jest zamontowany z hosta (`./updates` obok `docker-compose.yml`) tylko do odczytu.
@@ -11,16 +11,17 @@ Serwer działa jako kontener Dockera. Obraz `ghcr.io/pcpl2/komunikator-server` j
 
 Docker z pluginem compose i dostęp do prywatnego ghcr.io (logowanie, pobranie obrazu) zapewnia administrator serwera.
 
-Skopiuj z repozytorium `deploy/docker-compose.yml` i `deploy/komunikator.toml` do jednego katalogu, np. `/opt/komunikator`, i utwórz w nim pusty podkatalog `updates`. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera (domena albo IP i port 7700). Ten adres trafia do zaproszeń. Potem uruchom:
+Skopiuj z repozytorium `deploy/docker-compose.yml` i `deploy/komunikator.toml` do jednego katalogu, np. `/opt/komunikator`. Utwórz w nim podkatalogi `data` (dane serwera; właścicielem musi być uid 65532, z którym działa serwer) i `updates`. W `komunikator.toml` ustaw `public_address` na prawdziwy adres serwera (domena albo IP i port 7700). Ten adres trafia do zaproszeń. Potem uruchom:
 
 ```
 cd /opt/komunikator
-mkdir -p updates
+mkdir -p data updates
+sudo chown 65532:65532 data
 docker compose up -d
 docker compose logs komunikator
 ```
 
-W logu powinna pojawić się linia `fingerprint: …`, czyli odcisk certyfikatu serwera. Odcisk się nie zmienia, dopóki istnieje wolumen `komunikator-data`. Usunięcie wolumenu oznacza nowy odcisk, utratę kont i konieczność rozdania wszystkim nowych zaproszeń.
+W logu powinna pojawić się linia `fingerprint: …`, czyli odcisk certyfikatu serwera. Odcisk się nie zmienia, dopóki istnieje katalog `data`. Jego utrata oznacza nowy odcisk, utratę kont i konieczność rozdania wszystkim nowych zaproszeń, więc rób kopię zapasową.
 
 ## Firewall: UDP 7700
 
@@ -54,10 +55,13 @@ Dla `reset-password` hasło czytane jest ze standardowego wejścia, więc dodaj 
 **Kopia zapasowa** (bazę, certyfikat i klucz serwera trzymaj w bezpiecznym miejscu):
 
 ```
-docker run --rm -v komunikator_komunikator-data:/data -v "$PWD":/kopia alpine tar czf /kopia/komunikator-data.tgz -C /data .
+cd /opt/komunikator
+docker compose stop
+sudo tar czf komunikator-data-$(date +%F).tgz data
+docker compose start
 ```
 
-Pełną nazwę wolumenu (z przedrostkiem projektu compose) pokazuje `docker volume ls`.
+Zatrzymanie na kilka sekund daje spójną kopię bazy. Przywrócenie: rozpakuj archiwum w `/opt/komunikator` i uruchom kontener. Archiwum zawiera klucz prywatny serwera, więc trzymaj je poza serwerem i tylko dla siebie.
 
 ## Aktualizacja serwera
 
@@ -140,7 +144,7 @@ W efekcie:
 
 Oba sekrety są wymagane: bez nich albo przy złej postaci workflow się zatrzymuje. Zaproszenia działają jak dotąd. Konto założone zaproszeniem do innego serwera zostaje przy swoim adresie. Program zbudowany lokalnie, bez wbudowanego serwera, pokazuje pola adresu i odcisku jak dawniej.
 
-Odcisk zmienia się wyłącznie po utracie wolumenu `/data`. Wtedy trzeba zaktualizować sekret i wydać nowego klienta.
+Odcisk zmienia się wyłącznie po utracie katalogu `data` (bez kopii zapasowej). Wtedy trzeba zaktualizować sekret i wydać nowego klienta.
 
 ### Publikowanie aktualizacji klienta
 

@@ -52,12 +52,21 @@ impl RunningServer {
 }
 
 pub async fn start(config: ServerConfig) -> anyhow::Result<RunningServer> {
-    let identity = tls::load_or_create_identity(&config.data_dir)?;
-    let reset_key = tls::load_or_create_reset_key(&config.data_dir)?;
+    // A data_dir the server cannot write (a host directory owned by root, mounted into the
+    // container that runs as uid 65532) fails here; say what to fix.
+    let in_data_dir = |e: anyhow::Error| {
+        e.context(format!(
+            "data_dir {} must be writable by the server's user (Docker image: uid 65532, \
+             e.g. `sudo chown -R 65532:65532 data` on the host)",
+            config.data_dir.display()
+        ))
+    };
+    let identity = tls::load_or_create_identity(&config.data_dir).map_err(in_data_dir)?;
+    let reset_key = tls::load_or_create_reset_key(&config.data_dir).map_err(in_data_dir)?;
     let endpoint = bind_endpoint(quic_config(&identity)?, &reset_key, config.bind).await?;
     let dummy_hash =
         tokio::task::spawn_blocking(|| auth::hash_password("dummy-password-for-timing")).await?;
-    let store = store::Store::open(&config.data_dir.join("komunikator.db"))?;
+    let store = store::Store::open(&config.data_dir.join("komunikator.db")).map_err(in_data_dir)?;
     let report = store.import_config_users(&config.users, unix_now())?;
     if report.imported > 0 {
         tracing::info!(imported = report.imported, "accounts imported from the config");

@@ -54,14 +54,15 @@ Docker i dostęp do prywatnego ghcr.io (logowanie, `docker pull` obrazu `ghcr.io
 4. Uruchom serwer:
    ```
    cd /opt/komunikator
-   mkdir -p updates
+   mkdir -p data updates
+   sudo chown 65532:65532 data
    docker compose up -d
    docker compose logs komunikator
    ```
 
-W logu powinny być linie `listening: 0.0.0.0:7700` i `fingerprint: …` (64 znaki). Zanotuj odcisk: przyda się w kroku 5. Nie zmieni się, dopóki istnieje wolumen `komunikator-data`.
+W logu powinny być linie `listening: 0.0.0.0:7700` i `fingerprint: …` (64 znaki). Zanotuj odcisk: przyda się w kroku 5. Nie zmieni się, dopóki istnieje katalog `/opt/komunikator/data`.
 
-Podkatalog `updates` jest zamontowany w kontenerze tylko do odczytu. Trafiają do niego aktualizacje klienta (patrz „Kolejne wersje” niżej).
+Katalog `data` trzyma certyfikat i klucz serwera oraz bazę kont. To zwykły katalog na hoście, a nie wolumen Dockera, więc nie zniknie przy `docker compose down -v` ani `docker volume prune`. Należy do uid 65532, bo z tym użytkownikiem działa serwer. Rób jego kopię zapasową: `docs/wydanie.md`, sekcja „Administracja”. Podkatalog `updates` jest zamontowany w kontenerze tylko do odczytu. Trafiają do niego aktualizacje klienta (patrz „Kolejne wersje” niżej).
 
 ### 5. Wydanie klienta z wbudowanym serwerem
 

@@ -26,8 +26,8 @@ pub fn load_or_create_identity(dir: &Path) -> anyhow::Result<ServerIdentity> {
         let generated = rcgen::generate_simple_self_signed(vec![protocol_server_name()])?;
         let cert = generated.cert.der().to_vec();
         let key = generated.signing_key.serialize_der();
-        write_secret(&key_path, &key)?;
-        std::fs::write(&cert_path, &cert)?;
+        write_secret(&key_path, &key).with_context(|| format!("writing {}", key_path.display()))?;
+        std::fs::write(&cert_path, &cert).with_context(|| format!("writing {}", cert_path.display()))?;
         (cert, key)
     };
     let fingerprint = Sha256::digest(&cert).into();
@@ -50,7 +50,7 @@ pub fn load_or_create_reset_key(dir: &Path) -> anyhow::Result<[u8; 32]> {
     let mut key = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
         .map_err(|_| anyhow::anyhow!("system RNG failed"))?;
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     write_secret(&path, &key).with_context(|| format!("writing {}", path.display()))?;
     Ok(key)
 }

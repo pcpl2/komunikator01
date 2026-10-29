@@ -1,5 +1,5 @@
 # Serwer komunikatora: `docker compose up -d` w katalogu z tym plikiem, komunikator.toml
-# i podkatalogiem updates/ (może być pusty).
+# i podkatalogami data/ (właściciel uid 65532) oraz updates/ (może być pusty).
 # Obraz jest prywatny: Docker musi mieć dostęp do ghcr.io (zapewnia administrator serwera).
 services:
   komunikator:
@@ -9,7 +9,9 @@ services:
     ports:
       - "7700:7700/udp"
     volumes:
-      - komunikator-data:/data
+      # Certyfikat i klucz serwera, baza kont i pokoi: zwykły katalog na hoście, nie wolumen
+      # Dockera, więc nie zniknie przy `docker compose down -v` ani `docker volume prune`.
+      - ./data:/data
       # Aktualizacje klienta (manifest.bin + komunikator-X.Y.Z.exe): zwykłe pliki na hoście,
       # serwer tylko je czyta. Wgranie nowej wersji = skopiowanie plików do ./updates.
       - ./updates:/data/updates:ro
@@ -19,6 +21,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  komunikator-data:
