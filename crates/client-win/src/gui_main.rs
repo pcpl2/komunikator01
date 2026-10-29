@@ -15,6 +15,9 @@ struct Cli {
     /// Open the window and tray, run for a second, save settings and exit (self-test)
     #[arg(long)]
     smoke: bool,
+    /// Started by a self-update (shows the new version)
+    #[arg(long, hide = true)]
+    updated: bool,
 }
 
 #[cfg(windows)]
@@ -27,7 +30,8 @@ fn main() {
         )
         .init();
     let cli = Cli::parse();
-    let code = run(Options { minimized: cli.minimized, data_dir: cli.data_dir, smoke: cli.smoke });
+    let code =
+        run(Options { minimized: cli.minimized, data_dir: cli.data_dir, smoke: cli.smoke, updated: cli.updated });
     std::process::exit(code);
 }
 

@@ -821,7 +821,7 @@ fn random_session_id() -> u64 {
 }
 
 /// Prefers IPv4 when the name resolves to both families.
-async fn resolve(server: &str) -> Option<SocketAddr> {
+pub(crate) async fn resolve(server: &str) -> Option<SocketAddr> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(server).await.ok()?.collect();
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied()
 }

@@ -1,0 +1,4 @@
+# Klucz publiczny wydań (Ed25519): 64 znaki szesnastkowe w pierwszym wierszu, który nie jest komentarzem.
+# Przed zbudowaniem klientów wpisz tu klucz wypisany przez `komunikator-release keygen`.
+# Same zera wyłączają samoaktualizację.
+0000000000000000000000000000000000000000000000000000000000000000

@@ -7,3 +7,4 @@ pub mod chat;
 pub mod lobby;
 pub mod settings;
 pub mod app;
+pub mod update;

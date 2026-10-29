@@ -82,6 +82,10 @@ Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym
 - `Ustawienia…`: mikrofon i głośniki, czułość wykrywania mowy (z podglądem poziomu mikrofonu), skróty globalne `Wycisz mikrofon` / `Wycisz wszystkich` (wymagają Ctrl, Alt lub Shift; zajęty skrót okno pokazuje, a drugie `OK` zapisuje go mimo to), dźwięki, `Uruchamiaj z Windows`, `Uruchamiaj jako administrator` (gdy gra działa jako administrator i nie przepuszcza skrótów) oraz `Konto…` — zmiana konta łączy od nowa.
 - Opcje: `--minimized` (start w zasobniku), `--data-dir <katalog>` (zamiast `%APPDATA%\komunikator`), `--smoke` (autotest: okno na sekundę, zapis ustawień, wyjście).
 
+#### Aktualizacje
+
+Program sam pobiera nowe wersje ze swojego serwera: przy starcie (zanim się połączy), co 6 godzin i od razu, gdy serwer zgłosi niezgodną wersję programu. Przyjmuje tylko wydanie podpisane kluczem wbudowanym w program (`crates/client-win/release-key.pub`), ściśle nowsze od własnej wersji, o zgodnym rozmiarze i skrócie SHA-256; serwer nie ma klucza i nie może podsunąć niczego innego ani starszej wersji. Na pasku stanu widać `pobieranie aktualizacji…`, potem `aktualizacja gotowa — zostanie zainstalowana, gdy nie będziesz w rozmowie`. Instalacja czeka, aż nie będziesz w pokoju z inną osobą: wtedy program zapisuje ustawienia, kończy połączenie, podmienia plik `komunikator.exe` (nowy obok jako `komunikator.exe.new`, stary odkładany jako `komunikator.exe.old` i usuwany przy następnym starcie) i uruchamia się ponownie z komunikatem `zaktualizowano do wersji X`. Przy błędzie pojawia się `aktualizacja nieudana: <powód>`, a program działa dalej w starej wersji. Program musi leżeć w folderze, w którym możesz zapisywać pliki. Kompilacja z kluczem z samych zer (domyślny w repozytorium) nie aktualizuje się wcale. Kanał aktualizacji: [docs/updates.md](docs/updates.md).
+
 ### Wiersz poleceń: `komunikator-cli.exe`
 
 ```
@@ -111,6 +115,7 @@ Odebrane wiadomości wyglądają jak `[14:05] ala: tekst`; każdy adres (URL lub
 
 - `--list-devices` wypisuje urządzenia. Wybrane urządzenie ustawiasz przez `--capture-device <id>` i `--render-device <id>`; bez tych opcji używane są domyślne urządzenia komunikacyjne Windows.
 - `--data-dir <katalog>`: gdzie leżą `identity.bin` (tożsamość chroniona DPAPI), `known_devices.toml` i `settings.toml` (domyślnie `%APPDATA%\komunikator`, ten sam co dla okna).
+- `--check-update` sprawdza raz serwer (z `--server` i `--fingerprint`, z `--invite` albo zapamiętany w `settings.toml`), instaluje nowsze podpisane wydanie w miejsce `komunikator.exe` leżącego obok `komunikator-cli.exe`, wypisuje wynik i kończy działanie. Uruchomione okno przejdzie na nową wersję po ponownym starcie. Bez tej opcji `komunikator-cli` nigdy niczego nie aktualizuje.
 
 Dźwięk jest szyfrowany end-to-end: serwer nie może go odsłuchać. „Nowe urządzenie” oznacza, że znajomy ma nową tożsamość (np. nowy komputer): porównaj kod z nim głosowo. „Zmieniony klucz” (to samo urządzenie, inny klucz) to możliwe podszywanie się. Szczegóły i ograniczenia: [docs/e2e.md](docs/e2e.md).
 

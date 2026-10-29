@@ -9,6 +9,7 @@ pub mod pipeline;
 #[cfg(windows)]
 pub mod startup;
 pub mod supervisor;
+pub mod updater;
 #[cfg(windows)]
 pub mod ui;
 #[cfg(windows)]

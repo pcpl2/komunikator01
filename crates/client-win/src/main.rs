@@ -48,6 +48,10 @@ struct Cli {
     /// Print audio devices and exit
     #[arg(long)]
     list_devices: bool,
+    /// Update komunikator.exe next to this program from the server, if a newer signed release
+    /// is there, and exit (the server from --server/--fingerprint, --invite or settings.toml)
+    #[arg(long)]
+    check_update: bool,
 }
 
 #[cfg(windows)]
@@ -68,6 +72,9 @@ fn main() -> anyhow::Result<()> {
             println!("głośniki : {name}\n           {id}");
         }
         return Ok(());
+    }
+    if cli.check_update {
+        return check_update(&cli);
     }
     use client_core::net::session::Credentials;
     use client_core::settings::SettingsStore;
@@ -698,6 +705,68 @@ impl Roster {
         }
         warn_if_unsaved(trust);
         let _ = commands.send(SessionCommand::TrustChanged(id));
+    }
+}
+
+/// Checks the server once and installs a newer signed release over `komunikator.exe` next to
+/// this program. The release is the window program; this exe is never replaced.
+#[cfg(windows)]
+fn check_update(cli: &Cli) -> anyhow::Result<()> {
+    use client_core::update::{self, current_version, Decision};
+    use client_win::updater;
+
+    let Some(key) = updater::release_key() else {
+        println!("ta wersja nie ma klucza wydań — samoaktualizacja jest wyłączona");
+        return Ok(());
+    };
+    let (server, fingerprint) = update_server(cli)?;
+    let exe = std::env::current_exe()?.with_file_name("komunikator.exe");
+    updater::cleanup_on_start(&exe);
+    if !exe.is_file() {
+        anyhow::bail!("nie ma {} — aktualizowany jest program okienkowy obok komunikator-cli.exe", exe.display());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let current = current_version();
+    println!("sprawdzanie aktualizacji na {server} (Twoja wersja: {current})…");
+    let m = match rt.block_on(update::check(&server, fingerprint, &key, current)) {
+        Ok(Decision::UpToDate) => {
+            println!("brak nowszej wersji");
+            return Ok(());
+        }
+        Ok(Decision::Available(m)) => m,
+        Err(e) => anyhow::bail!("aktualizacja nieudana: {e}"),
+    };
+    println!("pobieranie wersji {}…", m.version);
+    let bytes = rt
+        .block_on(update::download(&server, fingerprint, &m))
+        .map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
+    updater::stage(&exe, &bytes).map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
+    updater::swap(&exe).map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
+    println!("zaktualizowano {} do wersji {}; uruchomiony komunikator zmieni się po ponownym starcie", exe.display(), m.version);
+    Ok(())
+}
+
+/// The server to update from: given on the command line (an invite carries one too), else the
+/// saved account's.
+#[cfg(windows)]
+fn update_server(cli: &Cli) -> anyhow::Result<(String, [u8; 32])> {
+    if let Some(code) = &cli.invite {
+        let invite = decode_invite(code).map_err(|_| anyhow::anyhow!("niepoprawny kod zaproszenia"))?;
+        return Ok((invite.server, invite.fingerprint));
+    }
+    if let (Some(server), Some(fp)) = (&cli.server, &cli.fingerprint) {
+        let fp = protocol::parse_fingerprint(fp).ok_or_else(|| anyhow::anyhow!("odcisk musi mieć 64 znaki szesnastkowe"))?;
+        return Ok((server.clone(), fp));
+    }
+    let data_dir = cli.data_dir.clone().unwrap_or_else(client_win::startup::default_data_dir);
+    let path = data_dir.join("settings.toml");
+    let (_, s, _) = client_core::settings::SettingsStore::load(&path);
+    match protocol::parse_fingerprint(&s.fingerprint) {
+        Some(fp) if !s.server.is_empty() => Ok((s.server, fp)),
+        _ => anyhow::bail!(
+            "brak zapisanego serwera w {}: podaj --server i --fingerprint albo --invite",
+            path.display()
+        ),
     }
 }
 

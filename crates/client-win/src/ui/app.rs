@@ -1,14 +1,18 @@
 //! The GUI's start and the glue between `AppState` and the outside world: session events in,
 //! effects out (session commands, gains, sounds, clipboard, settings file, trust store).
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use anyhow::Context;
 use client_core::app::{describe_fatal, Action, AppState, Effect, Status, View};
 use client_core::net::session::{Credentials, FatalReason, SessionCommand, SessionEvent};
 use client_core::settings::{Settings, SettingsStore};
+use client_core::update::{self, current_version, may_apply, Decision};
 use protocol::invite::encode_invite;
+use protocol::update::Version;
 use protocol::MemberId;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -25,9 +29,10 @@ use super::dialogs::{
 use super::instance;
 use super::sound::Sounds;
 use super::wide::wide;
-use super::window::{Start, Window, WM_APP_SESSION};
+use super::window::{Start, Window, WM_APP_SESSION, WM_APP_UPDATE};
 use crate::dpapi::{load_password, load_token, store_password, store_token};
 use crate::startup::{default_data_dir, start_client, Account, Audio, Client, Notice};
+use crate::updater;
 
 pub struct Options {
     /// Start hidden, in the tray.
@@ -35,6 +40,8 @@ pub struct Options {
     pub data_dir: Option<PathBuf>,
     /// Show window and tray, pump messages for a second, save settings and exit 0.
     pub smoke: bool,
+    /// Started by a self-update in place of the previous version.
+    pub updated: bool,
 }
 
 /// Runs the GUI to the end; returns the process exit code.
@@ -55,6 +62,9 @@ pub fn run(opts: Options) -> i32 {
         let Some(g) = claim() else { return 0 };
         _guard = g;
     }
+    // Before anything else: a swap cut short leaves no exe under the name autostart uses.
+    // The self-test never touches the exe next to it.
+    let updates = if opts.smoke { None } else { Updates::new() };
     let mut settings = settings;
     if let Some(b) = broken.filter(|_| !opts.smoke) {
         let text = match b {
@@ -100,7 +110,7 @@ pub fn run(opts: Options) -> i32 {
         }
     };
     // The exe may have moved since the entry was written (an update, another folder).
-    let mut startup_notice = None;
+    let mut startup_notice = opts.updated.then(|| format!("zaktualizowano do wersji {}", current_version()));
     if settings.autostart && !opts.smoke {
         if let Err(e) = set_autostart(true) {
             startup_notice = Some(format!("nie udało się odświeżyć uruchamiania z Windows: {e}"));
@@ -122,6 +132,7 @@ pub fn run(opts: Options) -> i32 {
         playback_lost_shown: false,
         register,
         login_prompt: None,
+        updates,
     };
 
     let window = match Window::create(app, Start { minimized: opts.minimized, smoke: opts.smoke }) {
@@ -131,6 +142,8 @@ pub fn run(opts: Options) -> i32 {
             return 1;
         }
     };
+    // Before the session: a client too old for the server still finds its update.
+    window.with_app(|app| app.check_update(window.hwnd()));
     let mut started = Err(String::new());
     window.with_app(|app| started = app.connect(window.hwnd()));
     let notices = match started {
@@ -165,8 +178,105 @@ pub fn run(opts: Options) -> i32 {
     window.with_app(App::shutdown);
     // Stops the forwarder before the window goes, so nothing posts to a dead handle.
     rt.shutdown_timeout(Duration::from_secs(1));
+    let mut restart = None;
+    window.with_app(|app| restart = app.installed_update());
     window.destroy();
+    if let Some(exe) = restart {
+        // The new copy must find the single-instance name free.
+        _guard = None;
+        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        if let Err(e) = updater::restart(&exe, &args) {
+            message_box(
+                None,
+                &format!(
+                    "Komunikator został zaktualizowany, ale nie udało się go uruchomić ponownie ({e}). \
+                     Uruchom go sam."
+                ),
+                MB_ICONWARNING,
+            );
+        }
+    }
     code
+}
+
+const UPDATE_DOWNLOADING: &str = "pobieranie aktualizacji…";
+const UPDATE_READY: &str = "aktualizacja gotowa — zostanie zainstalowana, gdy nie będziesz w rozmowie";
+
+/// What a background update check reports back to the window.
+enum UpdateMsg {
+    Downloading,
+    UpToDate,
+    Ready(Version),
+    Failed(String),
+}
+
+/// Hands update reports to the window thread and wakes it.
+struct UpdatePost {
+    tx: mpsc::Sender<UpdateMsg>,
+    /// HWND is not Send; posting only needs its value.
+    hwnd: usize,
+}
+
+impl UpdatePost {
+    fn send(&self, m: UpdateMsg) {
+        if self.tx.send(m).is_ok() {
+            let hwnd = HWND(self.hwnd as *mut _);
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_UPDATE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// Self-update state; absent when this build has no release key (or in the self-test).
+struct Updates {
+    key: [u8; 32],
+    exe: PathBuf,
+    tx: mpsc::Sender<UpdateMsg>,
+    rx: mpsc::Receiver<UpdateMsg>,
+    /// A check or download is running.
+    busy: bool,
+    /// Staged beside the exe, waiting until I am not in a conversation.
+    ready: Option<Version>,
+    /// Swapped in: the new exe starts once this one has closed.
+    installed: bool,
+}
+
+impl Updates {
+    fn new() -> Option<Updates> {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                tracing::warn!("self-update disabled: no exe path: {e}");
+                return None;
+            }
+        };
+        updater::cleanup_on_start(&exe);
+        let Some(key) = updater::release_key() else {
+            tracing::info!("self-update disabled: this build has no release key");
+            return None;
+        };
+        let (tx, rx) = mpsc::channel();
+        Some(Updates { key, exe, tx, rx, busy: false, ready: None, installed: false })
+    }
+}
+
+/// Checks the server for a newer signed release and stages it; the version staged, if any.
+async fn fetch_update(
+    server: &str,
+    fingerprint: [u8; 32],
+    key: &[u8; 32],
+    exe: &Path,
+    post: &UpdatePost,
+) -> anyhow::Result<Option<Version>> {
+    let Decision::Available(m) = update::check(server, fingerprint, key, current_version()).await? else {
+        return Ok(None);
+    };
+    post.send(UpdateMsg::Downloading);
+    let bytes = update::download(server, fingerprint, &m).await?;
+    let exe = exe.to_owned();
+    tokio::task::spawn_blocking(move || updater::stage(&exe, &bytes))
+        .await?
+        .context("nie udało się zapisać pobranego pliku")?;
+    Ok(Some(m.version))
 }
 
 /// What to log in with: a registration in progress, else the saved token, else the saved
@@ -331,6 +441,7 @@ pub struct App {
     register: Option<Registration>,
     /// The account form a failed login asks the window to open.
     login_prompt: Option<AccountForm>,
+    updates: Option<Updates>,
 }
 
 impl App {
@@ -496,6 +607,77 @@ impl App {
         }
     }
 
+    /// Looks for a newer release in the background, unless one is already being fetched or
+    /// waits to be installed.
+    pub fn check_update(&mut self, hwnd: HWND) {
+        let Some(u) = &mut self.updates else { return };
+        if u.busy || u.ready.is_some() || u.installed {
+            return;
+        }
+        let s = self.state.settings();
+        let target = match &self.register {
+            Some(r) => Some((r.invite.server.clone(), r.invite.fingerprint)),
+            None => protocol::parse_fingerprint(&s.fingerprint).map(|fp| (s.server.clone(), fp)),
+        };
+        let Some((server, fingerprint)) = target.filter(|(server, _)| !server.is_empty()) else { return };
+        u.busy = true;
+        let post = UpdatePost { tx: u.tx.clone(), hwnd: hwnd.0 as usize };
+        let (key, exe) = (u.key, u.exe.clone());
+        self.rt.spawn(async move {
+            let msg = match fetch_update(&server, fingerprint, &key, &exe, &post).await {
+                Ok(None) => UpdateMsg::UpToDate,
+                Ok(Some(v)) => UpdateMsg::Ready(v),
+                Err(e) => UpdateMsg::Failed(format!("{e}")),
+            };
+            post.send(msg);
+        });
+    }
+
+    /// Applies what the background update check reported.
+    pub fn drain_updates(&mut self) {
+        let Some(u) = &mut self.updates else { return };
+        while let Ok(m) = u.rx.try_recv() {
+            match m {
+                UpdateMsg::Downloading => self.local_notice = Some(UPDATE_DOWNLOADING.into()),
+                UpdateMsg::UpToDate => u.busy = false,
+                UpdateMsg::Ready(v) => {
+                    u.busy = false;
+                    u.ready = Some(v);
+                    self.local_notice = Some(UPDATE_READY.into());
+                }
+                UpdateMsg::Failed(why) => {
+                    u.busy = false;
+                    self.local_notice = Some(format!("aktualizacja nieudana: {why}"));
+                }
+            }
+        }
+    }
+
+    /// Puts a staged release in place of the exe once I am not in a conversation; true when
+    /// the program should now close (`run` then starts the new exe).
+    pub fn install_update_if_due(&mut self) -> bool {
+        let Some(u) = &mut self.updates else { return false };
+        if u.ready.is_none() || !may_apply(self.state.in_room_with_others()) {
+            return false;
+        }
+        u.ready = None;
+        match updater::swap(&u.exe) {
+            Ok(()) => {
+                u.installed = true;
+                true
+            }
+            Err(e) => {
+                self.local_notice = Some(format!("aktualizacja nieudana: {e}"));
+                false
+            }
+        }
+    }
+
+    /// The exe to start after closing, when an update was installed.
+    fn installed_update(&self) -> Option<PathBuf> {
+        self.updates.as_ref().filter(|u| u.installed).map(|u| u.exe.clone())
+    }
+
     /// Reads who is speaking; true when the view changed.
     pub fn poll_activity(&mut self) -> bool {
         let Some(c) = &mut self.client else { return false };
@@ -577,6 +759,7 @@ impl App {
                     }
                     self.command(SessionCommand::TrustChanged(id));
                 }
+                Effect::CheckUpdate => self.check_update(hwnd),
             }
         }
         self.sync_controls();

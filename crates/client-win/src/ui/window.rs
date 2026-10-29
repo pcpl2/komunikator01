@@ -43,9 +43,13 @@ use super::wide::{from_wide, scale, wide};
 /// Posted by the session forwarder when events are queued.
 pub const WM_APP_SESSION: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
+/// Posted by the background update check when it has something to report.
+pub const WM_APP_UPDATE: u32 = WM_APP + 3;
 
 const TIMER_ACTIVITY: usize = 1;
 const TIMER_SMOKE: usize = 2;
+const TIMER_UPDATE: usize = 3;
+const UPDATE_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
 const HOTKEY_MUTE: i32 = 1;
 const HOTKEY_DEAFEN: i32 = 2;
 
@@ -161,6 +165,8 @@ impl Window {
             }
             if start.smoke {
                 SetTimer(Some(hwnd), TIMER_SMOKE, 1000, None);
+            } else {
+                SetTimer(Some(hwnd), TIMER_UPDATE, UPDATE_EVERY_MS, None);
             }
             Ok(win)
         }
@@ -256,6 +262,7 @@ impl Window {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_ACTIVITY);
             let _ = KillTimer(Some(hwnd), TIMER_SMOKE);
+            let _ = KillTimer(Some(hwnd), TIMER_UPDATE);
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         hotkey::unregister(hwnd, HOTKEY_MUTE);
@@ -366,6 +373,7 @@ impl Window {
                         }
                     }
                     TIMER_SMOKE => unsafe { PostQuitMessage(0) },
+                    TIMER_UPDATE => self.with_app(|app| app.check_update(hwnd)),
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -383,10 +391,23 @@ impl Window {
                     inner.app.drain_events(hwnd);
                     self.draw(&mut inner);
                     drop(inner);
+                    // The lobby may have changed: a waiting update may install now.
+                    self.install_update();
                     self.login_prompt();
                 } else {
                     // Events stay queued; ask again once the current handler is done.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SESSION, WPARAM(0), LPARAM(0)) };
+                }
+                Some(LRESULT(0))
+            }
+            WM_APP_UPDATE => {
+                if let Ok(mut inner) = self.inner.try_borrow_mut() {
+                    inner.app.drain_updates();
+                    self.draw(&mut inner);
+                    drop(inner);
+                    self.install_update();
+                } else {
+                    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_UPDATE, WPARAM(0), LPARAM(0)) };
                 }
                 Some(LRESULT(0))
             }
@@ -564,8 +585,25 @@ impl Window {
         // Back to what the settings say, whether the dialog tried others or not.
         self.apply_hotkeys();
         self.redraw();
-        // A login that failed while the dialog was open asks now.
+        // A login that failed while the dialog was open asks now; so does a waiting update.
+        self.install_update();
         self.login_prompt();
+    }
+
+    /// Installs a waiting update when I am not in a conversation, then closes the program
+    /// (`run` starts the new exe). Never while a dialog is open: its own loop would end.
+    fn install_update(&self) {
+        if !unsafe { IsWindowEnabled(self.hwnd()) }.as_bool() {
+            return;
+        }
+        let mut close = false;
+        self.with_app(|app| close = app.install_update_if_due());
+        if close {
+            unsafe { PostQuitMessage(0) };
+        } else {
+            // A failed swap leaves a notice.
+            self.redraw();
+        }
     }
 
     /// The account dialog over `owner`; a changed account restarts the session.

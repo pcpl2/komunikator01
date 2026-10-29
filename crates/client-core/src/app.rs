@@ -56,6 +56,8 @@ pub enum Effect {
     /// Mark this device as verified (or accept its changed key) in the trust store, then
     /// tell the session. `name` is the raw username the store is keyed by.
     Trust { verify: bool, id: MemberId, name: String, identity: IdentityPublic },
+    /// The server speaks a newer protocol: a release for it may be waiting.
+    CheckUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +188,12 @@ impl AppState {
                 let secs = retry_in.as_secs() + u64::from(retry_in.subsec_nanos() > 0);
                 self.set_status(Status::Disconnected { retry_in_s: u32::try_from(secs).unwrap_or(u32::MAX) });
             }
-            SessionEvent::Fatal(reason) => self.set_status(Status::Fatal(describe_fatal(reason))),
+            SessionEvent::Fatal(reason) => {
+                if matches!(reason, FatalReason::VersionMismatch { .. }) {
+                    out.push(Effect::CheckUpdate);
+                }
+                self.set_status(Status::Fatal(describe_fatal(reason)));
+            }
             SessionEvent::MemberJoined(m) => {
                 let id = m.id;
                 let changes = self.lobby.as_mut().map(|l| l.member_joined(m)).unwrap_or_default();
@@ -343,6 +350,15 @@ impl AppState {
 
     pub fn deafened(&self) -> bool {
         self.view.deafened
+    }
+
+    /// In a conversation: connected, in a room together with at least one other member.
+    pub fn in_room_with_others(&self) -> bool {
+        // A session ended for good keeps its last lobby on screen, but nobody hears me there.
+        self.view.status == Status::Connected
+            && self.lobby.as_ref().is_some_and(|l| {
+                l.my_room().is_some() && l.members_in(l.my_room()).iter().any(|m| m.id != l.me())
+            })
     }
 
     fn room_changes(&mut self, changes: Vec<RoomChange>, out: &mut Vec<Effect>) {
@@ -1014,5 +1030,33 @@ mod tests {
         assert_eq!(s.on_event(SessionEvent::TokenIssued(crate::net::session::SessionToken([9; 32]))), vec![]);
         assert_eq!(s.on_event(SessionEvent::SignedInAs("Ala".into())), vec![]);
         assert_eq!(*s.view(), before);
+    }
+
+    #[test]
+    fn version_mismatch_triggers_update_check() {
+        let mut s = online();
+        let fx = s.on_event(SessionEvent::Fatal(FatalReason::VersionMismatch { server: 9 }));
+        assert_eq!(fx, vec![Effect::CheckUpdate]);
+        let mut s = online();
+        assert!(!s.on_event(SessionEvent::Fatal(FatalReason::BadCredentials)).contains(&Effect::CheckUpdate));
+    }
+
+    #[test]
+    fn in_room_with_others_follows_the_lobby() {
+        let mut s = state();
+        assert!(!s.in_room_with_others(), "not connected");
+        s.on_event(connected());
+        assert!(s.in_room_with_others(), "ola is in my room");
+        s.on_event(SessionEvent::MemberLeft(2));
+        assert!(!s.in_room_with_others(), "alone in my room");
+        s.on_event(SessionEvent::MemberMoved { id: 3, room: Some(10) });
+        assert!(s.in_room_with_others());
+        s.on_event(SessionEvent::MemberMoved { id: 1, room: None });
+        assert!(!s.in_room_with_others(), "in no room");
+        s.on_event(SessionEvent::Disconnected { retry_in: Duration::from_secs(1) });
+        assert!(!s.in_room_with_others());
+        let mut s = online();
+        s.on_event(SessionEvent::Fatal(FatalReason::SessionReplaced));
+        assert!(!s.in_room_with_others(), "the session is over");
     }
 }
