@@ -11,7 +11,9 @@ cargo build --release --workspace          # Windows: komunikator.exe (okno), ko
 cargo build --release -p server            # Debian: tylko serwer
 ```
 
-Wymagania: Rust (stable) i CMake (do zbudowania libopus).
+Wymagania: Rust (stable) i CMake (do zbudowania libopus). Klient jest linkowany ze statycznym CRT (`.cargo/config.toml`), więc `komunikator.exe` działa bez VC++ Redistributable.
+
+Wdrożenie serwera na Debianie (usługa systemd, firewall) i publikowanie wydań: [docs/wydanie.md](docs/wydanie.md); gotowe pliki w `deploy/`.
 
 ## Serwer
 

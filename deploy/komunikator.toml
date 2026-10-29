@@ -1,0 +1,7 @@
+# Konfiguracja produkcyjna serwera: /etc/komunikator/komunikator.toml
+# Adres i port UDP, na którym serwer nasłuchuje (otwórz go w firewallu).
+bind = "0.0.0.0:7700"
+# Certyfikat serwera, klucz prywatny i baza kont (komunikator.db). Katalog zakłada systemd (StateDirectory).
+data_dir = "/var/lib/komunikator"
+# Adres, który trafia do zaproszeń. Zmień na prawdziwy adres serwera.
+public_address = "serwer.example.pl:7700"
