@@ -9,13 +9,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use protocol::update::{Version, RELEASE_MARKER_PREFIX};
+use protocol::update::{Manifest, Version, RELEASE_MARKER_PREFIX};
 
 /// The release public key: 64 hex chars on the first line that is not a comment. All zeros
 /// (the committed placeholder) means this build does not update itself.
 pub const RELEASE_KEY: &str = include_str!("../release-key.pub");
 
 const UPDATED_FLAG: &str = "--updated";
+const MINIMIZED_FLAG: &str = "--minimized";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MARKER_KEY: &[u8] = b":KEY:";
@@ -143,14 +144,33 @@ pub fn stage(exe: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 /// Puts the staged release in place of the exe; on failure the exe is left as it was.
 pub fn swap(exe: &Path) -> io::Result<()> {
     let (old, new) = (beside(exe, ".old"), beside(exe, ".new"));
-    // Left by an earlier update; if it is still locked, the rename below fails cleanly.
-    let _ = fs::remove_file(&old);
-    fs::rename(exe, &old)?;
-    if let Err(e) = fs::rename(&new, exe) {
-        let _ = fs::rename(&old, exe);
+    // Replaces a copy left by an earlier update; if it is still locked, this fails cleanly.
+    rename_durably(exe, &old)?;
+    if let Err(e) = rename_durably(&new, exe) {
+        let _ = rename_durably(&old, exe);
         return Err(e);
     }
     Ok(())
+}
+
+/// A rename that is on disk when it returns, so a crash or power cut right after the first
+/// of the two renames still leaves `.old` for `cleanup_on_start` to put back.
+#[cfg(windows)]
+fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(from), wide(to));
+    unsafe {
+        MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    }
+    .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+}
+
+#[cfg(not(windows))]
+fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
 }
 
 /// Undoes a swap interrupted between its two renames, then removes what an update left.
@@ -169,11 +189,12 @@ pub fn cleanup_on_start(exe: &Path) {
     }
 }
 
-/// Starts the updated exe on its own, with the same arguments plus `--updated`; the caller
-/// then exits (after releasing anything the new copy needs, like the single-instance guard).
-pub fn restart(exe: &Path, args: &[OsString]) -> io::Result<()> {
+/// Starts the updated exe on its own, with the same arguments plus `--updated` (and
+/// `--minimized` when the window was out of sight); the caller then exits (after releasing
+/// anything the new copy needs, like the single-instance guard).
+pub fn restart(exe: &Path, args: &[OsString], minimized: bool) -> io::Result<()> {
     let mut cmd = Command::new(exe);
-    cmd.args(restart_args(args));
+    cmd.args(restart_args(args, minimized));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -183,8 +204,20 @@ pub fn restart(exe: &Path, args: &[OsString]) -> io::Result<()> {
     cmd.spawn().map(drop)
 }
 
-fn restart_args(args: &[OsString]) -> Vec<OsString> {
-    let mut out: Vec<OsString> = args.iter().filter(|a| *a != UPDATED_FLAG).cloned().collect();
+/// The exe already is the release `m` describes. Then installing it again would only restart
+/// into the same program: a build that misreports its version would loop forever.
+pub fn release_in_place(exe: &Path, m: &Manifest) -> bool {
+    fs::read(exe).is_ok_and(|bytes| client_core::update::check_file(m, &bytes))
+}
+
+/// The same arguments with `--updated` once, and `--minimized` once exactly when the window
+/// was hidden or minimised: a restart must not pop up over a game.
+fn restart_args(args: &[OsString], minimized: bool) -> Vec<OsString> {
+    let mut out: Vec<OsString> =
+        args.iter().filter(|a| *a != UPDATED_FLAG && *a != MINIMIZED_FLAG).cloned().collect();
+    if minimized {
+        out.push(MINIMIZED_FLAG.into());
+    }
     out.push(UPDATED_FLAG.into());
     out
 }
@@ -228,7 +261,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exe = exe(&dir);
         // Nothing staged: the second rename fails and the old exe goes back.
-        assert!(swap(&exe).is_err());
+        // A real OS error, so the player gets a readable reason.
+        assert_eq!(swap(&exe).unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(read(&exe), b"stary");
         assert!(!dir.path().join("komunikator.exe.old").exists());
     }
@@ -336,6 +370,34 @@ mod tests {
     #[test]
     fn restart_args_carry_the_updated_flag_once() {
         let args: Vec<OsString> = ["--minimized", "--updated", "--data-dir", "x"].map(OsString::from).into();
-        assert_eq!(restart_args(&args), ["--minimized", "--data-dir", "x", "--updated"].map(OsString::from));
+        assert_eq!(restart_args(&args, true), ["--data-dir", "x", "--minimized", "--updated"].map(OsString::from));
+    }
+
+    #[test]
+    fn restart_starts_minimized_when_the_window_was_out_of_sight() {
+        let os = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        // Hidden in the tray or minimised over a game: the new copy must not pop up.
+        assert_eq!(restart_args(&os(&["--data-dir", "x"]), true), os(&["--data-dir", "x", "--minimized", "--updated"]));
+        assert_eq!(restart_args(&os(&["--minimized", "--minimized"]), true), os(&["--minimized", "--updated"]));
+        // On screen: it comes back on screen, even if it was started minimised.
+        assert_eq!(restart_args(&os(&["--minimized", "--data-dir", "x"]), false), os(&["--data-dir", "x", "--updated"]));
+        assert_eq!(restart_args(&[], false), os(&["--updated"]));
+    }
+
+    #[test]
+    fn a_release_already_in_place_is_not_installed_again() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = exe(&dir);
+        let m = |bytes: &[u8]| Manifest {
+            version: Version { major: 9, minor: 9, patch: 9 },
+            file: "komunikator-9.9.9.exe".into(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        };
+        // The exe just started by an update is that release, whatever version it says it is.
+        assert!(release_in_place(&exe, &m(b"stary")));
+        assert!(!release_in_place(&exe, &m(b"nowy")));
+        assert!(!release_in_place(&dir.path().join("brak.exe"), &m(b"stary")));
     }
 }

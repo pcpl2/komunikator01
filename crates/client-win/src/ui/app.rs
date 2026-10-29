@@ -180,11 +180,11 @@ pub fn run(opts: Options) -> i32 {
     let mut restart = None;
     window.with_app(|app| restart = app.installed_update());
     window.destroy();
-    if let Some(exe) = restart {
+    if let Some((exe, minimized)) = restart {
         // The new copy must find the single-instance name free.
         _guard = None;
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-        if let Err(e) = updater::restart(&exe, &args) {
+        if let Err(e) = updater::restart(&exe, &args, minimized) {
             message_box(
                 None,
                 &format!(
@@ -258,6 +258,8 @@ struct Updates {
     ready: Option<Version>,
     /// Swapped in: the new exe starts once this one has closed.
     installed: bool,
+    /// The window was hidden or minimised when the update was installed.
+    restart_minimized: bool,
 }
 
 impl Updates {
@@ -278,7 +280,7 @@ impl Updates {
             return None;
         };
         let (tx, rx) = mpsc::channel();
-        Some(Updates { key, exe, tx, rx, busy: false, ready: None, installed: false })
+        Some(Updates { key, exe, tx, rx, busy: false, ready: None, installed: false, restart_minimized: false })
     }
 }
 
@@ -686,8 +688,9 @@ impl App {
     }
 
     /// Puts a staged release in place of the exe once I am not in a conversation; true when
-    /// the program should now close (`run` then starts the new exe).
-    pub fn install_update_if_due(&mut self, shown: Option<&str>) -> bool {
+    /// the program should now close (`run` then starts the new exe, minimised when the window
+    /// is `out_of_sight` now).
+    pub fn install_update_if_due(&mut self, shown: Option<&str>, out_of_sight: bool) -> bool {
         let Some(u) = &mut self.updates else { return false };
         if u.ready.is_none() || !may_apply(self.state.in_room_with_others()) {
             return false;
@@ -696,6 +699,7 @@ impl App {
         match updater::swap(&u.exe) {
             Ok(()) => {
                 u.installed = true;
+                u.restart_minimized = out_of_sight;
                 true
             }
             Err(e) => {
@@ -709,9 +713,9 @@ impl App {
         }
     }
 
-    /// The exe to start after closing, when an update was installed.
-    fn installed_update(&self) -> Option<PathBuf> {
-        self.updates.as_ref().filter(|u| u.installed).map(|u| u.exe.clone())
+    /// The exe to start after closing, when an update was installed, and whether minimised.
+    fn installed_update(&self) -> Option<(PathBuf, bool)> {
+        self.updates.as_ref().filter(|u| u.installed).map(|u| (u.exe.clone(), u.restart_minimized))
     }
 
     /// Reads who is speaking; true when the view changed.

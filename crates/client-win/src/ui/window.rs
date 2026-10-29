@@ -597,9 +597,12 @@ impl Window {
         if !unsafe { IsWindowEnabled(self.hwnd()) }.as_bool() {
             return;
         }
+        let hwnd = self.hwnd();
+        // Hidden in the tray or minimised (over a game): the new copy starts the same way.
+        let out_of_sight = unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() };
         let Ok(mut inner) = self.inner.try_borrow_mut() else { return };
         let shown = inner.render.notice().map(str::to_owned);
-        if inner.app.install_update_if_due(shown.as_deref()) {
+        if inner.app.install_update_if_due(shown.as_deref(), out_of_sight) {
             unsafe { PostQuitMessage(0) };
         } else {
             // A failed swap may leave a notice.

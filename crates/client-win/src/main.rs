@@ -49,7 +49,8 @@ struct Cli {
     #[arg(long)]
     list_devices: bool,
     /// Update komunikator.exe next to this program from the server, if a newer signed release
-    /// is there, and exit (the server from --server/--fingerprint, --invite or settings.toml)
+    /// is there, and exit (the server from --server/--fingerprint, --invite or settings.toml).
+    /// Close the window program (for the same --data-dir) first; it is refused while it runs
     #[arg(long)]
     check_update: bool,
 }
@@ -719,6 +720,11 @@ fn check_update(cli: &Cli) -> anyhow::Result<()> {
         println!("ta wersja nie ma klucza wydań — samoaktualizacja jest wyłączona");
         return Ok(());
     };
+    // The window program updates itself; two updaters would swap the same files.
+    let data_dir = cli.data_dir.clone().unwrap_or_else(client_win::startup::default_data_dir);
+    if client_win::ui::instance::running(&data_dir) {
+        anyhow::bail!("zamknij okno komunikatora przed aktualizacją z wiersza poleceń");
+    }
     let (server, fingerprint) = update_server(cli)?;
     let exe = std::env::current_exe()?.with_file_name("komunikator.exe");
     updater::cleanup_on_start(&exe);

@@ -8,7 +8,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WIN32_ERROR, WPARAM,
 };
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, PostMessageW, RegisterWindowMessageW,
 };
@@ -38,6 +38,20 @@ pub fn claim(data_dir: &Path) -> Option<InstanceGuard> {
         show_running();
     }
     guard
+}
+
+/// A window program is running for `data_dir`. Only looks: the name stays free for one that
+/// starts now.
+pub fn running(data_dir: &Path) -> bool {
+    let name = wide(&mutex_name(data_dir));
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            true
+        }
+        // An elevated copy's mutex may exist and still refuse to open.
+        Err(e) => WIN32_ERROR::from_error(&e) == Some(ERROR_ACCESS_DENIED),
+    }
 }
 
 /// The mutex alone: `None` when another copy holds it.
@@ -129,6 +143,18 @@ mod tests {
         assert!(try_claim(other.path()).is_some());
         drop(first);
         assert!(try_claim(dir.path()).is_some());
+    }
+
+    #[test]
+    fn running_sees_a_window_program_without_claiming_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!running(dir.path()));
+        // Looking must not take the name: a window program started now still gets it.
+        let guard = try_claim(dir.path());
+        assert!(guard.as_ref().is_some_and(|g| g.0.is_some()));
+        assert!(running(dir.path()));
+        drop(guard);
+        assert!(!running(dir.path()));
     }
 
     #[test]
