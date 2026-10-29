@@ -5,7 +5,9 @@
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, PostMessageW, RegisterWindowMessageW,
@@ -41,15 +43,39 @@ pub fn claim(data_dir: &Path) -> Option<InstanceGuard> {
 /// The mutex alone: `None` when another copy holds it.
 fn try_claim(data_dir: &Path) -> Option<InstanceGuard> {
     let name = wide(&mutex_name(data_dir));
-    // Without a mutex there is no guard; running twice beats not running at all.
-    let Ok(handle) = (unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }) else {
-        return Some(InstanceGuard(None));
+    let created = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
+    let code = match &created {
+        Ok(_) => Ok(unsafe { GetLastError() }),
+        Err(e) => Err(WIN32_ERROR::from_error(e).unwrap_or_default()),
     };
-    if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-        return Some(InstanceGuard(Some(handle)));
+    match (outcome(code), created) {
+        (Claimed::Ours, Ok(handle)) => Some(InstanceGuard(Some(handle))),
+        (Claimed::Running, Ok(handle)) => {
+            let _ = unsafe { CloseHandle(handle) };
+            None
+        }
+        (Claimed::Running, Err(_)) => None,
+        _ => Some(InstanceGuard(None)),
     }
-    let _ = unsafe { CloseHandle(handle) };
-    None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Claimed {
+    Ours,
+    Running,
+    /// No mutex at all; running twice beats not running at all.
+    NoGuard,
+}
+
+/// What `CreateMutexW` said: `Ok(last error)` with a handle, `Err(code)` without one.
+fn outcome(created: Result<WIN32_ERROR, WIN32_ERROR>) -> Claimed {
+    match created {
+        Ok(ERROR_ALREADY_EXISTS) => Claimed::Running,
+        Ok(_) => Claimed::Ours,
+        // An elevated copy's mutex carries its token's DACL; a non-elevated start may not open it.
+        Err(ERROR_ACCESS_DENIED) => Claimed::Running,
+        Err(_) => Claimed::NoGuard,
+    }
 }
 
 fn show_running() {
@@ -103,5 +129,15 @@ mod tests {
         assert!(try_claim(other.path()).is_some());
         drop(first);
         assert!(try_claim(dir.path()).is_some());
+    }
+
+    #[test]
+    fn mutex_held_by_an_elevated_copy_counts_as_running() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_NAME, ERROR_SUCCESS};
+        assert_eq!(outcome(Ok(ERROR_SUCCESS)), Claimed::Ours);
+        assert_eq!(outcome(Ok(ERROR_ALREADY_EXISTS)), Claimed::Running);
+        // A non-elevated start may not even open an elevated copy's mutex.
+        assert_eq!(outcome(Err(ERROR_ACCESS_DENIED)), Claimed::Running);
+        assert_eq!(outcome(Err(ERROR_INVALID_NAME)), Claimed::NoGuard);
     }
 }
