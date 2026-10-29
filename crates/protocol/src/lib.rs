@@ -5,9 +5,9 @@ pub mod control;
 pub mod framing;
 
 pub use control::{
-    hello_version, normalize_room_name, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
+    hello_version, normalize_room_name, normalize_username, ClientMsg, MemberId, MemberInfo, RejectReason, RoomChoice,
     RoomErrorReason, RoomId, RoomInfo, ServerMsg, DEFAULT_ROOM_NAME, MAX_CHAT_BLOB, MAX_ROOMS,
-    MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS,
+    MAX_ROOM_MEMBERS, MAX_ROOM_NAME_CHARS, MAX_USERNAME_CHARS,
 };
 pub use framing::{encode_frame, FrameDecoder, FrameError, MAX_FRAME};
 
@@ -70,6 +70,18 @@ mod tests {
         dec.push(&frame);
         assert!(dec.next::<ClientMsg>().is_err());
         assert_eq!(dec.front_body(), Some(&frame[4..]));
+    }
+
+    #[test]
+    fn username_rules() {
+        assert_eq!(normalize_username("Ala"), Some("Ala".to_string()));
+        assert_eq!(normalize_username("ża_1.x-y"), Some("ża_1.x-y".to_string()));
+        assert_eq!(normalize_username(""), None);
+        assert_eq!(normalize_username("a b"), None);
+        assert_eq!(normalize_username("a\u{202E}b"), None);
+        assert_eq!(normalize_username("a\u{0007}b"), None);
+        assert!(normalize_username(&"a".repeat(32)).is_some());
+        assert_eq!(normalize_username(&"a".repeat(33)), None);
     }
 
     #[test]

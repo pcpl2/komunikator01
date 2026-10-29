@@ -3,7 +3,12 @@ bind = "0.0.0.0:7700"
 # Katalog na certyfikat serwera (cert.der, key.der) i bazę pokoi (komunikator.db).
 data_dir = "/var/lib/komunikator"
 
-# Tymczasowa lista kont (do planu 4). Hash: `komunikator-server hash-password`.
+# Adres, który trafia do zaproszeń (opcjonalnie).
+# public_address = "serwer.example.pl:7700"
+
+# Nowe konta powstają z kodów zaproszeń wygenerowanych przez administratora.
+# Poniższa lista jest opcjonalna: wpisy są jednorazowo importowane do bazy
+# przy starcie (istniejące konta są pomijane). Hash: `komunikator-server hash-password`.
 [[users]]
 name = "ala"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$REPLACE"

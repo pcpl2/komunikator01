@@ -11,8 +11,12 @@ pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
+    /// Imported into the account store at start; new accounts come from invites.
     #[serde(default)]
     pub users: Vec<UserEntry>,
+    /// Address players put in invite links, e.g. `serwer.example.pl:7700`.
+    #[serde(default)]
+    pub public_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

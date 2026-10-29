@@ -24,6 +24,7 @@ pub fn config(dir: &tempfile::TempDir, port: u16) -> ServerConfig {
             .iter()
             .map(|n| UserEntry { name: n.to_string(), password_hash: hash_x(), admin: false })
             .collect(),
+        public_address: None,
     }
 }
 

@@ -27,6 +27,7 @@ async fn start_server(dir: &tempfile::TempDir) -> RunningServer {
         bind: "127.0.0.1:0".parse().unwrap(),
         data_dir: dir.path().to_owned(),
         users,
+        public_address: None,
     };
     server::start(config).await.unwrap()
 }

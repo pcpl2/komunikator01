@@ -95,6 +95,7 @@ pub enum RejectReason {
 pub type RoomId = u32;
 
 pub const MAX_ROOM_NAME_CHARS: usize = 32;
+pub const MAX_USERNAME_CHARS: usize = 32;
 pub const MAX_ROOMS: usize = 50;
 pub const MAX_ROOM_MEMBERS: usize = 20;
 /// Largest sealed chat blob the server will forward.
@@ -138,6 +139,19 @@ pub fn normalize_room_name(name: &str) -> Option<String> {
     if name.is_empty()
         || name.chars().count() > MAX_ROOM_NAME_CHARS
         || name.chars().any(|c| c.is_control() || is_bidi_control(c))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Trims the name; `None` unless it is 1..=32 chars of letters (any script), digits, `_`, `-`, `.`.
+/// Whitespace, control and bidi characters are never allowed.
+pub fn normalize_username(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_USERNAME_CHARS
+        || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return None;
     }
