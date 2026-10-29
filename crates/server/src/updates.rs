@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,11 +78,22 @@ impl Host {
     }
 
     async fn manifest(&self) -> Option<Vec<u8>> {
-        let file = tokio::fs::File::open(self.dir.join("manifest.bin")).await.ok()?;
-        let mut bytes = Vec::new();
+        let (file, len) = open_regular(&self.dir.join("manifest.bin"), MAX_MANIFEST as u64).await?;
+        let mut bytes = Vec::with_capacity(len as usize);
         file.take(MAX_MANIFEST as u64 + 1).read_to_end(&mut bytes).await.ok()?;
         (bytes.len() <= MAX_MANIFEST).then_some(bytes)
     }
+}
+
+/// Opens a regular file of at most `max` bytes; a symlink is never followed.
+async fn open_regular(path: &Path, max: u64) -> Option<(tokio::fs::File, u64)> {
+    let meta = tokio::fs::symlink_metadata(path).await.ok()?;
+    if !meta.is_file() || meta.len() > max {
+        return None;
+    }
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let len = file.metadata().await.ok()?.len();
+    (len <= max).then_some((file, len))
 }
 
 enum Request {
@@ -105,18 +116,23 @@ pub(crate) async fn serve(conn: Connection, host: Arc<Host>) {
         conn.close(VarInt::from_u32(CLOSE_BUSY), b"busy");
         return;
     };
-    let Ok(Ok((mut send, mut recv))) = timeout(REQUEST_TIMEOUT, conn.accept_bi()).await else { return };
-    let req = match timeout(REQUEST_TIMEOUT, recv.read_to_end(MAX_REQUEST)).await {
-        Ok(Ok(bytes)) => parse(&bytes),
-        Ok(Err(_)) => None,
-        Err(_) => return,
+    let read = async {
+        let (send, mut recv) = conn.accept_bi().await.ok()?;
+        Some((send, recv.read_to_end(MAX_REQUEST).await.ok().and_then(|b| parse(&b))))
     };
+    let Ok(Some((mut send, req))) = timeout(REQUEST_TIMEOUT, read).await else { return };
+    // One request per connection: the peer may open nothing more to make the server buffer.
+    conn.set_max_concurrent_bi_streams(VarInt::from_u32(0));
+    conn.set_max_concurrent_uni_streams(VarInt::from_u32(0));
     let Some(req) = req else {
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL), b"protocol violation");
         return;
     };
     let (kind, sent) = match req {
-        Request::Manifest => ("manifest", send_manifest(&mut send, &host).await),
+        // A peer that never reads must not hold its slot: every reply has a deadline.
+        Request::Manifest => {
+            ("manifest", timeout(REQUEST_TIMEOUT, send_manifest(&mut send, &host)).await.unwrap_or(Err(())))
+        }
         Request::File(name) => {
             ("file", timeout(TRANSFER_TIMEOUT, send_file(&mut send, &host, &name)).await.unwrap_or(Err(())))
         }
@@ -151,9 +167,7 @@ async fn open_release(host: &Host, name: &[u8]) -> Option<(tokio::fs::File, u64)
     if named.as_bytes() != name || !plain_file_name(&named) {
         return None;
     }
-    let file = tokio::fs::File::open(host.dir.join(&named)).await.ok()?;
-    let meta = file.metadata().await.ok()?;
-    (meta.is_file() && meta.len() <= MAX_RELEASE_SIZE).then_some((file, meta.len()))
+    open_regular(&host.dir.join(&named), MAX_RELEASE_SIZE).await
 }
 
 /// Streams the file in chunks; length 0 when it may not or cannot be served.

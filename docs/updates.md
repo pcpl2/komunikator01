@@ -12,7 +12,7 @@ Klucz podpisujący wydania (Ed25519) jest przechowywany offline i nigdy nie traf
 - Bez logowania.
 - Jedno żądanie na połączenie: klient otwiera jeden dwukierunkowy strumień, wysyła żądanie i zamyka swoją stronę strumienia; serwer odpowiada, zamyka swoją stronę i kończy połączenie.
 - Niepoprawne żądanie (nieznany rodzaj, zła długość, nadmiarowe bajty) serwer kończy zamknięciem połączenia z kodem 2, bez odpowiedzi.
-- Limity: najwyżej 4 jednoczesne połączenia aktualizacji z jednego adresu IP i 20 łącznie; nadmiarowe połączenie jest od razu zamykane z kodem 3. Żądanie musi przyjść w ciągu 10 s, a przesłanie pliku trwa najwyżej 10 minut.
+- Limity: najwyżej 4 jednoczesne połączenia aktualizacji z jednego adresu IP i 20 łącznie; nadmiarowe połączenie jest od razu zamykane z kodem 3. Otwarcie strumienia i całe żądanie muszą zmieścić się w 10 s od nawiązania połączenia, odpowiedź z manifestem w kolejnych 10 s, a przesłanie pliku trwa najwyżej 10 minut; klient, który nie odbiera danych, traci połączenie po tym czasie. Po odczytaniu żądania serwer nie pozwala otworzyć kolejnych strumieni.
 
 ## Żądania i odpowiedzi
 
@@ -29,7 +29,7 @@ Odpowiedź na żądanie pliku: długość (u64) i tyle bajtów pliku. Serwer wys
 
 - nazwa jest dokładnie równa polu `file` bieżącego manifestu (odczytanemu bez sprawdzania podpisu),
 - nazwa jest „zwykła”: 1–64 znaki `[A-Za-z0-9._-]`, nie zaczyna się od kropki (`plain_file_name`), więc nigdy nie jest ścieżką,
-- plik `data_dir/updates/<nazwa>` istnieje, jest zwykłym plikiem i ma najwyżej 64 MiB (`MAX_RELEASE_SIZE`).
+- plik `data_dir/updates/<nazwa>` istnieje, jest zwykłym plikiem (nie dowiązaniem symbolicznym; dowiązań serwer nie podąża, dotyczy to też `manifest.bin`) i ma najwyżej 64 MiB (`MAX_RELEASE_SIZE`).
 
 W każdym innym przypadku odpowiedzią jest długość 0. Serwer nie czyta żadnej innej ścieżki niż `manifest.bin` i plik nazwany w manifeście. Plik jest wysyłany kawałkami po 64 KiB, bez wczytywania całości do pamięci. Jeśli plik skurczy się w trakcie wysyłania, serwer przerywa strumień (reset) zamiast udawać kompletną odpowiedź; klient i tak sprawdza rozmiar i skrót.
 

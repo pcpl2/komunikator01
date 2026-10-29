@@ -122,7 +122,7 @@ pub fn unverified_file_name(bytes: &[u8]) -> Option<String> {
     (rest.is_empty() && body_rest.is_empty()).then_some(m.file)
 }
 
-/// Strictly greater:equal or older is never an update (no downgrade).
+/// Strictly greater: equal or older is never an update (no downgrade).
 pub fn is_newer(candidate: Version, current: Version) -> bool {
     candidate > current
 }

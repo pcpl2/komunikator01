@@ -200,3 +200,92 @@ async fn update_connections_are_limited() {
     assert!(served, "a freed slot must be reusable");
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn forward_slash_names_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    publish(dir.path(), "../x");
+    std::fs::write(dir.path().join("x"), b"secret").unwrap();
+    assert_eq!(fetch(&srv, &file_request("../x")).await, EMPTY_FILE);
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_manifest_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let mut big = publish(dir.path(), "a.exe");
+    big.resize(4097, 0);
+    std::fs::write(dir.path().join("updates").join("manifest.bin"), &big).unwrap();
+    std::fs::write(dir.path().join("updates").join("a.exe"), b"a").unwrap();
+    assert_eq!(fetch(&srv, &[1]).await, [0, 0, 0, 0]);
+    assert_eq!(fetch(&srv, &file_request("a.exe")).await, EMPTY_FILE);
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn overlong_request_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    let (_endpoint, conn) = update_conn(srv.local_addr(), srv.fingerprint()).await;
+    let mut req = file_request(&"a".repeat(255));
+    req.push(0);
+    assert_eq!(req.len(), 258);
+    assert_eq!(request(&conn, &req).await, None);
+    srv.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_release_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    publish(dir.path(), "a.exe");
+    std::fs::write(dir.path().join("secret"), b"secret").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("secret"), dir.path().join("updates").join("a.exe")).unwrap();
+    assert_eq!(fetch(&srv, &file_request("a.exe")).await, EMPTY_FILE);
+    srv.shutdown().await;
+}
+
+/// A client that never lets the server send (stream window 0) must not keep its slot.
+#[tokio::test]
+async fn stalled_reader_releases_its_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(&dir).await;
+    publish(dir.path(), "a.exe");
+    let (addr, fp) = (srv.local_addr(), srv.fingerprint());
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut cfg = client_core::net::client_config_with_alpn(fp, UPDATE_ALPN).unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(0));
+        transport.keep_alive_interval(Some(Duration::from_millis(500)));
+        cfg.transport_config(std::sync::Arc::new(transport));
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, client_core::net::SERVER_NAME).unwrap().await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[1]).await.unwrap();
+        send.finish().unwrap();
+        stalled.push((endpoint, conn, send, recv));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_e, extra) = update_conn(addr, fp).await;
+    assert_eq!(request(&extra, &[1]).await, None, "slots are taken by the stalled readers");
+
+    let start = std::time::Instant::now();
+    let served = loop {
+        let (_e, conn) = update_conn(addr, fp).await;
+        if request(&conn, &[1]).await.is_some() {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(served, "stalled readers must give their slots back");
+    drop(stalled);
+    srv.shutdown().await;
+}
