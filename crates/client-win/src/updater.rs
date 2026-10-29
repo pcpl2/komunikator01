@@ -9,13 +9,71 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use protocol::update::Version;
+use protocol::update::{Version, RELEASE_MARKER_PREFIX};
 
 /// The release public key: 64 hex chars on the first line that is not a comment. All zeros
 /// (the committed placeholder) means this build does not update itself.
 pub const RELEASE_KEY: &str = include_str!("../release-key.pub");
 
 const UPDATED_FLAG: &str = "--updated";
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const MARKER_KEY: &[u8] = b":KEY:";
+pub const MARKER_LEN: usize = RELEASE_MARKER_PREFIX.len() + VERSION.len() + MARKER_KEY.len() + 64 + 1;
+
+/// `KOMUNIKATOR-RELEASE:<version>:KEY:<release key hex>\0`, built at compile time. Only the
+/// window program embeds it (gui_main), so `komunikator-release sign` refuses any other exe,
+/// takes the version from it and checks that the build trusts the signing key.
+pub const fn release_marker() -> [u8; MARKER_LEN] {
+    let mut out = [0u8; MARKER_LEN];
+    let at = put(&mut out, 0, RELEASE_MARKER_PREFIX.as_bytes());
+    let at = put(&mut out, at, VERSION.as_bytes());
+    let at = put(&mut out, at, MARKER_KEY);
+    put(&mut out, at, &key_line(RELEASE_KEY.as_bytes()));
+    // The last byte stays 0: the terminator.
+    out
+}
+
+const fn put(out: &mut [u8; MARKER_LEN], at: usize, src: &[u8]) -> usize {
+    let mut i = 0;
+    while i < src.len() {
+        out[at + i] = src[i];
+        i += 1;
+    }
+    at + src.len()
+}
+
+/// The key line of `release-key.pub` (as `parse_release_key` finds it), lowercase. A malformed
+/// file stops the build instead of producing a program that silently never updates.
+const fn key_line(text: &[u8]) -> [u8; 64] {
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start;
+        while end < text.len() && text[end] != b'\n' {
+            end += 1;
+        }
+        let (mut a, mut b) = (start, end);
+        while a < b && text[a].is_ascii_whitespace() {
+            a += 1;
+        }
+        while b > a && text[b - 1].is_ascii_whitespace() {
+            b -= 1;
+        }
+        if a < b && text[a] != b'#' {
+            assert!(b - a == 64, "release-key.pub: the key must be 64 hex characters");
+            let mut out = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                assert!(text[a + i].is_ascii_hexdigit(), "release-key.pub: the key must be 64 hex characters");
+                out[i] = text[a + i].to_ascii_lowercase();
+                i += 1;
+            }
+            return out;
+        }
+        start = end + 1;
+    }
+    panic!("release-key.pub: no key line")
+}
 
 /// The built-in key, or `None` when updates are disabled.
 pub fn release_key() -> Option<[u8; 32]> {
@@ -211,6 +269,19 @@ mod tests {
         // The built-in file is well formed: a real key or the placeholder.
         let line = RELEASE_KEY.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'));
         assert!(line.and_then(protocol::parse_fingerprint).is_some(), "release-key.pub: {RELEASE_KEY:?}");
+    }
+
+    #[test]
+    fn release_marker_names_this_version_and_key() {
+        let line = RELEASE_KEY.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap();
+        let expected = format!(
+            "{RELEASE_MARKER_PREFIX}{}:KEY:{}\0",
+            env!("CARGO_PKG_VERSION"),
+            line.to_ascii_lowercase()
+        );
+        assert_eq!(&release_marker()[..], expected.as_bytes());
+        let text = format!("# komentarz ze znakiem #\r\n\r\n  {}\r\n{ZEROS}\n", "AB".repeat(32));
+        assert_eq!(&key_line(text.as_bytes())[..], "ab".repeat(32).as_bytes());
     }
 
     #[test]

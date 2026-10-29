@@ -21,14 +21,16 @@ enum Cmd {
         #[arg(long)]
         key: PathBuf,
     },
-    /// Podpisuje exe i zapisuje wydanie (exe + manifest.bin) w katalogu wyjściowym
+    /// Podpisuje komunikator.exe (program okienkowy) i zapisuje wydanie (exe + manifest.bin)
+    /// w katalogu wyjściowym. Wersję i klucz publiczny odczytuje ze znacznika wbudowanego w exe.
     Sign {
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
         exe: PathBuf,
+        /// Opcjonalne sprawdzenie: musi się zgadzać z wersją wbudowaną w exe
         #[arg(long)]
-        version: String,
+        version: Option<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -48,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Public { key } => println!("{}", release::public_hex(&key)?),
         Cmd::Sign { key, exe, version, out } => {
-            let m = release::sign(&key, &exe, &version, &out)?;
+            let m = release::sign(&key, &exe, version.as_deref(), &out)?;
             println!("Podpisano wersję {} ({} bajtów).", m.version, m.size);
             println!(
                 "Wgraj {} i manifest.bin z katalogu {} do data_dir/updates/ na serwerze.",

@@ -45,8 +45,8 @@ SignedManifest { body: Vec<u8>, signature: ([u8; 32], [u8; 32]) }
 
 ## Publikowanie wydania
 
-1. Na komputerze z kluczem offline: `komunikator-release sign --key <klucz> --exe <exe> --version <x.y.z> --out <katalog>` zapisuje do katalogu wyjściowego exe pod nazwą wydania oraz `manifest.bin`.
-2. Wgraj oba pliki do `data_dir/updates/` na serwerze. Najpierw plik wydania, potem `manifest.bin`, żeby klient nigdy nie dostał manifestu wskazującego na brakujący plik.
+1. Na komputerze z kluczem offline: `komunikator-release sign --key <klucz> --exe komunikator.exe --out <katalog>` zapisuje do katalogu wyjściowego exe pod nazwą wydania oraz `manifest.bin`. Program okienkowy ma wbudowany znacznik `KOMUNIKATOR-RELEASE:<x.y.z>:KEY:<klucz publiczny hex>\0`; narzędzie podpisuje tylko exe z takim znacznikiem, bierze z niego wersję (opcjonalne `--version` musi się zgadzać) i wymaga, by wbudowany klucz był kluczem podpisującym. Dzięki temu nie da się podpisać innego programu, exe pod innym numerem wersji niż jego własny (zapomniane podbicie wersji kończy się wydaniem, które klienci po prostu pomijają, a nie pętlą instalacji) ani kompilacji z kluczem z samych zer.
+2. Wgraj oba pliki do `data_dir/updates/` na serwerze. Najpierw plik wydania, potem `manifest.bin` jako `manifest.bin.tmp`, który na końcu przenosisz (`mv`) na `manifest.bin`: klient nigdy nie dostanie manifestu wskazującego na brakujący plik ani niepełnego manifestu. Przykład: [docs/wydanie.md](wydanie.md).
 
 Serwer czyta pliki przy każdym żądaniu, więc restart nie jest potrzebny.
 

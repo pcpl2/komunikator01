@@ -20,10 +20,15 @@ struct Cli {
     updated: bool,
 }
 
+/// Lets `komunikator-release sign` recognise this program and read its version and key.
+static RELEASE_MARKER: [u8; client_win::updater::MARKER_LEN] = client_win::updater::release_marker();
+
 #[cfg(windows)]
 fn main() {
     use client_win::ui::app::{run, Options};
 
+    // Kept in the binary through LTO and strip.
+    std::hint::black_box(&RELEASE_MARKER);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -37,6 +42,7 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
+    std::hint::black_box(&RELEASE_MARKER);
     let _ = Cli::parse();
     eprintln!("komunikator działa tylko na Windows");
 }

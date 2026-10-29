@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub const UPDATE_ALPN: &[u8] = b"komunikator-update/1";
 pub const MAX_MANIFEST: usize = 4096;
 pub const MAX_RELEASE_SIZE: u64 = 64 * 1024 * 1024;
+/// Starts the marker built into the window program: `<prefix><x.y.z>:KEY:<release key hex>\0`.
+/// The release tool signs only an exe that carries it, with its version and the signing key.
+pub const RELEASE_MARKER_PREFIX: &str = "KOMUNIKATOR-RELEASE:";
 /// Domain separation so a release signature can never be replayed as another kind of signature.
 const DOMAIN: &[u8] = b"komunikator/release/v1";
 
