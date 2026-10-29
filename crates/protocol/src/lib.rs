@@ -4,6 +4,7 @@ pub mod audio;
 pub mod control;
 pub mod framing;
 pub mod invite;
+pub mod update;
 
 pub use control::{
     hello_version, normalize_room_name, normalize_username, Auth, ClientMsg, MemberId, MemberInfo, RejectReason,
