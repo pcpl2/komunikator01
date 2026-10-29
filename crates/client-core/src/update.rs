@@ -17,8 +17,10 @@ use tokio::time::timeout;
 use crate::net::session::resolve;
 use crate::net::{client_config_with_alpn, SERVER_NAME};
 
-/// For each request, connection included.
+/// For each request, connection included; a file gets more, by its size.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The slowest link a release download should still finish on (bytes per second).
+const MIN_RATE: u64 = 100_000;
 const REQ_MANIFEST: u8 = 1;
 const REQ_FILE: u8 = 2;
 
@@ -48,9 +50,44 @@ impl fmt::Display for CheckError {
 
 impl std::error::Error for CheckError {}
 
+/// Checked when building: a crate version that is not `x.y.z` (like `0.2.0-rc1`) fails the
+/// build instead of the update check at run time.
+const CURRENT: Version = match parse_build_version(env!("CARGO_PKG_VERSION")) {
+    Some(v) => v,
+    None => panic!("the workspace version must be x.y.z (digits only): releases are numbered so"),
+};
+
 /// This build's version, as releases are numbered.
 pub fn current_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is major.minor.patch")
+    CURRENT
+}
+
+/// `Version::parse` usable at compile time.
+const fn parse_build_version(s: &str) -> Option<Version> {
+    let b = s.as_bytes();
+    let mut parts = [0u32; 3];
+    let (mut part, mut digits, mut i) = (0, 0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'0'..=b'9' => {
+                parts[part] = parts[part] * 10 + (b[i] - b'0') as u32;
+                digits += 1;
+                if parts[part] > u16::MAX as u32 {
+                    return None;
+                }
+            }
+            b'.' if digits > 0 && part < 2 => {
+                part += 1;
+                digits = 0;
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    if part != 2 || digits == 0 {
+        return None;
+    }
+    Some(Version { major: parts[0] as u16, minor: parts[1] as u16, patch: parts[2] as u16 })
 }
 
 /// Only a strictly newer release is an update: a hostile server cannot downgrade.
@@ -74,7 +111,7 @@ pub fn may_apply(in_room_with_others: bool) -> bool {
 
 /// The server's signed manifest, unverified; `None` when it publishes no release.
 pub async fn fetch_manifest(server: &str, fingerprint: [u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
-    let bytes = request(server, fingerprint, &[REQ_MANIFEST], 4, MAX_MANIFEST as u64).await?;
+    let bytes = request(server, fingerprint, &[REQ_MANIFEST], 4, MAX_MANIFEST as u64, TIMEOUT).await?;
     Ok((!bytes.is_empty()).then_some(bytes))
 }
 
@@ -82,7 +119,7 @@ pub async fn fetch_manifest(server: &str, fingerprint: [u8; 32]) -> anyhow::Resu
 pub async fn fetch_file(server: &str, fingerprint: [u8; 32], name: &str, max: u64) -> anyhow::Result<Vec<u8>> {
     let len = u8::try_from(name.len()).map_err(|_| anyhow!("za długa nazwa pliku wydania"))?;
     let req = [&[REQ_FILE, len][..], name.as_bytes()].concat();
-    let bytes = request(server, fingerprint, &req, 8, max).await?;
+    let bytes = request(server, fingerprint, &req, 8, max, file_timeout(max)).await?;
     if bytes.is_empty() {
         bail!("serwer nie udostępnia pliku wydania");
     }
@@ -123,9 +160,21 @@ fn describe(e: UpdateError) -> &'static str {
     }
 }
 
-/// One request on a fresh connection; returns the body after its `len_bytes` little-endian
-/// length, refusing anything longer than `max`.
-async fn request(server: &str, fingerprint: [u8; 32], req: &[u8], len_bytes: usize, max: u64) -> anyhow::Result<Vec<u8>> {
+/// Time for the whole download of a file of `size` bytes, connection included.
+fn file_timeout(size: u64) -> Duration {
+    TIMEOUT + Duration::from_secs(size / MIN_RATE)
+}
+
+/// One request on a fresh connection, within `limit`; returns the body after its `len_bytes`
+/// little-endian length, refusing anything longer than `max`.
+async fn request(
+    server: &str,
+    fingerprint: [u8; 32],
+    req: &[u8],
+    len_bytes: usize,
+    max: u64,
+    limit: Duration,
+) -> anyhow::Result<Vec<u8>> {
     let work = async {
         let (_endpoint, conn) = connect(server, fingerprint).await?;
         let result = exchange(&conn, req, len_bytes, max).await;
@@ -133,7 +182,7 @@ async fn request(server: &str, fingerprint: [u8; 32], req: &[u8], len_bytes: usi
         result
     };
     // Dropping the unfinished work on timeout drops its connection too.
-    timeout(TIMEOUT, work).await.map_err(|_| anyhow!("serwer nie odpowiedział na czas"))?
+    timeout(limit, work).await.map_err(|_| anyhow!("serwer nie odpowiedział na czas"))?
 }
 
 async fn connect(server: &str, fingerprint: [u8; 32]) -> anyhow::Result<(Endpoint, Connection)> {
@@ -208,5 +257,20 @@ mod tests {
     #[test]
     fn current_version_is_the_crate_version() {
         assert_eq!(current_version().to_string(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn the_build_time_version_parser_agrees_with_the_manifest_one() {
+        for s in ["0.1.0", "1.2.3", "65535.0.10", "1.2", "1.2.3.4", "0.2.0-rc1", "1..3", "", "70000.0.0", "a.b.c", "1.2.3 "] {
+            assert_eq!(parse_build_version(s), Version::parse(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_large_file_gets_time_to_arrive() {
+        assert_eq!(file_timeout(0), Duration::from_secs(30));
+        assert_eq!(file_timeout(1_000_000), Duration::from_secs(40));
+        // The largest release still has its whole transfer at 100 kB/s.
+        assert!(file_timeout(MAX_RELEASE_SIZE) >= Duration::from_secs(30 + MAX_RELEASE_SIZE / 100_000));
     }
 }
