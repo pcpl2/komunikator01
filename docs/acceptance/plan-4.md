@@ -17,5 +17,7 @@ Maszyna deweloperska: Windows 11, **bez mikrofonu**. Testy automatyczne obejmuj�
 11. **Zmiana konta:** `Ustawienia…` → `Konto…`, zmiana nazwy użytkownika → program łączy się od nowa jako ta osoba.
 12. **Zasoby przez 2 godziny rozmowy:** Menedżer zadań, karta Szczegóły: `komunikator.exe` ma < 30 MB pamięci (zestaw roboczy) i < 1 % CPU przez całą 2-godzinną sesję, także przy zminimalizowanym oknie.
 13. **Dźwięk gry nie jest ściszany:** w trakcie rozmowy dźwięk gry ma tę samą głośność co bez komunikatora (Windows nie włącza „ściszania komunikacji”).
+14. **Drugie uruchomienie:** uruchom program drugi raz, gdy siedzi w zasobniku → pokazuje się istniejące okno, nie ma drugiej ikony.
+15. **Ikona w zasobniku po zmianie DPI:** przeciągnij okno na monitor z innym skalowaniem, wycisz skrótem → ikona w zasobniku robi się czerwona.
 
 Wyniki: _do uzupełnienia_.

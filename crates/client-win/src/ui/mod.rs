@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod dialogs;
 pub mod hotkey;
 pub mod icons;
+mod instance;
 mod layout;
 mod render;
 pub mod sound;

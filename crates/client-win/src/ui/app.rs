@@ -2,11 +2,10 @@
 //! effects out (session commands, gains, sounds, clipboard, settings file, trust store).
 
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::Duration;
 
-use client_core::app::{Action, AppState, Effect, View};
-use client_core::audio::activity::Activity;
+use client_core::app::{Action, AppState, Effect, Status, View};
 use client_core::net::session::{SessionCommand, SessionEvent};
 use client_core::settings::{Settings, SettingsStore};
 use protocol::MemberId;
@@ -18,7 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::autostart::{autostart_enabled, is_elevated, relaunch_as_admin, set_autostart};
 use super::clipboard;
-use super::dialogs::{account_dialog, AccountInput, SettingsInput};
+use super::dialogs::{try_account_dialog, AccountInput, DialogUnavailable, SettingsInput};
+use super::instance;
 use super::sound::Sounds;
 use super::wide::wide;
 use super::window::{Start, Window, WM_APP_SESSION};
@@ -38,9 +38,18 @@ pub fn run(opts: Options) -> i32 {
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     let settings_path = data_dir.join("settings.toml");
     let (store, settings, broken) = SettingsStore::load(&settings_path);
+    // The self-test runs beside a real copy; a second real start shows the first one instead.
+    let claim = || if opts.smoke { Some(None) } else { instance::claim(&data_dir).map(Some) };
+    let Some(mut _guard) = claim() else { return 0 };
     // Games running as admin swallow hotkeys sent to a non-elevated process.
-    if settings.run_as_admin && !opts.smoke && !is_elevated() && relaunch_as_admin() {
-        return 0;
+    if settings.run_as_admin && !opts.smoke && !is_elevated() {
+        // The elevated copy must find the name free; if UAC is declined, carry on as we are.
+        _guard = None;
+        if relaunch_as_admin() {
+            return 0;
+        }
+        let Some(g) = claim() else { return 0 };
+        _guard = g;
     }
     let mut settings = settings;
     if let Some(b) = broken.filter(|_| !opts.smoke) {
@@ -58,7 +67,14 @@ pub fn run(opts: Options) -> i32 {
         if opts.smoke {
             return 1;
         }
-        let Some(a) = account_dialog(None, &account_input(&settings), true) else { return 0 };
+        let a = match try_account_dialog(None, &account_input(&settings), true) {
+            Ok(Some(a)) => a,
+            Ok(None) => return 0,
+            Err(DialogUnavailable) => {
+                message_box(None, "Nie udało się otworzyć okna z danymi konta.", MB_ICONERROR);
+                return 1;
+            }
+        };
         if let Err(e) = set_account(&mut settings, &a) {
             message_box(None, &format!("Nie udało się zapisać hasła: {e:#}"), MB_ICONERROR);
             return 1;
@@ -75,6 +91,13 @@ pub fn run(opts: Options) -> i32 {
             return 1;
         }
     };
+    // The exe may have moved since the entry was written (an update, another folder).
+    let mut startup_notice = None;
+    if settings.autostart && !opts.smoke {
+        if let Err(e) = set_autostart(true) {
+            startup_notice = Some(format!("nie udało się odświeżyć uruchamiania z Windows: {e}"));
+        }
+    }
     let (events_tx, events) = mpsc::channel();
     let app = App {
         state: AppState::with_clock(settings, Box::new(local_hm)),
@@ -87,7 +110,8 @@ pub fn run(opts: Options) -> i32 {
         data_dir,
         sounds: Sounds::new(),
         speaking: Vec::new(),
-        local_notice: None,
+        local_notice: startup_notice,
+        playback_lost_shown: false,
     };
 
     let window = match Window::create(app, Start { minimized: opts.minimized, smoke: opts.smoke }) {
@@ -176,6 +200,13 @@ pub fn message_box(owner: Option<HWND>, text: &str, icon: MESSAGEBOX_STYLE) {
     unsafe { MessageBoxW(owner, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | icon) };
 }
 
+const PLAYBACK_LOST: &str = "błąd odtwarzania dźwięku — uruchom program ponownie";
+
+/// Whether OK in the account dialog should start a new session.
+fn needs_reconnect(same_account: bool, status: &Status) -> bool {
+    !same_account || matches!(status, Status::Fatal(_))
+}
+
 /// The model plus everything its effects act on.
 pub struct App {
     state: AppState,
@@ -194,6 +225,8 @@ pub struct App {
     speaking: Vec<MemberId>,
     /// A status-bar message the model does not know about (hotkey or file errors).
     local_notice: Option<String>,
+    /// The "playback broke" notice was shown for the current client.
+    playback_lost_shown: bool,
 }
 
 impl App {
@@ -221,8 +254,9 @@ impl App {
         self.local_notice.take()
     }
 
-    pub fn activity(&self) -> Option<Arc<Activity>> {
-        self.client.as_ref().map(|c| c.activity.clone())
+    /// The current client's microphone level (the client changes with the account).
+    pub fn mic_level_dbfs(&self) -> f32 {
+        self.client.as_ref().map_or(f32::NEG_INFINITY, |c| c.activity.mic_level_dbfs())
     }
 
     /// Starts (or restarts) the session and audio for the account in the settings, with a
@@ -253,18 +287,20 @@ impl App {
             }
         });
         self.client = Some(client);
+        self.playback_lost_shown = false;
         self.sync_controls();
         Ok(notices)
     }
 
-    /// Saves a changed account and reconnects with it; an unchanged one does nothing.
+    /// Saves a changed account and reconnects with it. An unchanged one does nothing, unless
+    /// the session has failed for good: then OK is the way to try again.
     pub fn change_account(&mut self, hwnd: HWND, a: AccountInput) {
         let s = self.state.settings();
         let same = s.server == a.server
             && s.fingerprint == a.fingerprint
             && s.username == a.username
             && load_password(s).as_deref() == Some(a.password.as_str());
-        if same {
+        if !needs_reconnect(same, &self.state.view().status) {
             return;
         }
         if let Err(e) = set_account(self.state.settings_mut(), &a) {
@@ -279,7 +315,8 @@ impl App {
                     self.local_notice = Some(n.text);
                 }
             }
-            Err(e) => self.local_notice = Some(format!("nie udało się połączyć: {e}")),
+            // The old client is gone; "łączenie…" would wait forever.
+            Err(e) => self.state.session_failed(format!("nie udało się połączyć: {e}")),
         }
     }
 
@@ -333,10 +370,15 @@ impl App {
 
     /// Reads who is speaking; true when the view changed.
     pub fn poll_activity(&mut self) -> bool {
-        let Some(c) = &self.client else { return false };
+        let Some(c) = &mut self.client else { return false };
+        let lost = c.engine.playback_lost() && !self.playback_lost_shown;
         c.activity.speaking(&mut self.speaking);
         let me = c.activity.me_speaking();
-        self.state.on_activity(&self.speaking, me)
+        if lost {
+            self.playback_lost_shown = true;
+            self.local_notice = Some(PLAYBACK_LOST.to_owned());
+        }
+        self.state.on_activity(&self.speaking, me) || lost
     }
 
     pub fn save_settings(&mut self) {
@@ -416,5 +458,19 @@ impl App {
         if let Some(c) = &self.client {
             let _ = c.session.commands.send(cmd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_account_reconnects_only_after_a_fatal_error() {
+        assert!(!needs_reconnect(true, &Status::Connected));
+        assert!(!needs_reconnect(true, &Status::Connecting));
+        assert!(!needs_reconnect(true, &Status::Disconnected { retry_in_s: 3 }));
+        assert!(needs_reconnect(true, &Status::Fatal("zalogowano się na to konto w innym miejscu".into())));
+        assert!(needs_reconnect(false, &Status::Connected));
     }
 }

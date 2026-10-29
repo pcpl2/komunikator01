@@ -48,7 +48,7 @@ pub fn validate_account(server: &str, fingerprint: &str, user: &str, password: &
         return Err((Field::Server, "podaj adres serwera"));
     }
     match server.rsplit_once(':') {
-        None | Some((_, "")) => return Err((Field::Server, "brakuje portu, np. serwer.pl:4433")),
+        None | Some((_, "")) => return Err((Field::Server, "brakuje portu, np. serwer.pl:7700")),
         Some(("", _)) => return Err((Field::Server, "brakuje nazwy serwera przed dwukropkiem")),
         Some((_, port)) => {
             if !port.parse::<u16>().is_ok_and(|p| p != 0) {
@@ -142,12 +142,24 @@ pub fn device_choices(list: &[(String, String)], saved: Option<&str>) -> (Vec<St
     (labels, ids, selected)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct AccountInput {
     pub server: String,
     pub fingerprint: String,
     pub username: String,
     pub password: String,
+}
+
+/// Leaves the password out, so it never ends up in a log.
+impl std::fmt::Debug for AccountInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountInput")
+            .field("server", &self.server)
+            .field("fingerprint", &self.fingerprint)
+            .field("username", &self.username)
+            .field("password", &"<ukryte>")
+            .finish()
+    }
 }
 
 /// What the settings dialog edits.
@@ -583,13 +595,30 @@ const ID_SERVER: u16 = 201;
 
 /// The account form. `first_run` adds a greeting; `None` means cancelled.
 pub fn account_dialog(owner: Option<HWND>, initial: &AccountInput, first_run: bool) -> Option<AccountInput> {
+    try_account_dialog(owner, initial, first_run).ok().flatten()
+}
+
+/// The dialog window could not be created (as opposed to the user cancelling it).
+#[derive(Debug)]
+pub struct DialogUnavailable;
+
+/// Like `account_dialog`, telling a dialog that never opened apart from Cancel.
+pub fn try_account_dialog(
+    owner: Option<HWND>,
+    initial: &AccountInput,
+    first_run: bool,
+) -> Result<Option<AccountInput>, DialogUnavailable> {
     let title = if first_run { "Komunikator — pierwsze uruchomienie" } else { "Konto" };
-    let d = Dialog::new(owner, title)?;
+    let d = Dialog::new(owner, title).ok_or(DialogUnavailable)?;
+    Ok(account_form(&d, initial, first_run))
+}
+
+fn account_form(d: &Dialog, initial: &AccountInput, first_run: bool) -> Option<AccountInput> {
     let (m, w) = (12, 420);
     let fw = w - 2 * m;
     let mut y = m;
     if first_run {
-        d.label("Wpisz dane, które dostałeś od osoby prowadzącej serwer.", m, y, fw, 32);
+        d.label("Wpisz dane od osoby prowadzącej serwer.", m, y, fw, 32);
         y += 36;
     }
     let fields = [
@@ -880,22 +909,35 @@ mod tests {
     const FP: &str = "abababababababababababababababababababababababababababababababab";
 
     #[test]
+    fn account_debug_hides_the_password() {
+        let a = AccountInput {
+            server: "serwer.pl:7700".into(),
+            fingerprint: FP.into(),
+            username: "ola".into(),
+            password: "Tajne-Hasło-42".into(),
+        };
+        let text = format!("{a:?} {a:#?}");
+        assert!(!text.contains("Tajne-Hasło-42"), "{text}");
+        assert!(text.contains("ola") && text.contains("serwer.pl:7700"), "{text}");
+    }
+
+    #[test]
     fn account_validation_messages() {
-        assert_eq!(validate_account("serwer.pl:4433", FP, "ola", "tajne"), Ok(()));
-        assert_eq!(validate_account(" [::1]:4433 ", &FP.to_uppercase(), " ola ", " "), Ok(()));
+        assert_eq!(validate_account("serwer.pl:7700", FP, "ola", "tajne"), Ok(()));
+        assert_eq!(validate_account(" [::1]:7700 ", &FP.to_uppercase(), " ola ", " "), Ok(()));
         let bad_fp = FP.replace('a', "g");
         let cases = [
             (("", FP, "ola", "x"), (Field::Server, "podaj adres serwera")),
-            (("serwer.pl", FP, "ola", "x"), (Field::Server, "brakuje portu, np. serwer.pl:4433")),
-            (("serwer.pl:", FP, "ola", "x"), (Field::Server, "brakuje portu, np. serwer.pl:4433")),
-            ((":4433", FP, "ola", "x"), (Field::Server, "brakuje nazwy serwera przed dwukropkiem")),
+            (("serwer.pl", FP, "ola", "x"), (Field::Server, "brakuje portu, np. serwer.pl:7700")),
+            (("serwer.pl:", FP, "ola", "x"), (Field::Server, "brakuje portu, np. serwer.pl:7700")),
+            ((":7700", FP, "ola", "x"), (Field::Server, "brakuje nazwy serwera przed dwukropkiem")),
             (("serwer.pl:70000", FP, "ola", "x"), (Field::Server, "port to liczba od 1 do 65535")),
             (("serwer.pl:0", FP, "ola", "x"), (Field::Server, "port to liczba od 1 do 65535")),
             (("serwer.pl:abc", FP, "ola", "x"), (Field::Server, "port to liczba od 1 do 65535")),
-            (("serwer.pl:4433", "abc", "ola", "x"), (Field::Fingerprint, "odcisk to 64 znaki: cyfry 0–9 i litery a–f")),
-            (("serwer.pl:4433", &bad_fp, "ola", "x"), (Field::Fingerprint, "odcisk to 64 znaki: cyfry 0–9 i litery a–f")),
-            (("serwer.pl:4433", FP, "  ", "x"), (Field::User, "podaj nazwę użytkownika")),
-            (("serwer.pl:4433", FP, "ola", ""), (Field::Password, "podaj hasło")),
+            (("serwer.pl:7700", "abc", "ola", "x"), (Field::Fingerprint, "odcisk to 64 znaki: cyfry 0–9 i litery a–f")),
+            (("serwer.pl:7700", &bad_fp, "ola", "x"), (Field::Fingerprint, "odcisk to 64 znaki: cyfry 0–9 i litery a–f")),
+            (("serwer.pl:7700", FP, "  ", "x"), (Field::User, "podaj nazwę użytkownika")),
+            (("serwer.pl:7700", FP, "ola", ""), (Field::Password, "podaj hasło")),
         ];
         for ((server, fp, user, pw), want) in cases {
             assert_eq!(validate_account(server, fp, user, pw), Err(want), "{server:?} {fp:?} {user:?} {pw:?}");
@@ -1067,7 +1109,7 @@ mod tests {
                 }
                 1 => {
                     log.borrow_mut().push(get_text(scripted::item(d, ID_ERROR)));
-                    set_text(scripted::item(d, ID_SERVER), "serwer.pl:4433");
+                    set_text(scripted::item(d, ID_SERVER), "serwer.pl:7700");
                 }
                 2 => {
                     // Editing the field cleared its message; Enter in a field is OK.
@@ -1078,11 +1120,11 @@ mod tests {
             },
             || account_dialog(None, &initial, true),
         );
-        assert_eq!(*seen.borrow(), vec!["brakuje portu, np. serwer.pl:4433".to_owned(), String::new()]);
+        assert_eq!(*seen.borrow(), vec!["brakuje portu, np. serwer.pl:7700".to_owned(), String::new()]);
         assert_eq!(
             result,
             Some(AccountInput {
-                server: "serwer.pl:4433".into(),
+                server: "serwer.pl:7700".into(),
                 fingerprint: FP.into(),
                 username: "ola".into(),
                 password: "tajne hasło".into(),

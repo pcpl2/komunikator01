@@ -30,6 +30,7 @@ use super::app::{account_input, App};
 use super::dialogs::{self, SafetyChoice, SafetyInfo, SettingsEnv, SettingsInput};
 use super::hotkey;
 use super::icons::{make_icon, tray_pixels, TrayState};
+use super::instance::SHOW_MESSAGE;
 use super::layout::{
     self, create_controls, initial_rect, ID_CHAT, ID_DEAFEN, ID_LEAVE, ID_MUTE, ID_NEW_ROOM, ID_SEND, ID_SETTINGS,
     ID_TOP, ID_TREE,
@@ -48,7 +49,7 @@ const TIMER_SMOKE: usize = 2;
 const HOTKEY_MUTE: i32 = 1;
 const HOTKEY_DEAFEN: i32 = 2;
 
-const CLASS: PCWSTR = w!("KomunikatorMain");
+pub(super) const CLASS: PCWSTR = w!("KomunikatorMain");
 
 pub struct Start {
     pub minimized: bool,
@@ -71,6 +72,8 @@ pub struct Window {
     /// Last on-screen rectangle while neither minimised nor maximised; saved on exit.
     normal: Cell<RECT>,
     taskbar_created: u32,
+    /// Posted by a second start of the program: show this window instead.
+    show_request: u32,
     /// Class icons (large, small); freed with the window state.
     icons: (HICON, HICON),
     inner: RefCell<Inner>,
@@ -110,6 +113,7 @@ impl Window {
                 minimized: Cell::new(false),
                 normal: Cell::new(rect),
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+                show_request: RegisterWindowMessageW(SHOW_MESSAGE),
                 icons: (icon, small),
                 inner: RefCell::new(Inner { app, render: Render::default(), tray: None }),
             });
@@ -129,9 +133,10 @@ impl Window {
                 Some(instance),
                 Some(raw.cast()),
             )?;
-            // Elevated (run as admin), UIPI would drop these from medium-integrity Explorer,
-            // and after an Explorer restart the tray icon, the only way back, would be gone.
-            for m in [win.taskbar_created, WM_APP_TRAY] {
+            // Elevated (run as admin), UIPI would drop these from medium-integrity Explorer
+            // (after its restart the tray icon, the only way back, would be gone) and from a
+            // second, non-elevated start asking us to show the window.
+            for m in [win.taskbar_created, WM_APP_TRAY, win.show_request] {
                 let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
             }
             win.dpi.set(GetDpiForWindow(hwnd).max(96));
@@ -391,6 +396,10 @@ impl Window {
                 }
                 Some(LRESULT(0))
             }
+            m if m == self.show_request && m != 0 => {
+                self.show();
+                Some(LRESULT(0))
+            }
             m if m == self.taskbar_created && m != 0 => {
                 self.taskbar_created();
                 Some(LRESULT(0))
@@ -527,7 +536,6 @@ impl Window {
         let hwnd = self.hwnd();
         let Ok(inner) = self.inner.try_borrow() else { return };
         let current = SettingsInput::from_settings(inner.app.settings());
-        let activity = inner.app.activity();
         drop(inner);
         // WASAPI enumeration initialises COM for its thread; keep that off the UI thread.
         let (capture_devices, render_devices) = std::thread::scope(|s| {
@@ -535,7 +543,8 @@ impl Window {
                 .join()
                 .unwrap_or_default()
         });
-        let mic_level = || activity.as_ref().map_or(f32::NEG_INFINITY, |a| a.mic_level_dbfs());
+        // Asked on each tick: changing the account inside the dialog starts a new client.
+        let mic_level = || self.inner.try_borrow().map_or(f32::NEG_INFINITY, |i| i.app.mic_level_dbfs());
         let try_hotkeys = |mute: Option<&str>, deafen: Option<&str>| {
             self.register_hotkeys([mute, deafen]).map(|r| r.err().map(|e| hotkey::describe(&e)))
         };
