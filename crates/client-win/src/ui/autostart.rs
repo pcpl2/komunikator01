@@ -93,11 +93,7 @@ pub fn relaunch_as_admin() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let args = std::env::args()
-        .skip(1)
-        .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let args = join_args(std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()));
     let (exe, args) = (wide(&exe.to_string_lossy()), wide(&args));
     let r = unsafe {
         ShellExecuteW(
@@ -110,4 +106,60 @@ pub fn relaunch_as_admin() -> bool {
         )
     };
     r.0 as isize > 32
+}
+
+/// One command line from arguments, each quoted so `CommandLineToArgvW` gives it back intact.
+fn join_args<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> String {
+    args.into_iter().map(|a| quote_arg(a.as_ref())).collect::<Vec<_>>().join(" ")
+}
+
+/// Backslashes are literal unless they precede a quote, so those (and the ones before the
+/// closing quote) are doubled and embedded quotes escaped.
+fn quote_arg(a: &str) -> String {
+    const BACKSLASH: char = '\\';
+    if !a.is_empty() && !a.contains([' ', '\t', '\n', '\x0b', '"']) {
+        return a.to_owned();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in a.chars() {
+        match c {
+            BACKSLASH => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_are_quoted_for_command_line_to_argv() {
+        let cases = [
+            (r"--minimized", r"--minimized"),
+            (r"C:\dir\", r"C:\dir\"),
+            (r"C:\x y\", r#""C:\x y\\""#),
+            (r#"C:\a"b"#, r#""C:\a\"b""#),
+            (r#"x\"y z"#, r#""x\\\"y z""#),
+            (r"tab	here", "\"tab\there\""),
+            ("", r#""""#),
+        ];
+        for (arg, want) in cases {
+            assert_eq!(quote_arg(arg), want, "{arg:?}");
+        }
+        assert_eq!(join_args([r"--data-dir", r"C:\x y\", "--minimized"]), r#"--data-dir "C:\x y\\" --minimized"#);
+    }
 }

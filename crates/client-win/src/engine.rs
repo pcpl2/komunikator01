@@ -33,6 +33,8 @@ pub struct AudioEngine {
     stop: Arc<AtomicBool>,
     capture: Option<JoinHandle<()>>,
     render: Option<JoinHandle<mpsc::Receiver<IncomingFrame>>>,
+    /// The render thread panicked and took the incoming audio channel with it.
+    render_lost: bool,
 }
 
 #[cfg(windows)]
@@ -103,6 +105,7 @@ impl AudioEngine {
             stop: Arc::new(AtomicBool::new(false)),
             capture: None,
             render: None,
+            render_lost: false,
         };
         engine.spawn(capture, render);
         engine
@@ -119,6 +122,15 @@ impl AudioEngine {
         self.spawn(capture, render);
     }
 
+    /// True once incoming audio is gone for good (the render thread panicked); only a new
+    /// session brings it back. Cheap enough to ask on every UI tick.
+    pub fn playback_lost(&mut self) -> bool {
+        if self.render.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.reap_render();
+        }
+        self.render_lost
+    }
+
     pub fn stop(mut self) {
         self.halt();
     }
@@ -128,9 +140,16 @@ impl AudioEngine {
         if let Some(h) = self.capture.take() {
             let _ = h.join();
         }
+        self.reap_render();
+    }
+
+    fn reap_render(&mut self) {
         match self.render.take().map(JoinHandle::join) {
             Some(Ok(rx)) => self.audio_in = Some(rx),
-            Some(Err(_)) => tracing::error!("render thread panicked; incoming audio is lost"),
+            Some(Err(_)) => {
+                tracing::error!("render thread panicked; incoming audio is lost");
+                self.render_lost = true;
+            }
             None => {}
         }
     }
@@ -224,9 +243,12 @@ mod tests {
         }
     }
 
+    /// Which stream was opened on which device, in order.
+    type Opened = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+
     #[test]
     fn restart_keeps_session_channels() {
-        let opened: Arc<Mutex<Vec<(&str, Option<String>)>>> = Arc::default();
+        let opened: Opened = Arc::default();
         let open_capture: CaptureOpener = {
             let opened = opened.clone();
             Arc::new(move |d| {
@@ -302,5 +324,46 @@ mod tests {
         engine.stop();
         assert!(!activity.me_speaking());
         assert_eq!(activity.mic_level_dbfs(), -100.0);
+    }
+
+    struct BrokenSpeaker;
+
+    impl FrameSink for BrokenSpeaker {
+        fn write_frame(&mut self, _: &Pcm) -> Result<(), AudioError> {
+            panic!("driver bug");
+        }
+    }
+
+    #[test]
+    fn render_panic_is_reported() {
+        let start = |sink: fn() -> Box<dyn FrameSink>| {
+            let (out_tx, _out_rx) = mpsc::channel(4096);
+            let (_in_tx, in_rx) = mpsc::channel(16);
+            AudioEngine::with_openers(
+                Arc::new(|_| Box::new(Mic(0))),
+                Arc::new(move |_| sink()),
+                None,
+                None,
+                0.5,
+                out_tx,
+                in_rx,
+                Arc::new(Controls::default()),
+                Arc::new(GainTable::new()),
+                Arc::new(Activity::new()),
+            )
+        };
+        let mut healthy = start(|| Box::new(Speaker));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!healthy.playback_lost());
+        healthy.restart_devices(None, None);
+        assert!(!healthy.playback_lost());
+        healthy.stop();
+
+        let mut broken = start(|| Box::new(BrokenSpeaker));
+        wait_for("render thread to die", || broken.playback_lost());
+        // A new device cannot help: the incoming audio channel went down with the thread.
+        broken.restart_devices(Some("spk2".into()), None);
+        assert!(broken.playback_lost());
+        broken.stop();
     }
 }

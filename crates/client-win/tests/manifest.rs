@@ -21,8 +21,8 @@ fn assert_manifest(exe: &str) {
         let module = LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_AS_DATAFILE).unwrap();
         let res = FindResourceW(
             Some(module),
-            PCWSTR(1 as *const u16),
-            PCWSTR(RT_MANIFEST as *const u16),
+            PCWSTR(std::ptr::without_provenance(1)),
+            PCWSTR(std::ptr::without_provenance(RT_MANIFEST)),
         );
         let found = !res.is_invalid();
         let _ = FreeLibrary(module);

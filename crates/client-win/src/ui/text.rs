@@ -117,6 +117,9 @@ pub fn tray_tip(v: &View) -> &'static str {
     }
 }
 
+// The kind goes in the upper 32 bits of the lParam, so it needs a 64-bit isize.
+const _: () = assert!(std::mem::size_of::<isize>() == 8);
+
 /// What a tree item stands for, packed into its lParam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeItem {
