@@ -457,7 +457,7 @@ impl App {
                         c.gains.remove(*id);
                     }
                 }
-                SessionEvent::TokenIssued(token) => self.token_issued(token),
+                SessionEvent::TokenIssued(token) => self.token_issued(&token.0),
                 SessionEvent::Fatal(reason) => {
                     self.login_prompt = login_prompt(self.state.settings(), *reason, self.register.as_ref());
                 }

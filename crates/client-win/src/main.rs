@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     Some(SessionEvent::TokenIssued(token)) => {
                         if let Some((store, s)) = &mut saved {
-                            remember_token(store, s, &token);
+                            remember_token(store, s, &token.0);
                         }
                     }
                     Some(e) => {
@@ -342,7 +342,7 @@ fn print_event(e: &SessionEvent, now: (u16, u16)) {
     match e {
         SessionEvent::Connecting => println!("łączenie…"),
         // Handled (and never printed) in the main loop.
-        SessionEvent::TokenIssued(_) => {}
+        SessionEvent::TokenIssued(_) | SessionEvent::SignedInAs(_) => {}
         SessionEvent::Connected { you, room, members, .. } => {
             let names: Vec<_> = members
                 .iter()

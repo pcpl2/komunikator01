@@ -166,8 +166,8 @@ impl AppState {
         let mut out = Vec::new();
         match e {
             SessionEvent::Connecting => self.set_status(Status::Connecting),
-            // The GUI stores it before the event gets here; nothing to show.
-            SessionEvent::TokenIssued(_) => {}
+            // The GUI stores both before the event gets here; nothing to show.
+            SessionEvent::TokenIssued(_) | SessionEvent::SignedInAs(_) => {}
             SessionEvent::Connected { you, room, rooms, members } => {
                 self.lobby = Some(Lobby::new(you, room, rooms, members).0);
                 self.e2e.clear();
@@ -1008,10 +1008,11 @@ mod tests {
             assert_eq!(describe_fatal(reason), text);
         }
         assert_eq!(protocol::MIN_PASSWORD_CHARS, 8, "the text names the limit");
-        // A new token changes nothing on screen; the GUI stores it.
+        // A new token or name changes nothing on screen; the GUI stores them.
         let mut s = online();
         let before = s.view().clone();
-        assert_eq!(s.on_event(SessionEvent::TokenIssued([9; 32])), vec![]);
+        assert_eq!(s.on_event(SessionEvent::TokenIssued(crate::net::session::SessionToken([9; 32]))), vec![]);
+        assert_eq!(s.on_event(SessionEvent::SignedInAs("Ala".into())), vec![]);
         assert_eq!(*s.view(), before);
     }
 }

@@ -93,12 +93,25 @@ impl Credentials {
     }
 }
 
+/// A session token from the server. Its `Debug` hides the bytes, so it never ends up in a log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SessionToken(pub [u8; 32]);
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionToken(<ukryte>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Connecting,
     /// The server issued a new session token; store it for the next start (the one used to
-    /// log in is spent). Never log it.
-    TokenIssued([u8; 32]),
+    /// log in is spent).
+    TokenIssued(SessionToken),
+    /// My name as the server spells it (it ignores letter case at login). Follows every
+    /// `TokenIssued`; save it in place of the typed name.
+    SignedInAs(String),
     /// `members` are everyone online (me included), whatever their room.
     Connected { you: MemberId, room: Option<RoomId>, rooms: Vec<RoomInfo>, members: Vec<MemberInfo> },
     MemberJoined(MemberInfo),
@@ -338,7 +351,12 @@ impl Task {
                 // The credentials just used are spent (a token) or must not be sent again (an
                 // invite); every later login of this run uses the fresh token.
                 self.params.credentials = Credentials::Token(token);
-                self.emit(SessionEvent::TokenIssued(token));
+                self.emit(SessionEvent::TokenIssued(SessionToken(token)));
+                // Peers check my E2E announce against this spelling, not the one typed.
+                if let Some(me) = members.iter().find(|m| m.id == you) {
+                    self.params.username = me.name.clone();
+                }
+                self.emit(SessionEvent::SignedInAs(self.params.username.clone()));
                 self.welcomed(you, room, rooms, members)
             }
             Some(ServerMsg::Rejected { reason }) => {
@@ -893,6 +911,13 @@ mod tests {
             let text = format!("{c:?} {c:#?}");
             assert!(!text.contains("Tajne") && !text.contains("171") && !text.contains("205"), "{text}");
         }
+    }
+
+    #[test]
+    fn session_event_debug_hides_the_token() {
+        let e = SessionEvent::TokenIssued(SessionToken([0xAB; 32]));
+        let text = format!("{e:?} {e:#?}");
+        assert!(!text.contains("171"), "{text}");
     }
 
     #[test]
