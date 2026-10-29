@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use protocol::update::Version;
+
 /// The release public key: 64 hex chars on the first line that is not a comment. All zeros
 /// (the committed placeholder) means this build does not update itself.
 pub const RELEASE_KEY: &str = include_str!("../release-key.pub");
@@ -23,6 +25,46 @@ pub fn release_key() -> Option<[u8; 32]> {
 fn parse_release_key(text: &str) -> Option<[u8; 32]> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'))?;
     protocol::parse_fingerprint(line).filter(|k| *k != [0; 32])
+}
+
+/// The exe's real name for the running file: a copy started as `komunikator.exe.old` (after
+/// a swap cut short) still means `komunikator.exe`, so cleanup can put it back.
+pub fn canonical_exe(running: &Path) -> PathBuf {
+    match running.file_name().and_then(OsStr::to_str) {
+        Some(name) if name.len() > 4 && name.to_ascii_lowercase().ends_with(".old") => {
+            running.with_file_name(&name[..name.len() - 4])
+        }
+        _ => running.to_owned(),
+    }
+}
+
+/// Written by the window program at every start, so `komunikator-cli --check-update` knows
+/// which version it would replace (and never installs an older one).
+const VERSION_STAMP: &str = "komunikator.version";
+
+pub fn write_version_stamp(exe: &Path, v: Version) -> io::Result<()> {
+    fs::write(exe.with_file_name(VERSION_STAMP), format!("{v}\n"))
+}
+
+/// The newer of `own` and the version the window program next to `exe` last stamped.
+pub fn installed_version(exe: &Path, own: Version) -> Version {
+    let stamp = fs::read_to_string(exe.with_file_name(VERSION_STAMP)).ok();
+    stamp.and_then(|s| Version::parse(s.trim())).map_or(own, |s| s.max(own))
+}
+
+/// A file error as the player should read it, without raw system codes.
+pub fn describe_io(e: &io::Error) -> &'static str {
+    const SHARING_VIOLATION: i32 = 32;
+    const LOCK_VIOLATION: i32 = 33;
+    if matches!(e.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION)) {
+        return "plik programu jest używany przez inny proces";
+    }
+    match e.kind() {
+        io::ErrorKind::PermissionDenied => "brak prawa zapisu w folderze programu",
+        io::ErrorKind::NotFound => "brak pliku programu",
+        io::ErrorKind::StorageFull => "brak miejsca na dysku",
+        _ => "nie udało się zapisać pliku programu",
+    }
 }
 
 fn beside(exe: &Path, suffix: &str) -> PathBuf {
@@ -169,6 +211,55 @@ mod tests {
         // The built-in file is well formed: a real key or the placeholder.
         let line = RELEASE_KEY.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'));
         assert!(line.and_then(protocol::parse_fingerprint).is_some(), "release-key.pub: {RELEASE_KEY:?}");
+    }
+
+    #[test]
+    fn started_from_the_old_copy_means_the_real_name() {
+        let dir = Path::new(r"C:\Gry\Komunikator");
+        assert_eq!(canonical_exe(&dir.join("komunikator.exe")), dir.join("komunikator.exe"));
+        assert_eq!(canonical_exe(&dir.join("komunikator.exe.old")), dir.join("komunikator.exe"));
+        assert_eq!(canonical_exe(&dir.join("komunikator.exe.OLD")), dir.join("komunikator.exe"));
+        assert_eq!(canonical_exe(&dir.join(".old")), dir.join(".old"));
+    }
+
+    #[test]
+    fn interrupted_swap_recovers_when_started_from_the_old_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("komunikator.exe.old");
+        std::fs::write(&old, b"stary").unwrap();
+        let exe = canonical_exe(&old);
+        cleanup_on_start(&exe);
+        assert_eq!(read(&exe), b"stary");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn io_errors_are_described_in_polish() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(describe_io(&Error::from(ErrorKind::PermissionDenied)), "brak prawa zapisu w folderze programu");
+        assert_eq!(describe_io(&Error::from_raw_os_error(5)), "brak prawa zapisu w folderze programu");
+        assert_eq!(describe_io(&Error::from_raw_os_error(32)), "plik programu jest używany przez inny proces");
+        assert!(!describe_io(&Error::other("x")).contains("os error"));
+    }
+
+    #[test]
+    fn the_cli_never_installs_an_older_release_than_the_window_program() {
+        use client_core::update::{decide, Decision};
+        use protocol::update::{Manifest, Version};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = exe(&dir);
+        let own = Version { major: 1, minor: 0, patch: 0 };
+        assert_eq!(installed_version(&exe, own), own, "no stamp yet");
+        write_version_stamp(&exe, Version { major: 9, minor: 0, patch: 0 }).unwrap();
+        let installed = installed_version(&exe, own);
+        assert_eq!(installed, Version { major: 9, minor: 0, patch: 0 });
+        let m = Manifest { version: Version { major: 5, minor: 0, patch: 0 }, file: "k.exe".into(), size: 1, sha256: [0; 32] };
+        assert_eq!(decide(&m, installed), Decision::UpToDate);
+        // An older stamp never lowers the bar.
+        write_version_stamp(&exe, Version { major: 0, minor: 9, patch: 0 }).unwrap();
+        assert_eq!(installed_version(&exe, own), own);
+        std::fs::write(dir.path().join("komunikator.version"), "śmieci").unwrap();
+        assert_eq!(installed_version(&exe, own), own);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! the signed manifest and the release it names. Nothing downloaded is trusted until the
 //! manifest's signature, the version (strictly newer) and the file's size and hash check out.
 
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -26,6 +27,26 @@ pub enum Decision {
     UpToDate,
     Available(Manifest),
 }
+
+/// Why a check found nothing to install.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The server could not be asked: unreachable, or too old to have the update channel.
+    Unreachable(anyhow::Error),
+    /// The server publishes a release that does not verify.
+    Rejected(&'static str),
+}
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CheckError::Unreachable(e) => write!(f, "{e}"),
+            CheckError::Rejected(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for CheckError {}
 
 /// This build's version, as releases are numbered.
 pub fn current_version() -> Version {
@@ -69,9 +90,15 @@ pub async fn fetch_file(server: &str, fingerprint: [u8; 32], name: &str, max: u6
 }
 
 /// Fetches and verifies the manifest against the built-in release key.
-pub async fn check(server: &str, fingerprint: [u8; 32], key: &[u8; 32], current: Version) -> anyhow::Result<Decision> {
-    let Some(bytes) = fetch_manifest(server, fingerprint).await? else { return Ok(Decision::UpToDate) };
-    let m = verify_manifest(key, &bytes).map_err(|e| anyhow!(describe(e)))?;
+pub async fn check(
+    server: &str,
+    fingerprint: [u8; 32],
+    key: &[u8; 32],
+    current: Version,
+) -> Result<Decision, CheckError> {
+    let fetched = fetch_manifest(server, fingerprint).await.map_err(CheckError::Unreachable)?;
+    let Some(bytes) = fetched else { return Ok(Decision::UpToDate) };
+    let m = verify_manifest(key, &bytes).map_err(|e| CheckError::Rejected(describe(e)))?;
     Ok(decide(&m, current))
 }
 
@@ -106,7 +133,7 @@ async fn request(server: &str, fingerprint: [u8; 32], req: &[u8], len_bytes: usi
         result
     };
     // Dropping the unfinished work on timeout drops its connection too.
-    timeout(TIMEOUT, work).await.map_err(|_| anyhow!("serwer nie odpowiada w czasie"))?
+    timeout(TIMEOUT, work).await.map_err(|_| anyhow!("serwer nie odpowiedział na czas"))?
 }
 
 async fn connect(server: &str, fingerprint: [u8; 32]) -> anyhow::Result<(Endpoint, Connection)> {

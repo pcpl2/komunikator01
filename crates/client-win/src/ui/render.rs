@@ -113,6 +113,11 @@ impl Render {
         })
     }
 
+    /// The notice on the status bar now.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     fn set_notice(&mut self, c: &Controls, n: Option<String>) {
         if n != self.notice {
             set_part(c.status, 1, n.as_deref().unwrap_or(""));

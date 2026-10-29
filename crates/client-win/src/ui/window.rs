@@ -402,7 +402,8 @@ impl Window {
             }
             WM_APP_UPDATE => {
                 if let Ok(mut inner) = self.inner.try_borrow_mut() {
-                    inner.app.drain_updates();
+                    let shown = inner.render.notice().map(str::to_owned);
+                    inner.app.drain_updates(shown.as_deref());
                     self.draw(&mut inner);
                     drop(inner);
                     self.install_update();
@@ -596,13 +597,13 @@ impl Window {
         if !unsafe { IsWindowEnabled(self.hwnd()) }.as_bool() {
             return;
         }
-        let mut close = false;
-        self.with_app(|app| close = app.install_update_if_due());
-        if close {
+        let Ok(mut inner) = self.inner.try_borrow_mut() else { return };
+        let shown = inner.render.notice().map(str::to_owned);
+        if inner.app.install_update_if_due(shown.as_deref()) {
             unsafe { PostQuitMessage(0) };
         } else {
-            // A failed swap leaves a notice.
-            self.redraw();
+            // A failed swap may leave a notice.
+            self.draw(&mut inner);
         }
     }
 

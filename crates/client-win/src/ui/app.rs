@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::Context;
 use client_core::app::{describe_fatal, Action, AppState, Effect, Status, View};
 use client_core::net::session::{Credentials, FatalReason, SessionCommand, SessionEvent};
 use client_core::settings::{Settings, SettingsStore};
-use client_core::update::{self, current_version, may_apply, Decision};
+use client_core::update::{self, current_version, may_apply, CheckError, Decision};
 use protocol::invite::encode_invite;
 use protocol::update::Version;
 use protocol::MemberId;
@@ -110,7 +109,7 @@ pub fn run(opts: Options) -> i32 {
         }
     };
     // The exe may have moved since the entry was written (an update, another folder).
-    let mut startup_notice = opts.updated.then(|| format!("zaktualizowano do wersji {}", current_version()));
+    let mut startup_notice = opts.updated.then(|| format!("{UPDATED_TO}{}", current_version()));
     if settings.autostart && !opts.smoke {
         if let Err(e) = set_autostart(true) {
             startup_notice = Some(format!("nie udało się odświeżyć uruchamiania z Windows: {e}"));
@@ -201,13 +200,34 @@ pub fn run(opts: Options) -> i32 {
 
 const UPDATE_DOWNLOADING: &str = "pobieranie aktualizacji…";
 const UPDATE_READY: &str = "aktualizacja gotowa — zostanie zainstalowana, gdy nie będziesz w rozmowie";
+const UPDATE_FAILED: &str = "aktualizacja nieudana: ";
+const UPDATED_TO: &str = "zaktualizowano do wersji ";
 
 /// What a background update check reports back to the window.
 enum UpdateMsg {
     Downloading,
     UpToDate,
     Ready(Version),
+    Failed(UpdateFailure),
+}
+
+#[derive(Debug)]
+enum UpdateFailure {
+    /// The server could not be asked (offline, or too old for the update channel).
+    Unreachable(String),
+    /// A release was found but could not be verified, downloaded or installed.
     Failed(String),
+}
+
+/// The status-bar text for a failed update, if any: nothing when the server simply could not
+/// be asked (that would nag at every start offline), and never over a notice that is not
+/// about updates (`shown`).
+fn failure_notice(f: &UpdateFailure, shown: Option<&str>) -> Option<String> {
+    let UpdateFailure::Failed(why) = f else { return None };
+    let about_updates = |n: &str| {
+        n == UPDATE_DOWNLOADING || n == UPDATE_READY || n.starts_with(UPDATE_FAILED) || n.starts_with(UPDATED_TO)
+    };
+    shown.is_none_or(about_updates).then(|| format!("{UPDATE_FAILED}{why}"))
 }
 
 /// Hands update reports to the window thread and wakes it.
@@ -243,13 +263,16 @@ struct Updates {
 impl Updates {
     fn new() -> Option<Updates> {
         let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
+            Ok(exe) => updater::canonical_exe(&exe),
             Err(e) => {
                 tracing::warn!("self-update disabled: no exe path: {e}");
                 return None;
             }
         };
         updater::cleanup_on_start(&exe);
+        if let Err(e) = updater::write_version_stamp(&exe, current_version()) {
+            tracing::debug!("version stamp not written: {e}");
+        }
         let Some(key) = updater::release_key() else {
             tracing::info!("self-update disabled: this build has no release key");
             return None;
@@ -266,16 +289,19 @@ async fn fetch_update(
     key: &[u8; 32],
     exe: &Path,
     post: &UpdatePost,
-) -> anyhow::Result<Option<Version>> {
-    let Decision::Available(m) = update::check(server, fingerprint, key, current_version()).await? else {
-        return Ok(None);
-    };
+) -> Result<Option<Version>, UpdateFailure> {
+    let decision = update::check(server, fingerprint, key, current_version()).await.map_err(|e| match e {
+        CheckError::Unreachable(e) => UpdateFailure::Unreachable(format!("{e:#}")),
+        CheckError::Rejected(why) => UpdateFailure::Failed(why.into()),
+    })?;
+    let Decision::Available(m) = decision else { return Ok(None) };
     post.send(UpdateMsg::Downloading);
-    let bytes = update::download(server, fingerprint, &m).await?;
+    let bytes = update::download(server, fingerprint, &m).await.map_err(|e| UpdateFailure::Failed(format!("{e}")))?;
     let exe = exe.to_owned();
     tokio::task::spawn_blocking(move || updater::stage(&exe, &bytes))
-        .await?
-        .context("nie udało się zapisać pobranego pliku")?;
+        .await
+        .map_err(|_| UpdateFailure::Failed("przerwane zapisywanie aktualizacji".into()))?
+        .map_err(|e| UpdateFailure::Failed(updater::describe_io(&e).into()))?;
     Ok(Some(m.version))
 }
 
@@ -627,14 +653,14 @@ impl App {
             let msg = match fetch_update(&server, fingerprint, &key, &exe, &post).await {
                 Ok(None) => UpdateMsg::UpToDate,
                 Ok(Some(v)) => UpdateMsg::Ready(v),
-                Err(e) => UpdateMsg::Failed(format!("{e}")),
+                Err(f) => UpdateMsg::Failed(f),
             };
             post.send(msg);
         });
     }
 
-    /// Applies what the background update check reported.
-    pub fn drain_updates(&mut self) {
+    /// Applies what the background update check reported; `shown` is the status-bar notice.
+    pub fn drain_updates(&mut self, shown: Option<&str>) {
         let Some(u) = &mut self.updates else { return };
         while let Ok(m) = u.rx.try_recv() {
             match m {
@@ -645,9 +671,15 @@ impl App {
                     u.ready = Some(v);
                     self.local_notice = Some(UPDATE_READY.into());
                 }
-                UpdateMsg::Failed(why) => {
+                UpdateMsg::Failed(f) => {
                     u.busy = false;
-                    self.local_notice = Some(format!("aktualizacja nieudana: {why}"));
+                    match &f {
+                        UpdateFailure::Unreachable(why) => tracing::info!("update server not reachable: {why}"),
+                        UpdateFailure::Failed(why) => tracing::warn!("update failed: {why}"),
+                    }
+                    if let Some(n) = failure_notice(&f, self.local_notice.as_deref().or(shown)) {
+                        self.local_notice = Some(n);
+                    }
                 }
             }
         }
@@ -655,7 +687,7 @@ impl App {
 
     /// Puts a staged release in place of the exe once I am not in a conversation; true when
     /// the program should now close (`run` then starts the new exe).
-    pub fn install_update_if_due(&mut self) -> bool {
+    pub fn install_update_if_due(&mut self, shown: Option<&str>) -> bool {
         let Some(u) = &mut self.updates else { return false };
         if u.ready.is_none() || !may_apply(self.state.in_room_with_others()) {
             return false;
@@ -667,7 +699,11 @@ impl App {
                 true
             }
             Err(e) => {
-                self.local_notice = Some(format!("aktualizacja nieudana: {e}"));
+                tracing::warn!("update swap failed: {e}");
+                let f = UpdateFailure::Failed(updater::describe_io(&e).into());
+                if let Some(n) = failure_notice(&f, self.local_notice.as_deref().or(shown)) {
+                    self.local_notice = Some(n);
+                }
                 false
             }
         }
@@ -872,6 +908,19 @@ mod tests {
         for reason in [FatalReason::AccountBlocked, FatalReason::SessionReplaced, FatalReason::VersionMismatch { server: 9 }] {
             assert_eq!(login_prompt(&s, reason, Some(&r)), None);
         }
+    }
+
+    #[test]
+    fn update_failures_show_only_when_a_release_was_found_and_never_over_other_notices() {
+        let offline = UpdateFailure::Unreachable("brak połączenia z serwerem".into());
+        assert_eq!(failure_notice(&offline, None), None, "offline is not worth a notice");
+        let bad = UpdateFailure::Failed("opis wydania nie ma poprawnego podpisu".into());
+        let text = Some("aktualizacja nieudana: opis wydania nie ma poprawnego podpisu".to_owned());
+        assert_eq!(failure_notice(&bad, None), text);
+        for ours in [UPDATE_DOWNLOADING, UPDATE_READY, "aktualizacja nieudana: x", "zaktualizowano do wersji 1.2.3"] {
+            assert_eq!(failure_notice(&bad, Some(ours)), text, "{ours}");
+        }
+        assert_eq!(failure_notice(&bad, Some("skrót: Wycisz mikrofon (Ctrl+M): zajęty")), None);
     }
 
     #[test]

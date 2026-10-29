@@ -726,8 +726,9 @@ fn check_update(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("nie ma {} — aktualizowany jest program okienkowy obok komunikator-cli.exe", exe.display());
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let current = current_version();
-    println!("sprawdzanie aktualizacji na {server} (Twoja wersja: {current})…");
+    // The window program may already be newer than this CLI: never install below it.
+    let current = updater::installed_version(&exe, current_version());
+    println!("sprawdzanie aktualizacji na {server} (zainstalowana wersja: {current})…");
     let m = match rt.block_on(update::check(&server, fingerprint, &key, current)) {
         Ok(Decision::UpToDate) => {
             println!("brak nowszej wersji");
@@ -740,8 +741,12 @@ fn check_update(cli: &Cli) -> anyhow::Result<()> {
     let bytes = rt
         .block_on(update::download(&server, fingerprint, &m))
         .map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
-    updater::stage(&exe, &bytes).map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
-    updater::swap(&exe).map_err(|e| anyhow::anyhow!("aktualizacja nieudana: {e}"))?;
+    let failed = |e: std::io::Error| anyhow::anyhow!("aktualizacja nieudana: {}", updater::describe_io(&e));
+    updater::stage(&exe, &bytes).map_err(failed)?;
+    updater::swap(&exe).map_err(failed)?;
+    if let Err(e) = updater::write_version_stamp(&exe, m.version) {
+        println!("UWAGA: nie udało się zapisać komunikator.version: {}", updater::describe_io(&e));
+    }
     println!("zaktualizowano {} do wersji {}; uruchomiony komunikator zmieni się po ponownym starcie", exe.display(), m.version);
     Ok(())
 }

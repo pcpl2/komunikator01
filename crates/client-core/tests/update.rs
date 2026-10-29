@@ -1,6 +1,6 @@
 //! The client's side of the update channel against a real server with a signed release.
 
-use client_core::update::{check, check_file, download, fetch_file, fetch_manifest, Decision};
+use client_core::update::{check, check_file, download, fetch_file, fetch_manifest, CheckError, Decision};
 use ed25519_dalek::SigningKey;
 use protocol::update::{sign_manifest, verify_manifest, Manifest, Version};
 use server::{RunningServer, ServerConfig};
@@ -65,7 +65,7 @@ async fn fetch_from_test_server() {
     assert_eq!(check(&addr, fp, &public, old).await.unwrap(), Decision::Available(m.clone()));
     assert_eq!(check(&addr, fp, &public, m.version).await.unwrap(), Decision::UpToDate);
     let other = SigningKey::from_bytes(&[6; 32]).verifying_key().to_bytes();
-    assert!(check(&addr, fp, &other, old).await.is_err());
+    assert!(matches!(check(&addr, fp, &other, old).await, Err(CheckError::Rejected(_))));
     assert_eq!(download(&addr, fp, &m).await.unwrap(), content);
 
     // A file that does not match the signed size and hash is refused.
@@ -79,4 +79,7 @@ async fn fetch_from_test_server() {
     let huge = Manifest { size: protocol::update::MAX_RELEASE_SIZE + 1, ..m };
     assert!(download(&addr, fp, &huge).await.is_err());
     srv.shutdown().await;
+
+    // Nobody answering is not the same as a bad release.
+    assert!(matches!(check(&addr, fp, &public, old).await, Err(CheckError::Unreachable(_))));
 }

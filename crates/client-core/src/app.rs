@@ -136,6 +136,9 @@ pub struct AppState {
     version: u64,
     /// The view changed since the last version bump.
     dirty: bool,
+    /// The last connected lobby had me in a room with someone else. Kept while reconnecting:
+    /// a network blip in a call is still a call.
+    in_conversation: bool,
 }
 
 impl AppState {
@@ -161,6 +164,7 @@ impl AppState {
             },
             version: 0,
             dirty: false,
+            in_conversation: false,
         }
     }
 
@@ -354,11 +358,7 @@ impl AppState {
 
     /// In a conversation: connected, in a room together with at least one other member.
     pub fn in_room_with_others(&self) -> bool {
-        // A session ended for good keeps its last lobby on screen, but nobody hears me there.
-        self.view.status == Status::Connected
-            && self.lobby.as_ref().is_some_and(|l| {
-                l.my_room().is_some() && l.members_in(l.my_room()).iter().any(|m| m.id != l.me())
-            })
+        self.in_conversation
     }
 
     fn room_changes(&mut self, changes: Vec<RoomChange>, out: &mut Vec<Effect>) {
@@ -485,6 +485,17 @@ impl AppState {
 
     /// Rebuilds the derived part of the view and bumps the version if anything changed.
     fn finish(&mut self) {
+        match self.view.status {
+            Status::Connected => {
+                self.in_conversation = self.lobby.as_ref().is_some_and(|l| {
+                    l.my_room().is_some() && l.members_in(l.my_room()).iter().any(|m| m.id != l.me())
+                });
+            }
+            // A session ended for good keeps its last lobby on screen, but nobody hears me there.
+            Status::Fatal(_) => self.in_conversation = false,
+            // Reconnecting: only the next connected lobby can tell whether the call is over.
+            Status::Connecting | Status::Disconnected { .. } => {}
+        }
         let rooms = self.build_rooms();
         let my_room = self.lobby.as_ref().and_then(Lobby::my_room);
         if rooms != self.view.rooms || my_room != self.view.my_room {
@@ -1054,7 +1065,21 @@ mod tests {
         s.on_event(SessionEvent::MemberMoved { id: 1, room: None });
         assert!(!s.in_room_with_others(), "in no room");
         s.on_event(SessionEvent::Disconnected { retry_in: Duration::from_secs(1) });
-        assert!(!s.in_room_with_others());
+        assert!(!s.in_room_with_others(), "was not in a call");
+
+        // A blip during a call: still a call until a connected lobby says otherwise.
+        let mut s = online();
+        s.on_event(SessionEvent::Disconnected { retry_in: Duration::from_secs(1) });
+        assert!(s.in_room_with_others(), "reconnecting in a call");
+        s.on_event(SessionEvent::Connecting);
+        assert!(s.in_room_with_others(), "reconnecting in a call");
+        s.on_event(SessionEvent::Connected { you: 7, room: Some(10), rooms: vec![r(10, "Ogólny")], members: vec![m(7, "ja", Some(10))] });
+        assert!(!s.in_room_with_others(), "back, alone");
+        let mut s = online();
+        s.on_event(SessionEvent::Disconnected { retry_in: Duration::from_secs(1) });
+        s.on_event(SessionEvent::Fatal(FatalReason::VersionMismatch { server: 9 }));
+        assert!(!s.in_room_with_others(), "the session is over");
+
         let mut s = online();
         s.on_event(SessionEvent::Fatal(FatalReason::SessionReplaced));
         assert!(!s.in_room_with_others(), "the session is over");
