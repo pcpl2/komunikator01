@@ -19,12 +19,17 @@ use super::window::CLASS;
 /// The registered message a second start posts to the running window.
 pub const SHOW_MESSAGE: PCWSTR = windows::core::w!("komunikator-show");
 
-/// Held while this copy runs; the name is free again once it drops.
-pub struct InstanceGuard(Option<HANDLE>);
+/// One fixed name for every copy, whatever its data directory: the installer (Inno Setup
+/// `AppMutex`, installer/komunikator.iss) asks to close the program while it exists.
+pub const APP_MUTEX: &str = "komunikator-app";
+
+/// Held while this copy runs (its data-directory mutex, then the app mutex); the names are
+/// free again once it drops.
+pub struct InstanceGuard(Option<HANDLE>, Option<HANDLE>);
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        if let Some(h) = self.0 {
+        for h in [self.0, self.1].into_iter().flatten() {
             let _ = unsafe { CloseHandle(h) };
         }
     }
@@ -33,11 +38,19 @@ impl Drop for InstanceGuard {
 /// `Some` when this is the only copy for `data_dir`. Otherwise asks the running copy to show
 /// its window and returns `None`; the caller exits.
 pub fn claim(data_dir: &Path) -> Option<InstanceGuard> {
-    let guard = try_claim(data_dir);
-    if guard.is_none() {
+    let Some(mut guard) = try_claim(data_dir) else {
         show_running();
-    }
-    guard
+        return None;
+    };
+    guard.1 = hold_app_mutex();
+    Some(guard)
+}
+
+/// Creates (or joins) the app mutex; `None` only when Windows refuses, which costs no more
+/// than the installer not noticing this copy.
+fn hold_app_mutex() -> Option<HANDLE> {
+    let name = wide(APP_MUTEX);
+    unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.ok()
 }
 
 /// A window program is running for `data_dir`. Only looks: the name stays free for one that
@@ -63,13 +76,13 @@ fn try_claim(data_dir: &Path) -> Option<InstanceGuard> {
         Err(e) => Err(WIN32_ERROR::from_error(e).unwrap_or_default()),
     };
     match (outcome(code), created) {
-        (Claimed::Ours, Ok(handle)) => Some(InstanceGuard(Some(handle))),
+        (Claimed::Ours, Ok(handle)) => Some(InstanceGuard(Some(handle), None)),
         (Claimed::Running, Ok(handle)) => {
             let _ = unsafe { CloseHandle(handle) };
             None
         }
         (Claimed::Running, Err(_)) => None,
-        _ => Some(InstanceGuard(None)),
+        _ => Some(InstanceGuard(None, None)),
     }
 }
 
@@ -155,6 +168,18 @@ mod tests {
         assert!(running(dir.path()));
         drop(guard);
         assert!(!running(dir.path()));
+    }
+
+    #[test]
+    fn the_installer_sees_the_fixed_app_mutex() {
+        let held = hold_app_mutex();
+        assert!(held.is_some());
+        let name = wide(APP_MUTEX);
+        let opened = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) };
+        let _ = unsafe { CloseHandle(opened.unwrap()) };
+        // No namespace prefix: Inno Setup's AppMutex looks the name up in the user's session.
+        assert!(!APP_MUTEX.contains('\\'));
+        let _ = unsafe { CloseHandle(held.unwrap()) };
     }
 
     #[test]

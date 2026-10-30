@@ -83,6 +83,17 @@ pub struct Window {
     inner: RefCell<Inner>,
 }
 
+/// The program icon (resource 1, komunikator.rc) at the system size `metric`; the status disc
+/// when the exe has no icon (the test binaries).
+fn app_icon(instance: HINSTANCE, metric: SYSTEM_METRICS_INDEX, fallback: u32) -> HICON {
+    let size = unsafe { GetSystemMetrics(metric) };
+    let loaded = unsafe { LoadImageW(Some(instance), PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR) };
+    match loaded {
+        Ok(h) => HICON(h.0),
+        Err(_) => make_icon(&tray_pixels(TrayState::Connected, false, fallback), fallback),
+    }
+}
+
 impl Window {
     pub fn create(app: App, start: Start) -> windows::core::Result<Rc<Window>> {
         unsafe {
@@ -92,8 +103,8 @@ impl Window {
             };
             let _ = InitCommonControlsEx(&icc);
             let instance: HINSTANCE = GetModuleHandleW(None)?.into();
-            let icon = make_icon(&tray_pixels(TrayState::Connected, false, 32), 32);
-            let small = make_icon(&tray_pixels(TrayState::Connected, false, 16), 16);
+            let icon = app_icon(instance, SM_CXICON, 32);
+            let small = app_icon(instance, SM_CXSMICON, 16);
             let class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(wndproc),

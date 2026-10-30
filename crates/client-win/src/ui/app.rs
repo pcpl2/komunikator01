@@ -111,6 +111,9 @@ pub fn run(opts: Options) -> i32 {
     };
     // The exe may have moved since the entry was written (an update, another folder).
     let mut startup_notice = opts.updated.then(|| format!("{UPDATED_TO}{}", current_version()));
+    if !opts.smoke {
+        settings.autostart = wanted_autostart(settings.autostart, autostart_enabled());
+    }
     if settings.autostart && !opts.smoke {
         if let Err(e) = set_autostart(true) {
             startup_notice = Some(format!("nie udało się odświeżyć uruchamiania z Windows: {e}"));
@@ -204,6 +207,12 @@ const UPDATE_DOWNLOADING: &str = "pobieranie aktualizacji…";
 const UPDATE_READY: &str = "aktualizacja gotowa — zostanie zainstalowana, gdy nie będziesz w rozmowie";
 const UPDATE_FAILED: &str = "aktualizacja nieudana: ";
 const UPDATED_TO: &str = "zaktualizowano do wersji ";
+
+/// Whether to start with Windows: the saved choice, or the Run entry the installer wrote (so
+/// the settings dialog shows it, and the entry follows the exe after an update).
+fn wanted_autostart(saved: bool, registered: bool) -> bool {
+    saved || registered
+}
 
 /// What a background update check reports back to the window.
 enum UpdateMsg {
@@ -927,6 +936,14 @@ mod tests {
         let v = ScratchVault::new();
         v.store(&Secret::Token([3; 32]), "Ola@stary.pl:7700").unwrap();
         (s, v)
+    }
+
+    #[test]
+    fn autostart_set_by_the_installer_is_adopted() {
+        assert!(wanted_autostart(false, true), "the installer's Run entry turns the setting on");
+        assert!(wanted_autostart(true, false), "a saved choice is kept (and the entry rewritten)");
+        assert!(wanted_autostart(true, true));
+        assert!(!wanted_autostart(false, false));
     }
 
     #[test]

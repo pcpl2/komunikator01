@@ -1,8 +1,9 @@
 # Wydanie klienta: uruchamiane tylko ręcznie (Actions → Wydanie klienta → Run workflow).
 # Wersję podaje się w formularzu; trafia do Cargo.toml tylko na czas budowania (bez commita),
 # a tag stawiany jest na commicie, z którego uruchomiono workflow.
-# Tworzy release z tagiem client-vX.Y.Z: komunikator.exe dla graczy oraz, gdy jest klucz,
-# podpisaną aktualizację (manifest.bin + komunikator-X.Y.Z.exe) do wgrania na serwer.
+# Tworzy release z tagiem client-vX.Y.Z: instalator komunikator-setup-X.Y.Z.exe i komunikator.exe
+# (wersja przenośna) dla graczy oraz, gdy jest klucz, podpisaną aktualizację (manifest.bin +
+# komunikator-X.Y.Z.exe) do wgrania na serwer.
 name: Wydanie klienta
 run-name: Wydanie klienta ${{ inputs.version }}
 
@@ -127,14 +128,27 @@ jobs:
               --version "${{ steps.version.outputs.version }}" --out update
             cp update/* dist/
           fi
-          (cd dist && sha256sum * > SHA256SUMS)
+
+      # Instalator Inno Setup (installer/komunikator.iss) z tego samego komunikator.exe.
+      - name: Instalator
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DExeDir=$PWD\target\release" "/DOutputDir=$PWD\dist" installer\komunikator.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem dist
 
       - name: Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          (cd dist && sha256sum * > SHA256SUMS)
           gh release create "${{ steps.version.outputs.tag }}" dist/* \
             --target "$GITHUB_SHA" \
             --title "Komunikator ${{ steps.version.outputs.version }}" \
-            --notes "Dla graczy: komunikator.exe (pierwsze uruchomienie: docs/pierwsze-uruchomienie.md). Aktualizacja dla zainstalowanych programów: manifest.bin i komunikator-X.Y.Z.exe skopiuj do katalogu updates obok docker-compose.yml na serwerze (docs/wydanie.md)."
+            --notes "Dla graczy: komunikator-setup-${{ steps.version.outputs.version }}.exe (instalator) albo komunikator.exe (wersja przenośna); pierwsze uruchomienie: docs/pierwsze-uruchomienie.md. Aktualizacja dla zainstalowanych programów: manifest.bin i komunikator-X.Y.Z.exe skopiuj do katalogu updates obok docker-compose.yml na serwerze (docs/wydanie.md)."

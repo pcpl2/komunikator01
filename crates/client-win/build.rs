@@ -3,6 +3,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=komunikator.rc");
     println!("cargo:rerun-if-changed=komunikator.manifest");
+    println!("cargo:rerun-if-changed=icon/komunikator.ico");
     // The built-in server (src/defaults.rs).
     println!("cargo:rerun-if-env-changed=KOMUNIKATOR_SERVER");
     println!("cargo:rerun-if-env-changed=KOMUNIKATOR_FINGERPRINT");

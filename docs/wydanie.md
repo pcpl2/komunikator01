@@ -99,7 +99,9 @@ Serwer i klient mają osobne wersje:
 | Część | Tag | Wynik |
 |---|---|---|
 | Serwer | `server-vX.Y.Z` | obraz `ghcr.io/pcpl2/komunikator-server:X.Y.Z` i `:latest`; release z digestem obrazu |
-| Klient | `client-vX.Y.Z` | release: `komunikator.exe`, `komunikator-cli.exe`, `SHA256SUMS`, a z kluczem także `manifest.bin` i `komunikator-X.Y.Z.exe` |
+| Klient | `client-vX.Y.Z` | release: instalator `komunikator-setup-X.Y.Z.exe`, `komunikator.exe` (wersja przenośna), `komunikator-cli.exe`, `SHA256SUMS`, a z kluczem także `manifest.bin` i `komunikator-X.Y.Z.exe` |
+
+Instalator (Inno Setup, `installer/komunikator.iss`) workflow buduje z tego samego `komunikator.exe`. Instaluje dla bieżącego użytkownika, bez UAC, do `%LOCALAPPDATA%\Programs\Komunikator`, bo program aktualizuje się sam i potrzebuje folderu z prawem zapisu. Pyta o uruchamianie z Windows i skrót na pulpicie. Gdy program działa, prosi o jego zamknięcie. Jeśli na runnerze nie ma Inno Setup, krok instaluje go przez `choco`. Lokalnie: `ISCC.exe /DAppVersion=X.Y.Z installer\komunikator.iss` (bierze `target\release\komunikator.exe`, wynik w `dist`). Ikonę programu i instalatora rysuje `crates/client-win/icon/make_icon.py`.
 
 Wersje w `Cargo.toml` w repozytorium dotyczą tylko budowania lokalnego i nie trzeba ich zmieniać. Wersja ma zawsze postać `x.y.z`, same cyfry. Klient przyjmuje tylko wersję ściśle nowszą od własnej, a workflow pilnuje tego samego.
 

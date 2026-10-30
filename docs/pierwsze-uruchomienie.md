@@ -70,7 +70,7 @@ Katalog `data` trzyma certyfikat i klucz serwera oraz bazę kont. To zwykły kat
    - `SERVER_ADDRESS`: ten sam adres co `public_address`, np. `gra.example.pl:7700`;
    - `SERVER_FINGERPRINT`: 64 znaki z linii `fingerprint:`.
 2. Uruchom `Actions → Wydanie klienta → Run workflow` z wersją `0.1.0`.
-3. Powstanie release `client-v0.1.0` z `komunikator.exe` dla graczy. Program ma wbudowany adres serwera i klucz wydań, a okno logowania pyta tylko o nazwę i hasło. Bez sekretów z kroków 2 i 5 workflow się zatrzyma.
+3. Powstanie release `client-v0.1.0` z instalatorem `komunikator-setup-0.1.0.exe` dla graczy (i `komunikator.exe` w wersji przenośnej). Program ma wbudowany adres serwera i klucz wydań, a okno logowania pyta tylko o nazwę i hasło. Bez sekretów z kroków 2 i 5 workflow się zatrzyma.
 
 ### 6. Twoje konto administratora
 
@@ -90,7 +90,7 @@ docker exec komunikator komunikator-server make-admin --config /etc/komunikator/
 
 Wygeneruj osobny kod dla każdej osoby tym samym poleceniem `invite`. Kod jest jednorazowy i domyślnie ważny 7 dni.
 
-Wyślij każdemu prywatną wiadomością `komunikator.exe` z release `client-v0.1.0` i jego kod, nie na publicznym kanale. Repozytorium jest prywatne, więc znajomi nie pobiorą pliku z GitHuba sami.
+Wyślij każdemu prywatną wiadomością instalator `komunikator-setup-X.Y.Z.exe` z najnowszego release `client-v…` i jego kod, nie na publicznym kanale. Repozytorium jest prywatne, więc znajomi nie pobiorą pliku z GitHuba sami.
 
 Później przydadzą się polecenia (każde z `docker exec komunikator komunikator-server … --config /etc/komunikator/komunikator.toml`):
 - `users`: kto ma konto;
@@ -122,8 +122,8 @@ Później przydadzą się polecenia (każde z `docker exec komunikator komunikat
 
 ## B. Gracz
 
-1. Utwórz folder, np. `C:\Gry\Komunikator`, i wrzuć do niego `komunikator.exe`. Program musi móc zapisywać w tym folderze, więc nie wybieraj `Program Files`.
-2. Uruchom program. Jeśli Windows pokaże „System Windows ochronił ten komputer”, kliknij **Więcej informacji → Uruchom mimo to**. Program nie ma płatnego podpisu wydawcy, dlatego to ostrzeżenie pojawia się tylko za pierwszym razem.
+1. Uruchom instalator `komunikator-setup-X.Y.Z.exe`. Jeśli Windows pokaże „System Windows ochronił ten komputer”, kliknij **Więcej informacji → Uruchom mimo to**. Instalator nie ma płatnego podpisu wydawcy, stąd to ostrzeżenie.
+2. Instalator nie pyta o uprawnienia administratora i instaluje program tylko dla Ciebie, do `%LOCALAPPDATA%\Programs\Komunikator` (stamtąd program sam się aktualizuje). Możesz zaznaczyć **Uruchamiaj Komunikator razem z Windows** i skrót na pulpicie. Na końcu zostaw zaznaczone **Uruchom Komunikator**. Kto woli bez instalacji: `komunikator.exe` z release wrzuć do własnego folderu z prawem zapisu (nie `Program Files`) i uruchom.
 3. Wybierz **Mam zaproszenie** i wklej cały kod `kom1-…`. Kto ma już konto, wybiera **Mam już konto** i wpisuje tylko nazwę i hasło.
 4. Wpisz nazwę użytkownika (1–32 znaki: litery, cyfry, `_ - .`) oraz hasło (co najmniej 8 znaków, dwa razy). Hasło wpisujesz tylko raz, bo program zapamiętuje sesję.
 5. Otwórz **Ustawienia…** i ustaw:
@@ -144,6 +144,8 @@ Krzyżyk chowa okno do zasobnika, ale program działa dalej. Kliknięcie ikony l
 - szary: brak połączenia.
 
 Jeśli gra działa jako administrator i nie przepuszcza skrótów, włącz w ustawieniach **Uruchamiaj jako administrator**.
+
+Nowsze wersje program instaluje sam. Ponowne uruchomienie instalatora (np. nowszego) nadpisuje program w tym samym miejscu, a konto i ustawienia zostają. Odinstalowanie (Ustawienia Windows → Aplikacje) usuwa program, skróty i uruchamianie z Windows. Zostawia dane w `%APPDATA%\komunikator` i zapamiętane logowanie, więc po ponownej instalacji nie trzeba się logować ani weryfikować osób od nowa.
 
 ## C. Pierwszy wspólny wieczór: co sprawdzić
 

@@ -2,3 +2,7 @@
 #define RT_MANIFEST 24
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "komunikator.manifest"
+
+// The program icon (Explorer, shortcuts, taskbar, the window); the installer uses the same file.
+// Drawn by icon/make_icon.py. ID 1 is what ui/window.rs loads.
+1 ICON "icon/komunikator.ico"
