@@ -276,6 +276,7 @@ pub struct SettingsInput {
     pub sensitivity: f32,
     pub noise_suppression: bool,
     pub continuous: bool,
+    pub echo_cancellation: bool,
     pub hotkey_mute: Option<String>,
     pub hotkey_deafen: Option<String>,
     pub sounds: Sounds,
@@ -291,6 +292,7 @@ impl SettingsInput {
             sensitivity: s.vad_sensitivity,
             noise_suppression: s.noise_suppression,
             continuous: s.continuous,
+            echo_cancellation: s.echo_cancellation,
             hotkey_mute: s.hotkey_mute.clone(),
             hotkey_deafen: s.hotkey_deafen.clone(),
             sounds: s.sounds.clone(),
@@ -305,6 +307,7 @@ impl SettingsInput {
         s.vad_sensitivity = self.sensitivity;
         s.noise_suppression = self.noise_suppression;
         s.continuous = self.continuous;
+        s.echo_cancellation = self.echo_cancellation;
         s.hotkey_mute = self.hotkey_mute;
         s.hotkey_deafen = self.hotkey_deafen;
         s.sounds = self.sounds;
@@ -981,6 +984,7 @@ const ID_ADMIN: u16 = 513;
 const ID_ACCOUNT: u16 = 514;
 const ID_DENOISE: u16 = 515;
 const ID_CONTINUOUS: u16 = 516;
+const ID_ECHO: u16 = 517;
 
 const HOTKEY_TAKEN_KEPT: &str = "OK zapisze go mimo to";
 
@@ -1025,6 +1029,9 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
     unsafe { SendMessageW(meter, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(100))) };
     y += 26;
     let denoise_text = "Tłumienie szumów mikrofonu (wentylator, klawiatura, szum tła)";
+    let echo_text = "Usuwanie echa (gdy grasz na głośnikach, inni nie słyszą siebie)";
+    let echo = d.checkbox(ID_ECHO, echo_text, current.echo_cancellation, m, y, w - 2 * m);
+    y += 24;
     let denoise = d.checkbox(ID_DENOISE, denoise_text, current.noise_suppression, m, y, w - 2 * m);
     let continuous_text = "Tryb ciągły: mikrofon nadaje cały czas, bez wykrywania mowy";
     let continuous = d.checkbox(ID_CONTINUOUS, continuous_text, current.continuous, m, y + 24, w - 2 * m);
@@ -1111,6 +1118,7 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
                     sensitivity: sensitivity_from_trackbar(u32::try_from(pos).unwrap_or(0)),
                     noise_suppression: checked(denoise),
                     continuous: checked(continuous),
+                    echo_cancellation: checked(echo),
                     hotkey_mute: mute,
                     hotkey_deafen: deafen,
                     sounds: Sounds { join_leave: checked(sound_join), chat: checked(sound_chat) },
@@ -1581,6 +1589,7 @@ mod tests {
                         SendMessageW(scripted::item(d, ID_SOUND_CHAT), BM_SETCHECK, Some(WPARAM(0)), None);
                         SendMessageW(scripted::item(d, ID_DENOISE), BM_SETCHECK, Some(WPARAM(0)), None);
                         SendMessageW(scripted::item(d, ID_CONTINUOUS), BM_SETCHECK, Some(WPARAM(1)), None);
+                        SendMessageW(scripted::item(d, ID_ECHO), BM_SETCHECK, Some(WPARAM(0)), None);
                         scripted::press(d, ID_OK);
                     }
                     1 => {
@@ -1604,6 +1613,8 @@ mod tests {
         want.noise_suppression = false;
         assert!(!current.continuous, "off by default");
         want.continuous = true;
+        assert!(current.echo_cancellation, "on by default");
+        want.echo_cancellation = false;
         assert_eq!(result, Some(want));
         assert!(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(owner) }.as_bool());
         unsafe {

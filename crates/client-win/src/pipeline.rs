@@ -1,11 +1,13 @@
 //! Capture and render loops connecting audio devices to the network session.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use client_core::audio::activity::Activity;
 use client_core::audio::codec::{Decoder, Encoder};
 use client_core::audio::denoise::Denoiser;
+use client_core::audio::echo::EchoCanceller;
 use client_core::audio::frame::{EncodedFrame, IncomingFrame, Pcm, FRAME_SAMPLES, MAX_PACKET};
 use client_core::audio::jitter::{JitterBuffer, Pop};
 use client_core::audio::mixer::{accumulate, clip};
@@ -27,6 +29,44 @@ pub struct Controls {
     pub noise_suppression: AtomicBool,
     /// Send every frame, not only speech; mute and deafen still apply.
     pub continuous: AtomicBool,
+    /// Remove from the mic what the speakers played (people on speakers).
+    pub echo_cancellation: AtomicBool,
+    /// What the render loop played, for the capture loop's echo canceller.
+    pub echo_reference: EchoReference,
+}
+
+/// Played frames waiting for the capture thread. Bounded: when capture stalls the oldest
+/// go, since an echo canceller only needs the recent past.
+pub struct EchoReference(Mutex<VecDeque<Pcm>>);
+
+/// One second.
+const ECHO_REFERENCE_FRAMES: usize = 50;
+
+impl Default for EchoReference {
+    fn default() -> Self {
+        Self(Mutex::new(VecDeque::with_capacity(ECHO_REFERENCE_FRAMES)))
+    }
+}
+
+impl EchoReference {
+    pub fn push(&self, pcm: &Pcm) {
+        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() == ECHO_REFERENCE_FRAMES {
+            q.pop_front();
+        }
+        q.push_back(*pcm);
+    }
+
+    /// Hands every waiting frame to `f`, oldest first; the lock is not held while `f` runs.
+    pub fn drain(&self, mut f: impl FnMut(&Pcm)) {
+        loop {
+            let next = self.0.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            match next {
+                Some(pcm) => f(&pcm),
+                None => return,
+            }
+        }
+    }
 }
 
 /// Reads the microphone until `stop` or a source error. Sequence numbers advance every
@@ -48,6 +88,7 @@ pub fn capture_loop(
     vad.set_sensitivity(f32::from_bits(applied));
     let mut packet = [0u8; MAX_PACKET];
     let mut denoiser = Denoiser::new();
+    let mut echo = EchoCanceller::new();
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         if let Err(e) = src.read_frame(&mut pcm) {
@@ -60,6 +101,11 @@ pub fn capture_loop(
         if wanted != applied {
             applied = wanted;
             vad.set_sensitivity(f32::from_bits(wanted));
+        }
+        // Echo first: noise suppression would distort the echo the canceller has to match.
+        if controls.echo_cancellation.load(Ordering::Relaxed) {
+            controls.echo_reference.drain(|far| echo.render(far));
+            echo.capture(&mut pcm);
         }
         if controls.noise_suppression.load(Ordering::Relaxed) {
             denoiser.process(&mut pcm);
@@ -152,6 +198,9 @@ pub fn render_loop(
         if let Err(e) = sink.write_frame(&out) {
             tracing::warn!("render stopped: {e:?}");
             return inp;
+        }
+        if controls.echo_cancellation.load(Ordering::Relaxed) {
+            controls.echo_reference.push(&out);
         }
     }
     inp
@@ -453,6 +502,89 @@ mod tests {
         let (off, on) = (hiss_level(false), hiss_level(true));
         assert!(off > -45.0, "hiss without suppression: {off:.1} dBFS");
         assert!(on < off - 20.0, "hiss with suppression: {on:.1} dBFS, without: {off:.1}");
+    }
+
+    /// A microphone that hears only the speakers: each read plays `far` (as the render
+    /// thread would hand it over) and returns its echo 40 ms later at -10 dB.
+    struct Room {
+        far: std::vec::IntoIter<Pcm>,
+        history: Vec<f32>,
+        controls: Arc<Controls>,
+    }
+
+    impl FrameSource for Room {
+        fn read_frame(&mut self, out: &mut Pcm) -> Result<(), AudioError> {
+            let f = self.far.next().ok_or(AudioError::Other("end".into()))?;
+            self.controls.echo_reference.push(&f);
+            self.history.extend_from_slice(&f);
+            *out = std::array::from_fn(|i| self.history[i] * 0.3);
+            self.history.drain(..FRAME_SAMPLES);
+            Ok(())
+        }
+    }
+
+    /// Frames sent in the last two of eight seconds of someone talking through my speakers.
+    fn echo_sent(echo_cancellation: bool) -> usize {
+        let (mut seed, mut y) = (1u32, 0.0f32);
+        // Phrases of 0.7 s with 0.3 s pauses, so the VAD does not take the echo for noise.
+        let far: Vec<Pcm> = (0..400)
+            .map(|k| {
+                let talking = if k % 50 < 35 { 1.0 } else { 0.0 };
+                std::array::from_fn(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let white = ((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.3;
+                    y = 0.7 * y + 0.3 * white;
+                    y * talking
+                })
+            })
+            .collect();
+        let controls = Arc::new(Controls::default());
+        controls.echo_cancellation.store(echo_cancellation, Ordering::Relaxed);
+        let room = Room { far: far.into_iter(), history: vec![0.0; 1920], controls: controls.clone() };
+        let (tx, mut rx) = mpsc::channel(1024);
+        capture_loop(
+            room,
+            Vad::new(0.5),
+            Encoder::new().unwrap(),
+            tx,
+            controls,
+            Arc::new(Activity::new()),
+            Arc::new(AtomicU32::new(0.5f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        std::iter::from_fn(|| rx.try_recv().ok()).filter(|f| f.seq >= 300).count()
+    }
+
+    #[test]
+    fn echo_cancellation_keeps_the_speakers_out_of_the_mic() {
+        assert!(echo_sent(false) > 50, "without it the echo is sent");
+        assert_eq!(echo_sent(true), 0, "with it the echo is not sent");
+    }
+
+    #[test]
+    fn render_hands_what_it_played_to_the_echo_canceller() {
+        let (tx, rx) = mpsc::channel(256);
+        let mut enc = Encoder::new().unwrap();
+        let mut buf = [0u8; 256];
+        for n in 0..10 {
+            let len = enc.encode(&sine(n), &mut buf).unwrap();
+            tx.try_send(IncomingFrame::new(1, n as u32, &buf[..len]).unwrap()).unwrap();
+        }
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let controls = Arc::new(Controls::default());
+        controls.echo_cancellation.store(true, Ordering::Relaxed);
+        render_loop(
+            Recorder { frames: frames.clone(), limit: 12 },
+            rx,
+            controls.clone(),
+            Arc::new(GainTable::new()),
+            Arc::new(Activity::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut handed = Vec::new();
+        controls.echo_reference.drain(|f| handed.push(*f));
+        // Exactly what the sink took; the refused 13th frame never played.
+        assert_eq!(handed, *frames.borrow());
     }
 
     #[test]

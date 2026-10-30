@@ -129,6 +129,7 @@ Później przydadzą się polecenia (każde z `docker exec komunikator komunikat
 5. Otwórz **Ustawienia…** i ustaw:
    - mikrofon i głośniki/słuchawki;
    - czułość mowy: mów normalnie i obserwuj pasek poziomu;
+   - **Usuwanie echa** (domyślnie włączone): kto gra na głośnikach, nie odsyła innym ich własnych głosów. Działa po kilku sekundach rozmowy, gdy program „nauczy się” pokoju. Na słuchawkach nie przeszkadza;
    - **Tłumienie szumów mikrofonu** (domyślnie włączone): usuwa szum wentylatora, klawiatury i syk mikrofonu. Jeśli mimo to inni słyszą u Ciebie szum, sprawdź w Windows, czy nie jest włączone „Wzmocnienie mikrofonu” (Ustawienia dźwięku → Więcej ustawień dźwięku → Nagrywanie → mikrofon → Właściwości → Poziomy) i ustaw je na 0 dB;
    - opcjonalnie **Tryb ciągły**: mikrofon nadaje cały czas, bez wykrywania mowy (suwak czułości jest wtedy nieaktywny). Przydaje się, gdy wykrywanie ucina początki zdań. Wyciszenie skrótem i przyciskiem działa dalej. Najlepiej z włączonym tłumieniem szumów;
    - skróty `Wycisz mikrofon` i `Wycisz wszystkich`, np. `Ctrl+Alt+M` i `Ctrl+Alt+D`. Skrót musi zawierać Ctrl, Alt lub Shift;

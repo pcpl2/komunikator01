@@ -914,6 +914,7 @@ impl App {
             c.controls.deafened.store(self.state.deafened(), Relaxed);
             c.controls.noise_suppression.store(self.state.settings().noise_suppression, Relaxed);
             c.controls.continuous.store(self.state.settings().continuous, Relaxed);
+            c.controls.echo_cancellation.store(self.state.settings().echo_cancellation, Relaxed);
         }
     }
 

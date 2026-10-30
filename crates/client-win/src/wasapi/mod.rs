@@ -1,4 +1,6 @@
-//! WASAPI capture and render streams (48 kHz mono f32, communications category).
+//! WASAPI capture and render streams (48 kHz mono f32, communications category). The
+//! microphone is opened raw where the driver allows it: the program does its own echo
+//! cancellation and noise suppression, and Windows' voice processing dulls the voice.
 
 mod capture;
 mod mmcss;
@@ -17,7 +19,8 @@ use windows::Win32::Media::Audio::{
     IAudioClient2, IAudioClientDuckingControl, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-    AUDCLNT_STREAMOPTIONS_NONE, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
+    AUDCLNT_STREAMOPTIONS, AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW,
+    AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
     AudioClientProperties, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
@@ -70,30 +73,21 @@ fn open_stream(flow: EDataFlow, device_id: Option<&str>, buffer_ms: i64) -> Resu
             Some(id) => enumerator.GetDevice(&HSTRING::from(id))?,
             None => enumerator.GetDefaultAudioEndpoint(flow, eCommunications)?,
         };
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-
-        // Communications category enables the system echo/noise processing where available.
-        let props = AudioClientProperties {
-            cbSize: size_of::<AudioClientProperties>() as u32,
-            bIsOffload: false.into(),
-            eCategory: AudioCategory_Communications,
-            Options: AUDCLNT_STREAMOPTIONS_NONE,
-        };
-        client.cast::<IAudioClient2>()?.SetClientProperties(&props)?;
-
-        let format = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-            nChannels: 1,
-            nSamplesPerSec: SAMPLE_RATE,
-            nAvgBytesPerSec: SAMPLE_RATE * 4,
-            nBlockAlign: 4,
-            wBitsPerSample: 32,
-            cbSize: 0,
-        };
-        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, buffer_ms * 10_000, 0, &format, None)?;
+        let mut client = None;
+        for &options in processing_options(flow) {
+            match init_client(&device, options, buffer_ms) {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                // Not every driver offers raw capture; the processed stream still works.
+                Err(e) if options == AUDCLNT_STREAMOPTIONS_RAW => {
+                    tracing::info!("raw microphone not available, using Windows processing: {e}")
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let client = client.ok_or_else(|| AudioError::Other("no stream options left".into()))?;
 
         // A communications stream would otherwise make Windows lower the game's volume.
         // Best effort: failing here must not keep the device from opening.
@@ -113,6 +107,48 @@ fn open_stream(flow: EDataFlow, device_id: Option<&str>, buffer_ms: i64) -> Resu
         stream.client.SetEventHandle(stream.event)?;
         Ok(stream)
     }
+}
+
+/// Stream options to try in order: the microphone without Windows' processing first.
+fn processing_options(flow: EDataFlow) -> &'static [AUDCLNT_STREAMOPTIONS] {
+    if flow == eCapture {
+        &[AUDCLNT_STREAMOPTIONS_RAW, AUDCLNT_STREAMOPTIONS_NONE]
+    } else {
+        &[AUDCLNT_STREAMOPTIONS_NONE]
+    }
+}
+
+/// A fresh client on `device`, initialized for 48 kHz mono f32 with `options`.
+unsafe fn init_client(
+    device: &IMMDevice,
+    options: AUDCLNT_STREAMOPTIONS,
+    buffer_ms: i64,
+) -> windows::core::Result<IAudioClient> {
+    let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+    // Communications category enables the system echo/noise processing where available
+    // (unless `options` asks for raw).
+    let props = AudioClientProperties {
+        cbSize: size_of::<AudioClientProperties>() as u32,
+        bIsOffload: false.into(),
+        eCategory: AudioCategory_Communications,
+        Options: options,
+    };
+    client.cast::<IAudioClient2>()?.SetClientProperties(&props)?;
+
+    let format = WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+        nChannels: 1,
+        nSamplesPerSec: SAMPLE_RATE,
+        nAvgBytesPerSec: SAMPLE_RATE * 4,
+        nBlockAlign: 4,
+        wBitsPerSample: 32,
+        cbSize: 0,
+    };
+    let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, buffer_ms * 10_000, 0, &format, None)?;
+    Ok(client)
 }
 
 /// Notices when Windows switches the default communications device (e.g. a headset is
@@ -183,5 +219,16 @@ fn list_devices(flow: EDataFlow) -> windows::core::Result<Vec<(String, String)>>
             out.push((id, name));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_microphone_asks_for_raw_first_and_the_speakers_never() {
+        assert_eq!(processing_options(eCapture), [AUDCLNT_STREAMOPTIONS_RAW, AUDCLNT_STREAMOPTIONS_NONE]);
+        assert_eq!(processing_options(eRender), [AUDCLNT_STREAMOPTIONS_NONE]);
     }
 }

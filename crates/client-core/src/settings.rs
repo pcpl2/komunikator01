@@ -41,6 +41,8 @@ pub struct Settings {
     pub noise_suppression: bool,
     /// Send the microphone all the time, without voice detection (mute still applies).
     pub continuous: bool,
+    /// AEC3 on the microphone: removes what the speakers played.
+    pub echo_cancellation: bool,
     /// e.g. "Ctrl+Shift+M"
     pub hotkey_mute: Option<String>,
     pub hotkey_deafen: Option<String>,
@@ -63,6 +65,7 @@ impl Default for Settings {
             vad_sensitivity: 0.5,
             noise_suppression: true,
             continuous: false,
+            echo_cancellation: true,
             hotkey_mute: None,
             hotkey_deafen: None,
             sounds: Sounds::default(),
@@ -175,6 +178,7 @@ mod tests {
         assert!(s.sounds.join_leave && s.sounds.chat);
         assert!(s.noise_suppression);
         assert!(!s.continuous);
+        assert!(s.echo_cancellation);
         assert!(broken.is_none());
     }
 
@@ -193,6 +197,7 @@ mod tests {
             vad_sensitivity: 0.8,
             noise_suppression: false,
             continuous: true,
+            echo_cancellation: false,
             hotkey_mute: Some("Ctrl+Shift+M".into()),
             hotkey_deafen: Some("Ctrl+Shift+D".into()),
             sounds: Sounds { join_leave: true, chat: false },
@@ -242,6 +247,7 @@ chat = false
 ").unwrap();
         let (_, s, _) = SettingsStore::load(&p);
         assert!(s.noise_suppression);
+        assert!(s.echo_cancellation);
     }
 
     #[test]
