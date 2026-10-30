@@ -37,6 +37,10 @@ pub struct Settings {
     pub render_device: Option<String>,
     /// 0.0..=1.0
     pub vad_sensitivity: f32,
+    /// RNNoise on the microphone before the VAD.
+    pub noise_suppression: bool,
+    /// Send the microphone all the time, without voice detection (mute still applies).
+    pub continuous: bool,
     /// e.g. "Ctrl+Shift+M"
     pub hotkey_mute: Option<String>,
     pub hotkey_deafen: Option<String>,
@@ -57,6 +61,8 @@ impl Default for Settings {
             capture_device: None,
             render_device: None,
             vad_sensitivity: 0.5,
+            noise_suppression: true,
+            continuous: false,
             hotkey_mute: None,
             hotkey_deafen: None,
             sounds: Sounds::default(),
@@ -167,6 +173,8 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert_eq!(s.vad_sensitivity, 0.5);
         assert!(s.sounds.join_leave && s.sounds.chat);
+        assert!(s.noise_suppression);
+        assert!(!s.continuous);
         assert!(broken.is_none());
     }
 
@@ -183,6 +191,8 @@ mod tests {
             capture_device: Some("Mikrofon".into()),
             render_device: Some("Słuchawki".into()),
             vad_sensitivity: 0.8,
+            noise_suppression: false,
+            continuous: true,
             hotkey_mute: Some("Ctrl+Shift+M".into()),
             hotkey_deafen: Some("Ctrl+Shift+D".into()),
             sounds: Sounds { join_leave: true, chat: false },
@@ -223,6 +233,15 @@ chat = false
         assert!(s.sounds.join_leave);
         assert_eq!(s.vad_sensitivity, 0.5);
         assert_eq!(s.window, None);
+    }
+
+    #[test]
+    fn file_from_before_noise_suppression_turns_it_on() {
+        let (_d, p) = path();
+        std::fs::write(&p, "vad_sensitivity = 0.3
+").unwrap();
+        let (_, s, _) = SettingsStore::load(&p);
+        assert!(s.noise_suppression);
     }
 
     #[test]

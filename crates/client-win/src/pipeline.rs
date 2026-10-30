@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use client_core::audio::activity::Activity;
 use client_core::audio::codec::{Decoder, Encoder};
+use client_core::audio::denoise::Denoiser;
 use client_core::audio::frame::{EncodedFrame, IncomingFrame, Pcm, FRAME_SAMPLES, MAX_PACKET};
 use client_core::audio::jitter::{JitterBuffer, Pop};
 use client_core::audio::mixer::{accumulate, clip};
@@ -22,6 +23,10 @@ const MAX_VOICES: usize = 16;
 pub struct Controls {
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
+    /// RNNoise on the microphone; read every frame so the setting applies live.
+    pub noise_suppression: AtomicBool,
+    /// Send every frame, not only speech; mute and deafen still apply.
+    pub continuous: AtomicBool,
 }
 
 /// Reads the microphone until `stop` or a source error. Sequence numbers advance every
@@ -42,6 +47,7 @@ pub fn capture_loop(
     let mut applied = sensitivity.load(Ordering::Relaxed);
     vad.set_sensitivity(f32::from_bits(applied));
     let mut packet = [0u8; MAX_PACKET];
+    let mut denoiser = Denoiser::new();
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         if let Err(e) = src.read_frame(&mut pcm) {
@@ -55,10 +61,13 @@ pub fn capture_loop(
             applied = wanted;
             vad.set_sensitivity(f32::from_bits(wanted));
         }
+        if controls.noise_suppression.load(Ordering::Relaxed) {
+            denoiser.process(&mut pcm);
+        }
         let speaking = vad.process(&pcm);
         // Deafen silences the mic too; the flags stay separate so undeafening restores
         // whatever mute state the user had.
-        let sending = speaking
+        let sending = (speaking || controls.continuous.load(Ordering::Relaxed))
             && !controls.muted.load(Ordering::Relaxed)
             && !controls.deafened.load(Ordering::Relaxed);
         activity.set_me(sending, vad.level_dbfs());
@@ -210,10 +219,20 @@ mod tests {
         shared_sensitivity: f32,
         activity: Arc<Activity>,
     ) -> Vec<u32> {
-        let (tx, mut rx) = mpsc::channel(1024);
         let controls = Arc::new(Controls::default());
         controls.muted.store(muted, Ordering::Relaxed);
         controls.deafened.store(deafened, Ordering::Relaxed);
+        run_capture_controls(frames, controls, vad_sensitivity, shared_sensitivity, activity)
+    }
+
+    fn run_capture_controls(
+        frames: Vec<Pcm>,
+        controls: Arc<Controls>,
+        vad_sensitivity: f32,
+        shared_sensitivity: f32,
+        activity: Arc<Activity>,
+    ) -> Vec<u32> {
+        let (tx, mut rx) = mpsc::channel(1024);
         capture_loop(
             Script(frames.into_iter()),
             Vad::new(vad_sensitivity),
@@ -245,6 +264,19 @@ mod tests {
     #[test]
     fn speech_sends_consecutive_seq() {
         assert_eq!(run_capture((0..3).map(sine).collect(), false), [0, 1, 2]);
+    }
+
+    #[test]
+    fn continuous_sends_silence_too_but_not_when_muted() {
+        let run = |muted: bool| {
+            let controls = Arc::new(Controls::default());
+            controls.continuous.store(true, Ordering::Relaxed);
+            controls.muted.store(muted, Ordering::Relaxed);
+            let frames = vec![[0.0; FRAME_SAMPLES]; 5];
+            run_capture_controls(frames, controls, 0.5, 0.5, Arc::new(Activity::new()))
+        };
+        assert_eq!(run(false), [0, 1, 2, 3, 4]);
+        assert!(run(true).is_empty());
     }
 
     #[test]
@@ -394,6 +426,33 @@ mod tests {
     fn capture_applies_new_sensitivity() {
         assert!(!speech_over_noise_sends(0.0), "low sensitivity stays closed");
         assert!(speech_over_noise_sends(1.0), "the shared value overrides the Vad's own");
+    }
+
+    /// Mic level after two seconds of fan-like hiss at about -35 dBFS.
+    fn hiss_level(noise_suppression: bool) -> f32 {
+        let (mut seed, mut y) = (1u32, 0.0f32);
+        let frames = (0..100)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let white = ((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.03;
+                    y = 0.9 * y + 0.1 * white;
+                    y * 10f32.sqrt()
+                })
+            })
+            .collect();
+        let controls = Arc::new(Controls::default());
+        controls.noise_suppression.store(noise_suppression, Ordering::Relaxed);
+        let activity = Arc::new(Activity::new());
+        run_capture_controls(frames, controls, 0.5, 0.5, activity.clone());
+        activity.mic_level_dbfs()
+    }
+
+    #[test]
+    fn noise_suppression_quiets_hiss_only_when_on() {
+        let (off, on) = (hiss_level(false), hiss_level(true));
+        assert!(off > -45.0, "hiss without suppression: {off:.1} dBFS");
+        assert!(on < off - 20.0, "hiss with suppression: {on:.1} dBFS, without: {off:.1}");
     }
 
     #[test]

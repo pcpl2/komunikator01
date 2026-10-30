@@ -153,6 +153,8 @@ fn main() -> anyhow::Result<()> {
         println!("{}", n.text);
     }
     let startup::Client { mut session, engine, trust, controls, gains, .. } = client;
+    controls.noise_suppression.store(saved.noise_suppression, std::sync::atomic::Ordering::Relaxed);
+    controls.continuous.store(saved.continuous, std::sync::atomic::Ordering::Relaxed);
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {

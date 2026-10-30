@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod codec;
+pub mod denoise;
 pub mod frame;
 pub mod jitter;
 pub mod mixer;

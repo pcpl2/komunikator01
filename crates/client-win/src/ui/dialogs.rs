@@ -274,6 +274,8 @@ pub struct SettingsInput {
     pub capture: Option<String>,
     pub render: Option<String>,
     pub sensitivity: f32,
+    pub noise_suppression: bool,
+    pub continuous: bool,
     pub hotkey_mute: Option<String>,
     pub hotkey_deafen: Option<String>,
     pub sounds: Sounds,
@@ -287,6 +289,8 @@ impl SettingsInput {
             capture: s.capture_device.clone(),
             render: s.render_device.clone(),
             sensitivity: s.vad_sensitivity,
+            noise_suppression: s.noise_suppression,
+            continuous: s.continuous,
             hotkey_mute: s.hotkey_mute.clone(),
             hotkey_deafen: s.hotkey_deafen.clone(),
             sounds: s.sounds.clone(),
@@ -299,6 +303,8 @@ impl SettingsInput {
         s.capture_device = self.capture;
         s.render_device = self.render;
         s.vad_sensitivity = self.sensitivity;
+        s.noise_suppression = self.noise_suppression;
+        s.continuous = self.continuous;
         s.hotkey_mute = self.hotkey_mute;
         s.hotkey_deafen = self.hotkey_deafen;
         s.sounds = self.sounds;
@@ -973,6 +979,8 @@ const ID_SOUND_CHAT: u16 = 511;
 const ID_AUTOSTART: u16 = 512;
 const ID_ADMIN: u16 = 513;
 const ID_ACCOUNT: u16 = 514;
+const ID_DENOISE: u16 = 515;
+const ID_CONTINUOUS: u16 = 516;
 
 const HOTKEY_TAKEN_KEPT: &str = "OK zapisze go mimo to";
 
@@ -1015,7 +1023,17 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
     d.label("Poziom mikrofonu", m, y, lw, 16);
     let meter = d.control(PROGRESS_CLASSW, "", 0, WINDOW_EX_STYLE::default(), ID_LEVEL, fx + 6, y, fw - 12, 16);
     unsafe { SendMessageW(meter, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(100))) };
-    y += 28;
+    y += 26;
+    let denoise_text = "Tłumienie szumów mikrofonu (wentylator, klawiatura, szum tła)";
+    let denoise = d.checkbox(ID_DENOISE, denoise_text, current.noise_suppression, m, y, w - 2 * m);
+    let continuous_text = "Tryb ciągły: mikrofon nadaje cały czas, bez wykrywania mowy";
+    let continuous = d.checkbox(ID_CONTINUOUS, continuous_text, current.continuous, m, y + 24, w - 2 * m);
+    // The sensitivity only matters while voice detection decides.
+    let follow_continuous = || {
+        let _ = unsafe { EnableWindow(slider, !checked(continuous)) };
+    };
+    follow_continuous();
+    y += 54;
 
     let hotkey_row = |id: u16, clear: u16, label: &str, saved: Option<&str>, err: u16, y: i32| {
         d.label(label, m, y + 4, lw, 16);
@@ -1062,6 +1080,7 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
     loop {
         match d.next() {
             Ev::Timer => level(),
+            Ev::Command { id: ID_CONTINUOUS, .. } => follow_continuous(),
             Ev::Command { id: ID_CLEAR_MUTE, .. } => clear_hotkey(mute_key, mute_err),
             Ev::Command { id: ID_CLEAR_DEAFEN, .. } => clear_hotkey(deafen_key, deafen_err),
             Ev::Command { id: ID_ACCOUNT, .. } => (env.open_account)(d.hwnd),
@@ -1090,6 +1109,8 @@ pub fn settings_dialog(owner: HWND, current: &SettingsInput, env: SettingsEnv) -
                     capture: selected(capture, &capture_ids),
                     render: selected(render, &render_ids),
                     sensitivity: sensitivity_from_trackbar(u32::try_from(pos).unwrap_or(0)),
+                    noise_suppression: checked(denoise),
+                    continuous: checked(continuous),
                     hotkey_mute: mute,
                     hotkey_deafen: deafen,
                     sounds: Sounds { join_leave: checked(sound_join), chat: checked(sound_chat) },
@@ -1558,6 +1579,8 @@ mod tests {
                         SendMessageW(scripted::item(d, ID_CAPTURE), CB_SETCURSEL, Some(WPARAM(1)), None);
                         SendMessageW(scripted::item(d, ID_SENSITIVITY), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(80)));
                         SendMessageW(scripted::item(d, ID_SOUND_CHAT), BM_SETCHECK, Some(WPARAM(0)), None);
+                        SendMessageW(scripted::item(d, ID_DENOISE), BM_SETCHECK, Some(WPARAM(0)), None);
+                        SendMessageW(scripted::item(d, ID_CONTINUOUS), BM_SETCHECK, Some(WPARAM(1)), None);
                         scripted::press(d, ID_OK);
                     }
                     1 => {
@@ -1577,6 +1600,10 @@ mod tests {
         want.sensitivity = 0.8;
         want.hotkey_mute = key;
         want.sounds.chat = false;
+        assert!(current.noise_suppression, "on by default");
+        want.noise_suppression = false;
+        assert!(!current.continuous, "off by default");
+        want.continuous = true;
         assert_eq!(result, Some(want));
         assert!(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(owner) }.as_bool());
         unsafe {

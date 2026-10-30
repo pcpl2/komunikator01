@@ -660,6 +660,7 @@ impl App {
         }
         new.apply_to(self.state.settings_mut());
         self.save_settings();
+        self.sync_controls();
         if !notices.is_empty() {
             self.local_notice = Some(notices.join("; "));
         }
@@ -905,12 +906,14 @@ impl App {
         self.sync_controls();
     }
 
-    /// Hands the mute state to the audio threads.
+    /// Hands the mute state and the microphone settings to the audio threads.
     fn sync_controls(&self) {
         if let Some(c) = &self.client {
             use std::sync::atomic::Ordering::Relaxed;
             c.controls.muted.store(self.state.muted(), Relaxed);
             c.controls.deafened.store(self.state.deafened(), Relaxed);
+            c.controls.noise_suppression.store(self.state.settings().noise_suppression, Relaxed);
+            c.controls.continuous.store(self.state.settings().continuous, Relaxed);
         }
     }
 
