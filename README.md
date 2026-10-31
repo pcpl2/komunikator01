@@ -82,7 +82,8 @@ Po zalogowaniu program pamięta sesję (token od serwera, odnawiany przy każdym
 - Po prawej czat pokoju; Enter wysyła. Kliknięcie wiadomości z adresem kopiuje pierwszy adres do schowka, prawy przycisk pozwala wybrać adres.
 - Krzyżyk chowa okno do zasobnika. Ikona w zasobniku: zielona (połączono), czerwona (wyciszony), ciemnoczerwona (wyciszeni wszyscy), szara (rozłączono), pomarańczowa kropka = nowa wiadomość. Lewy klik wycisza mikrofon; prawy: `Pokaż okno`, `Wycisz mikrofon`, `Wycisz wszystkich`, `Wyjdź`.
 - `Ustawienia…`: mikrofon i głośniki, czułość wykrywania mowy (z podglądem poziomu mikrofonu), usuwanie echa (WebRTC AEC3, domyślnie włączone, dla grających na głośnikach), tłumienie szumów mikrofonu (RNNoise, domyślnie włączone, działa od razu), tryb ciągły (mikrofon nadaje bez przerwy, bez wykrywania mowy), skróty globalne `Wycisz mikrofon` / `Wycisz wszystkich` (wymagają Ctrl, Alt lub Shift; zajęty skrót okno pokazuje, a drugie `OK` zapisuje go mimo to), dźwięki, `Uruchamiaj z Windows`, `Uruchamiaj jako administrator` (gdy gra działa jako administrator i nie przepuszcza skrótów) oraz `Konto…` — zmiana konta łączy od nowa.
-- Opcje: `--minimized` (start w zasobniku), `--data-dir <katalog>` (zamiast `%APPDATA%\komunikator`), `--smoke` (autotest: okno na sekundę, zapis ustawień, wyjście).
+- Wygląd jasny albo ciemny, tak jak ustawiono w Windows (Ustawienia → Personalizacja → Kolory → tryb aplikacji). Zmiana w Windows działa od razu, bez ponownego uruchamiania; w trybie dużego kontrastu program używa kolorów systemu.
+- Opcje: `--minimized` (start w zasobniku), `--data-dir <katalog>` (zamiast `%APPDATA%\komunikator`), `--smoke` (autotest: okno na sekundę, zapis ustawień, wyjście); ze zmienną `KOMUNIKATOR_SMOKE_SHOT=<plik.bmp>` zapisuje też obraz okna).
 
 #### Aktualizacje
 

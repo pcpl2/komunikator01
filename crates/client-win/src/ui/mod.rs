@@ -13,6 +13,8 @@ mod layout;
 mod render;
 pub mod sound;
 pub mod text;
+mod shot;
+mod theme;
 pub mod tray;
 pub mod wide;
 pub mod window;

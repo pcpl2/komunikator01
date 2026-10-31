@@ -45,6 +45,8 @@ pub struct Options {
 
 /// Runs the GUI to the end; returns the process exit code.
 pub fn run(opts: Options) -> i32 {
+    // Before any window, the first-run dialog included.
+    super::theme::refresh();
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     let settings_path = data_dir.join("settings.toml");
     let (store, settings, broken) = SettingsStore::load(&settings_path);

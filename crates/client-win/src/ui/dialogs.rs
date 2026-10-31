@@ -13,11 +13,10 @@ use client_core::settings::{Settings, Sounds};
 use protocol::invite::{decode_invite, Invite};
 use protocol::{normalize_username, MIN_PASSWORD_CHARS};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetMonitorInfoW, GetSysColorBrush, MonitorFromPoint, MonitorFromWindow,
-    SetBkMode, SetTextColor, COLOR_BTNFACE, HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
-    TRANSPARENT,
+    COLOR_BTNFACE, HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -33,6 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::hotkey;
+use super::theme;
 use super::wide::{from_wide, scale, wide};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,6 +519,7 @@ impl Dialog {
             let x = (area.left + (area.right - area.left - ww) / 2).clamp(work.left, (work.right - ww).max(work.left));
             let y = (area.top + (area.bottom - area.top - wh) / 2).clamp(work.top, (work.bottom - wh).max(work.top));
             let _ = SetWindowPos(self.hwnd, None, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            theme::apply(self.hwnd);
             if let Some(o) = self.owner {
                 let _ = EnableWindow(o, false);
             }
@@ -634,10 +635,17 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             // Which button Enter presses.
             DM_GETDEFID => LRESULT(((DC_HASDEFID << 16) | u32::from(shared.default_id.get())) as isize),
             WM_CTLCOLORSTATIC if is_error_label(HWND(lp.0 as *mut c_void)) => {
-                let dc = HDC(wp.0 as *mut c_void);
-                SetTextColor(dc, COLORREF(0x0000_20C0)); // dark red, 0x00BBGGRR
-                SetBkMode(dc, TRANSPARENT);
-                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+                theme::error_label(HDC(wp.0 as *mut c_void), GetSysColorBrush(COLOR_BTNFACE))
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                theme::ctlcolor(msg, HDC(wp.0 as *mut c_void)).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+            }
+            WM_ERASEBKGND if theme::erase(hwnd, HDC(wp.0 as *mut c_void)) => LRESULT(1),
+            WM_SETTINGCHANGE if theme::is_theme_change(lp) => {
+                if theme::refresh() {
+                    theme::apply(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
@@ -1561,6 +1569,10 @@ mod tests {
 
     #[test]
     fn settings_dialog_reports_taken_hotkey_then_keeps_it() {
+        // A picture in Windows' current theme (dark or light), for checking by eye.
+        if std::env::var_os("KOMUNIKATOR_DIALOG_SHOT").is_some() {
+            theme::refresh();
+        }
         let owner = scripted::owner();
         let current = SettingsInput::from_settings(&Settings::default());
         let taken = hotkey::parse("Ctrl+Shift+F20").unwrap();
@@ -1593,6 +1605,10 @@ mod tests {
                         scripted::press(d, ID_OK);
                     }
                     1 => {
+                        // After a full paint, with the error shown.
+                        if let Some(path) = std::env::var_os("KOMUNIKATOR_DIALOG_SHOT") {
+                            super::super::shot::save_bmp(d, std::path::Path::new(&path)).unwrap();
+                        }
                         *log.borrow_mut() = get_text(scripted::item(d, ID_ERROR));
                         scripted::press(d, ID_OK);
                     }

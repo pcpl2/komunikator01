@@ -1,26 +1,33 @@
 //! Draws the model's `View` into the window's controls, touching only what changed since the
 //! last draw: a speaking change rewrites item texts, never the whole tree.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use client_core::app::{ChatView, MemberView, RoomView, View};
 use protocol::{MemberId, RoomId};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::Graphics::Gdi::{
+    DrawTextW, InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, HGDIOBJ, TRANSPARENT,
+};
 use windows::Win32::UI::Controls::{
-    HTREEITEM, LVITEMW, LVIF_TEXT, LVM_DELETEALLITEMS, LVM_DELETEITEM, LVM_ENSUREVISIBLE,
-    LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, SB_SETTEXTW, TREE_VIEW_ITEM_STATE_FLAGS, TVE_EXPAND,
+    DRAWITEMSTRUCT, HTREEITEM, LVITEMW, LVIF_TEXT, LVM_DELETEALLITEMS, LVM_DELETEITEM, LVM_ENSUREVISIBLE,
+    LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, SBT_OWNERDRAW, SB_SETTEXTW, TREE_VIEW_ITEM_STATE_FLAGS, TVE_EXPAND,
     TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVITEMW, TVIS_BOLD,
     TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SETITEMW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, SendMessageW, SetWindowTextW, WM_SETREDRAW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, SendMessageW, SetWindowTextW, WM_GETFONT, WM_SETREDRAW,
+};
 
 use super::text::{
     chat_diff, chat_rows, deafen_label, member_text, mute_label, room_text, same_tree_shape,
     status_text, TreeItem,
 };
+use super::theme;
 use super::wide::wide;
 
 /// The child controls the view is drawn into.
@@ -206,9 +213,49 @@ pub fn set_text(hwnd: HWND, text: &str) {
     let _ = unsafe { SetWindowTextW(hwnd, windows::core::PCWSTR(w.as_ptr())) };
 }
 
+thread_local! {
+    /// The status bar's texts, kept for owner drawing (dark mode) and for a theme switch.
+    static STATUS_PARTS: RefCell<[Vec<u16>; 2]> = const { RefCell::new([Vec::new(), Vec::new()]) };
+}
+
 fn set_part(status: HWND, part: usize, text: &str) {
-    let w = wide(text);
-    unsafe { SendMessageW(status, SB_SETTEXTW, Some(WPARAM(part)), Some(LPARAM(w.as_ptr() as isize))) };
+    STATUS_PARTS.with_borrow_mut(|p| {
+        if let Some(slot) = p.get_mut(part) {
+            *slot = text.encode_utf16().collect();
+        }
+    });
+    send_part(status, part);
+}
+
+/// Hands part `part` to the status bar: as text in light mode, owner-drawn in dark mode,
+/// where the unthemed bar would draw its text black on the dark background.
+fn send_part(status: HWND, part: usize) {
+    let mut w = STATUS_PARTS.with_borrow(|p| p.get(part).cloned().unwrap_or_default());
+    w.push(0);
+    let (flags, lp) = if theme::dark() { (SBT_OWNERDRAW as usize, 0) } else { (0, w.as_ptr() as isize) };
+    unsafe { SendMessageW(status, SB_SETTEXTW, Some(WPARAM(part | flags)), Some(LPARAM(lp))) };
+}
+
+/// Re-sends both parts after the theme changed.
+pub fn restyle_status(status: HWND) {
+    for part in 0..2 {
+        send_part(status, part);
+    }
+}
+
+/// Draws an owner-drawn status part (dark mode) in the bar's font.
+pub fn draw_status_part(d: &DRAWITEMSTRUCT) {
+    let mut text = STATUS_PARTS.with_borrow(|p| p.get(d.itemID as usize).cloned().unwrap_or_default());
+    let mut rc = d.rcItem;
+    rc.left += 4;
+    unsafe {
+        let font = SendMessageW(d.hwndItem, WM_GETFONT, None, None);
+        let old = SelectObject(d.hDC, HGDIOBJ(font.0 as *mut _));
+        SetTextColor(d.hDC, theme::text_color());
+        SetBkMode(d.hDC, TRANSPARENT);
+        DrawTextW(d.hDC, &mut text, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(d.hDC, old);
+    }
 }
 
 fn redraw(hwnd: HWND, on: bool) {

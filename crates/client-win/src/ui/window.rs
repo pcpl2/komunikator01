@@ -14,10 +14,10 @@ use client_core::app::{Action, MemberView};
 use client_core::settings::WindowRect;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DeleteObject, ScreenToClient, COLOR_BTNFACE, HBRUSH, HFONT};
+use windows::Win32::Graphics::Gdi::{DeleteObject, ScreenToClient, COLOR_BTNFACE, HBRUSH, HDC, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, HTREEITEM, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
+    InitCommonControlsEx, DRAWITEMSTRUCT, HTREEITEM, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
     ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NMITEMACTIVATE, NM_CLICK, NM_DBLCLK,
     NM_RCLICK, TVGN_DROPHILITE, TVHITTESTINFO, TVHT_ONITEM, TVIF_PARAM, TVITEMW, TVM_GETITEMW,
     TVM_HITTEST, TVM_SELECTITEM,
@@ -33,9 +33,10 @@ use super::icons::{make_icon, tray_pixels, TrayState};
 use super::instance::SHOW_MESSAGE;
 use super::layout::{
     self, create_controls, initial_rect, ID_CHAT, ID_DEAFEN, ID_LEAVE, ID_MUTE, ID_NEW_ROOM, ID_SEND, ID_SETTINGS,
-    ID_TOP, ID_TREE,
+    ID_STATUS, ID_TOP, ID_TREE,
 };
-use super::render::{Controls, Render};
+use super::render::{self, Controls, Render};
+use super::theme;
 use super::text::{tray_state, tray_tip, TreeItem, VOLUME_STEPS};
 use super::tray::{self, Tray, TrayCommand};
 use super::wide::{from_wide, scale, wide};
@@ -158,6 +159,7 @@ impl Window {
             let _ = win.controls.set(create_controls(hwnd, instance));
             win.apply_fonts();
             win.layout();
+            theme::apply(hwnd);
             let c = win.controls();
             if topmost {
                 SendMessageW(c.top, BM_SETCHECK, Some(WPARAM(1)), None);
@@ -318,6 +320,24 @@ impl Window {
     fn handle(&self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hwnd = self.hwnd();
         match msg {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                theme::ctlcolor(msg, HDC(wp.0 as *mut c_void))
+            }
+            WM_ERASEBKGND => theme::erase(hwnd, HDC(wp.0 as *mut c_void)).then_some(LRESULT(1)),
+            WM_DRAWITEM if wp.0 == usize::from(ID_STATUS) => {
+                render::draw_status_part(unsafe { &*(lp.0 as *const DRAWITEMSTRUCT) });
+                Some(LRESULT(1))
+            }
+            // Windows' app theme was switched: follow it at once.
+            WM_SETTINGCHANGE if theme::is_theme_change(lp) => {
+                if theme::refresh() {
+                    theme::apply(hwnd);
+                    if let Some(c) = self.controls.get() {
+                        render::restyle_status(c.status);
+                    }
+                }
+                None
+            }
             WM_GETMINMAXINFO => {
                 let dpi = self.dpi.get();
                 let info = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
@@ -383,7 +403,14 @@ impl Window {
                             }
                         }
                     }
-                    TIMER_SMOKE => unsafe { PostQuitMessage(0) },
+                    TIMER_SMOKE => {
+                        if let Some(path) = std::env::var_os("KOMUNIKATOR_SMOKE_SHOT") {
+                            if let Err(e) = super::shot::save_bmp(hwnd, std::path::Path::new(&path)) {
+                                tracing::warn!("smoke screenshot not saved: {e}");
+                            }
+                        }
+                        unsafe { PostQuitMessage(0) }
+                    }
                     TIMER_UPDATE => self.with_app(|app| app.check_update(hwnd)),
                     _ => {}
                 }
